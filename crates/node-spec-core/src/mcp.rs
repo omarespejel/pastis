@@ -1,6 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use sha2::{Digest, Sha256};
+use pbkdf2::pbkdf2_hmac_array;
+use rand::{RngCore, rngs::OsRng};
+use sha2::Sha256;
+
+const API_KEY_KDF_ITERATIONS: u32 = 150_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpTool {
@@ -49,6 +53,7 @@ pub enum ValidationError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPolicy {
+    pub api_key_salt: [u8; 16],
     pub api_key_hash: [u8; 32],
     pub permissions: BTreeSet<ToolPermission>,
     pub max_requests_per_minute: u32,
@@ -60,15 +65,18 @@ impl AgentPolicy {
         permissions: BTreeSet<ToolPermission>,
         max_requests_per_minute: u32,
     ) -> Self {
+        let mut api_key_salt = [0_u8; 16];
+        OsRng.fill_bytes(&mut api_key_salt);
         Self {
-            api_key_hash: hash_api_key(api_key.as_ref()),
+            api_key_salt,
+            api_key_hash: hash_api_key(api_key.as_ref(), &api_key_salt),
             permissions,
             max_requests_per_minute,
         }
     }
 
     fn verify_api_key(&self, api_key: &str) -> bool {
-        self.api_key_hash == hash_api_key(api_key)
+        self.api_key_hash == hash_api_key(api_key, &self.api_key_salt)
     }
 }
 
@@ -167,10 +175,8 @@ impl McpAccessController {
     }
 }
 
-fn hash_api_key(api_key: &str) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(api_key.as_bytes());
-    hasher.finalize().into()
+fn hash_api_key(api_key: &str, salt: &[u8; 16]) -> [u8; 32] {
+    pbkdf2_hmac_array::<Sha256, 32>(api_key.as_bytes(), salt, API_KEY_KDF_ITERATIONS)
 }
 
 pub fn validate_tool(tool: &McpTool, limits: ValidationLimits) -> Result<(), ValidationError> {

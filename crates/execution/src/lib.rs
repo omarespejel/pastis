@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 #[cfg(feature = "blockifier-adapter")]
 use std::sync::Arc;
 use std::sync::Mutex;

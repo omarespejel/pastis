@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 #[cfg(feature = "production-adapters")]
 use starknet_node_execution::BlockifierVmBackend;
 use starknet_node_execution::ExecutionBackend;

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;

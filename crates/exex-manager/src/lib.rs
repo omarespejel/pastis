@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};

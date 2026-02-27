@@ -42,6 +42,23 @@ Source entry points:
 - [crates/exex-manager/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/exex-manager/src/lib.rs)
 - [crates/node/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/node/src/lib.rs)
 
+## External Integration Boundaries
+
+Planned integrations with `starknet-agentic`, `starkclaw`, and `SISNA` are treated as untrusted-by-default external systems.
+
+- Trust boundary:
+  - External agents never receive direct mutable handles to storage, consensus, or execution internals.
+  - Integration must happen through MCP tools and ExEx notifications only.
+- Authentication and authorization:
+  - Every MCP request must authenticate with an agent-scoped key.
+  - Tool access is permission-gated per agent policy and rate limited.
+- Input validation:
+  - All batch MCP requests are bounded by maximum depth and maximum size.
+  - Unknown tools, malformed payloads, and non-monotonic control-plane timestamps are rejected.
+- Operational isolation:
+  - ExExes are logically isolated by bounded queues and sink circuit breakers.
+  - Any third-party agent process should run in a separate container/process boundary with least-privilege credentials.
+
 ## Architecture Narrative
 
 1. A block is received and validated by consensus/sync components.

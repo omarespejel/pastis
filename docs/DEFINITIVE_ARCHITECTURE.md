@@ -85,10 +85,14 @@ ExEx manager uses bounded buffering, persistence, and backpressure semantics.
 ## 5. Security Boundaries
 
 - ExExes cannot mutate consensus state.
-- Notification path forbids `unsafe`.
+- Notification path forbids `unsafe` via crate-level `#![forbid(unsafe_code)]`.
 - Agent auto-actions are whitelisted.
 - Dual execution mismatch handling is explicit and configurable.
 - WAL is written before delivery.
+
+Enforcement note:
+- `unsafe` prohibition is compile-time enforced in first-party crates.
+- ExEx read-only behavior is enforced by API surface (`Arc` payloads, no mutable consensus handles), not by process sandboxing. Deployments should still isolate untrusted ExEx code at the process/container boundary.
 
 ## 6. Hardening Clauses (P1/P2 Gaps Closed)
 
