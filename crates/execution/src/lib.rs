@@ -510,6 +510,15 @@ impl BlockifierVmBackend {
                         executable.tx_hash().0
                     )));
                 }
+                if let ExecutableStarknetTransaction::L1Handler(l1_handler) = &executable {
+                    if l1_handler.tx.calldata.0.is_empty() {
+                        return Err(ExecutionError::Backend(format!(
+                            "invalid L1 handler tx {} in block {}: calldata must include the \
+                             from-address slot",
+                            tx.hash, block.number
+                        )));
+                    }
+                }
                 Ok(BlockifierTransaction::new_for_sequencing(executable))
             })
             .collect()
@@ -840,6 +849,33 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "blockifier-adapter")]
+    struct MalformedL1Resolver;
+
+    #[cfg(feature = "blockifier-adapter")]
+    impl ExecutableTransactionResolver for MalformedL1Resolver {
+        fn resolve(
+            &self,
+            _block_number: u64,
+            tx: &StarknetTransaction,
+        ) -> Result<ExecutableStarknetTransaction, ExecutionError> {
+            use starknet_api::executable_transaction::{
+                L1HandlerTransaction as ExecutableL1Handler, Transaction as ExecutableTx,
+            };
+            use starknet_api::transaction::TransactionHash;
+
+            let mut executable = ExecutableL1Handler::default();
+            executable.tx_hash =
+                TransactionHash(BlockifierFelt::from_str(&tx.hash).map_err(|error| {
+                    ExecutionError::Backend(format!(
+                        "invalid tx hash provided to MalformedL1Resolver: {error}"
+                    ))
+                })?);
+            // Keep calldata empty to ensure adapter guards against upstream underflow panic.
+            Ok(ExecutableTx::L1Handler(executable))
+        }
+    }
+
     #[test]
     fn falls_back_to_canonical_when_fast_backend_missing() {
         let canonical =
@@ -1072,6 +1108,24 @@ mod tests {
         match err {
             ExecutionError::Backend(message) => {
                 assert!(message.contains("resolver tx hash mismatch"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    #[test]
+    fn blockifier_backend_rejects_malformed_l1_handler_payloads() {
+        let backend =
+            BlockifierVmBackend::starknet_mainnet().with_tx_resolver(Arc::new(MalformedL1Resolver));
+        let mut state = InMemoryState::default();
+
+        let err = backend
+            .execute_block(&block(12, "0.14.2"), &mut state)
+            .expect_err("must reject malformed l1 handler payload");
+        match err {
+            ExecutionError::Backend(message) => {
+                assert!(message.contains("invalid L1 handler tx"));
             }
             other => panic!("unexpected error variant: {other:?}"),
         }
