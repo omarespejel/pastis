@@ -4101,6 +4101,7 @@ name = "starknet-node-storage"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "num-traits",
  "papyrus_storage",
  "semver",
  "serde",

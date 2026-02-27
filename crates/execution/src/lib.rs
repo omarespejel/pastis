@@ -266,11 +266,21 @@ impl BlockifierProtocolVersionResolver {
 
     pub fn starknet_mainnet_defaults() -> Self {
         let versions = [
-            "0.13.0", "0.13.1", "0.13.2", "0.13.3", "0.13.4", "0.13.5", "0.13.6", "0.14.0",
-            "0.14.1", "0.14.2",
+            ("0.13.0", "0.13.0"),
+            ("0.13.1", "0.13.1"),
+            ("0.13.1-1", "0.13.1.1"),
+            ("0.13.2", "0.13.2"),
+            ("0.13.2-1", "0.13.2.1"),
+            ("0.13.3", "0.13.3"),
+            ("0.13.4", "0.13.4"),
+            ("0.13.5", "0.13.5"),
+            ("0.13.6", "0.13.6"),
+            ("0.14.0", "0.14.0"),
+            ("0.14.1", "0.14.1"),
+            ("0.14.2", "0.14.2"),
         ];
-        let entries = versions.into_iter().map(|raw| {
-            let semver = Version::parse(raw).expect("known valid protocol version");
+        let entries = versions.into_iter().map(|(semver, raw)| {
+            let semver = Version::parse(semver).expect("known valid protocol version");
             let protocol = BlockifierProtocolVersion::try_from(raw)
                 .expect("blockifier supports bundled protocol version");
             (semver, protocol)
@@ -297,6 +307,13 @@ impl BlockifierProtocolVersionResolver {
             .map(|(_, resolved)| *resolved)
             .ok_or_else(|| ExecutionError::MissingConstants(requested.clone()))
     }
+}
+
+#[cfg(feature = "blockifier-adapter")]
+fn felt_to_u64(value: BlockifierFelt, field: &'static str) -> Result<u64, ExecutionError> {
+    value.to_u64().ok_or_else(|| {
+        ExecutionError::Backend(format!("value out of range for {field}: {:#x}", value))
+    })
 }
 
 #[cfg(feature = "blockifier-adapter")]
@@ -443,14 +460,17 @@ impl ExecutionBackend for BlockifierVmBackend {
             let contract_writes = state_diff.storage_diffs.entry(contract).or_default();
             for (key, value) in writes {
                 let key_felt: BlockifierFelt = key.into();
-                contract_writes.insert(format!("{:#x}", key_felt), value.to_u64().unwrap_or(0));
+                contract_writes.insert(
+                    format!("{:#x}", key_felt),
+                    felt_to_u64(value, "state_diff.storage_diffs")?,
+                );
             }
         }
         for (address, nonce) in summary.state_diff.address_to_nonce {
             let contract_felt: BlockifierFelt = address.into();
             state_diff.nonces.insert(
                 format!("{:#x}", contract_felt),
-                nonce.0.to_u64().unwrap_or(0),
+                felt_to_u64(nonce.0, "state_diff.nonces")?,
             );
         }
         for class_hash in summary.state_diff.class_hash_to_compiled_class_hash.keys() {
@@ -774,6 +794,16 @@ mod tests {
             .resolve_for_block(&Version::parse("0.14.3").expect("valid"))
             .expect("resolve with patch fallback");
         assert_eq!(resolved.to_string(), "0.14.2");
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    #[test]
+    fn blockifier_protocol_resolver_supports_four_component_versions() {
+        let resolver = BlockifierProtocolVersionResolver::starknet_mainnet_defaults();
+        let resolved = resolver
+            .resolve_for_block(&Version::parse("0.13.1-1").expect("valid"))
+            .expect("resolve explicit 4th component mapping");
+        assert_eq!(resolved.to_string(), "0.13.1.1");
     }
 
     #[cfg(feature = "blockifier-adapter")]

@@ -1,4 +1,8 @@
+#[cfg(feature = "production-adapters")]
+use starknet_node_execution::BlockifierVmBackend;
 use starknet_node_execution::ExecutionBackend;
+#[cfg(feature = "production-adapters")]
+use starknet_node_storage::PapyrusStorageAdapter;
 use starknet_node_storage::StorageBackend;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +99,17 @@ impl<S: StorageBackend, E: ExecutionBackend> StarknetNodeBuilder<WithStorage<S>,
             mcp_enabled: self.mcp_enabled,
         }
     }
+}
+
+#[cfg(feature = "production-adapters")]
+pub fn build_mainnet_production_node(
+    config: NodeConfig,
+    storage: PapyrusStorageAdapter,
+) -> StarknetNode<PapyrusStorageAdapter, BlockifierVmBackend> {
+    StarknetNodeBuilder::new(config)
+        .with_storage(storage)
+        .with_execution(BlockifierVmBackend::starknet_mainnet())
+        .build()
 }
 
 #[cfg(test)]

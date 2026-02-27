@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 default = []
-papyrus-adapter = ["dep:papyrus_storage", "dep:starknet_api", "dep:starknet-types-core"]
+papyrus-adapter = ["dep:papyrus_storage", "dep:starknet_api", "dep:starknet-types-core", "dep:num-traits"]
 
 [dependencies]
 hex = "0.4"
@@ -17,6 +17,7 @@ thiserror = { workspace = true }
 papyrus_storage = { version = "0.4.0-rc.0", optional = true }
 starknet_api = { version = "0.13.0-rc.0", optional = true }
 starknet-types-core = { version = "0.1.5", optional = true }
+num-traits = { version = "0.2", optional = true }
 
 [dev-dependencies]
 serde = { workspace = true }

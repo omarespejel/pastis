@@ -3,6 +3,13 @@ name = "starknet-node"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+production-adapters = [
+    "starknet-node-storage/papyrus-adapter",
+    "starknet-node-execution/blockifier-adapter",
+]
+
 [dependencies]
 starknet-node-execution = { path = "../execution" }
 starknet-node-storage = { path = "../storage" }
