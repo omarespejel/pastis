@@ -431,9 +431,17 @@ impl BlockifierProtocolVersionResolver {
         &self,
         requested: &Version,
     ) -> Result<BlockifierProtocolVersion, ExecutionError> {
+        if let Some(exact) = self.versions.get(requested).copied() {
+            return Ok(exact);
+        }
+
         self.versions
-            .get(requested)
-            .copied()
+            .iter()
+            .filter(|(version, _)| {
+                version.major == requested.major && version.minor == requested.minor
+            })
+            .max_by(|(left, _), (right, _)| left.cmp(right))
+            .map(|(_, protocol)| *protocol)
             .ok_or_else(|| ExecutionError::MissingConstants(requested.clone()))
     }
 }
@@ -1675,6 +1683,29 @@ mod tests {
     }
 
     #[test]
+    fn falls_back_to_highest_patch_for_protocol_constants_with_same_minor() {
+        let selector = ProtocolVersionSelector::new([
+            (
+                Version::parse("0.14.0").expect("valid"),
+                VersionedConstants {
+                    id: "v14_0".to_string(),
+                },
+            ),
+            (
+                Version::parse("0.14.2").expect("valid"),
+                VersionedConstants {
+                    id: "v14_2".to_string(),
+                },
+            ),
+        ]);
+
+        let selected = selector
+            .constants_for_block(&block(100, "0.14.3"))
+            .expect("fallback for same major.minor");
+        assert_eq!(selected.id, "v14_2");
+    }
+
+    #[test]
     fn rejects_unknown_minor_for_protocol_constants() {
         let selector = ProtocolVersionSelector::new([(
             Version::parse("0.14.0").expect("valid"),
@@ -1694,15 +1725,12 @@ mod tests {
 
     #[cfg(feature = "blockifier-adapter")]
     #[test]
-    fn blockifier_protocol_resolver_rejects_unknown_patch() {
+    fn blockifier_protocol_resolver_falls_back_to_highest_known_patch() {
         let resolver = BlockifierProtocolVersionResolver::starknet_mainnet_defaults();
-        let err = resolver
+        let resolved = resolver
             .resolve_for_block(&Version::parse("0.14.3").expect("valid"))
-            .expect_err("must fail closed");
-        assert_eq!(
-            err,
-            ExecutionError::MissingConstants(Version::parse("0.14.3").expect("valid"))
-        );
+            .expect("must fallback to known highest patch");
+        assert_eq!(resolved.to_string(), "0.14.2");
     }
 
     #[cfg(feature = "blockifier-adapter")]
@@ -1853,17 +1881,30 @@ mod tests {
 
     #[cfg(feature = "blockifier-adapter")]
     #[test]
-    fn blockifier_backend_simulate_tx_fails_closed_on_unknown_protocol() {
+    fn blockifier_backend_simulate_tx_falls_back_on_same_minor_patch() {
+        let backend = BlockifierVmBackend::starknet_mainnet();
+        let state = InMemoryState::default();
+        let tx = executable_l1_handler_tx("0xabc");
+
+        let simulation = backend
+            .simulate_tx(&tx, &state, &context(12, "0.14.3"))
+            .expect("fallback to highest known 0.14.x constants");
+        assert_eq!(simulation.receipt.tx_hash, "0xabc");
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    #[test]
+    fn blockifier_backend_simulate_tx_fails_closed_on_unknown_protocol_line() {
         let backend = BlockifierVmBackend::starknet_mainnet();
         let state = InMemoryState::default();
         let tx = executable_l1_handler_tx("0xabc");
 
         let err = backend
-            .simulate_tx(&tx, &state, &context(12, "0.14.3"))
-            .expect_err("must fail closed on unknown protocol");
+            .simulate_tx(&tx, &state, &context(12, "0.15.0"))
+            .expect_err("must fail closed on unknown major.minor protocol line");
         assert_eq!(
             err,
-            ExecutionError::MissingConstants(Version::parse("0.14.3").expect("valid version"))
+            ExecutionError::MissingConstants(Version::parse("0.15.0").expect("valid version"))
         );
     }
 }

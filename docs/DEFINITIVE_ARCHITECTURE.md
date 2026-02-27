@@ -176,7 +176,7 @@ Targets are enforced by repeatable measurement rather than aspiration:
 The repository currently includes core and phase-aligned scaffolding crates that codify and test the hardening clauses:
 - WAL versioned notification decoding with legacy fallback
 - Dependency-aware ExEx delivery planning with cycle/unknown checks
-- Protocol constants resolver with fail-closed semantics
+- Protocol constants resolver with exact-match-first and same-line patch fallback (`major.minor`), fail-closed on unknown protocol lines
 - L1 finality gating and unfinalized reorg invalidation
 - MCP batch recursion/size validation
 - Storage backend behavior (sequential inserts, block snapshots, deterministic state roots)
