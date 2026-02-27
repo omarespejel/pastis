@@ -7,4 +7,5 @@ edition = "2024"
 bincode = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
+sha2 = "0.10"
 thiserror = { workspace = true }

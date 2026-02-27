@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use sha2::{Digest, Sha256};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpTool {
     QueryState,
@@ -47,9 +49,27 @@ pub enum ValidationError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPolicy {
-    pub api_key: String,
+    pub api_key_hash: [u8; 32],
     pub permissions: BTreeSet<ToolPermission>,
     pub max_requests_per_minute: u32,
+}
+
+impl AgentPolicy {
+    pub fn new(
+        api_key: impl AsRef<str>,
+        permissions: BTreeSet<ToolPermission>,
+        max_requests_per_minute: u32,
+    ) -> Self {
+        Self {
+            api_key_hash: hash_api_key(api_key.as_ref()),
+            permissions,
+            max_requests_per_minute,
+        }
+    }
+
+    fn verify_api_key(&self, api_key: &str) -> bool {
+        self.api_key_hash == hash_api_key(api_key)
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -68,12 +88,15 @@ pub enum AccessError {
         agent_id: String,
         limit_per_minute: u32,
     },
+    #[error("non-monotonic request time for agent '{agent_id}'")]
+    NonMonotonicTime { agent_id: String },
 }
 
 #[derive(Debug, Default)]
 pub struct McpAccessController {
     policies: BTreeMap<String, AgentPolicy>,
     requests: BTreeMap<String, VecDeque<u64>>,
+    latest_request_time: BTreeMap<String, u64>,
 }
 
 impl McpAccessController {
@@ -81,6 +104,7 @@ impl McpAccessController {
         Self {
             policies: policies.into_iter().collect(),
             requests: BTreeMap::new(),
+            latest_request_time: BTreeMap::new(),
         }
     }
 
@@ -97,7 +121,7 @@ impl McpAccessController {
             .ok_or_else(|| AccessError::UnknownAgent {
                 agent_id: agent_id.to_string(),
             })?;
-        if policy.api_key != api_key {
+        if !policy.verify_api_key(api_key) {
             return Err(AccessError::InvalidApiKey {
                 agent_id: agent_id.to_string(),
             });
@@ -113,6 +137,16 @@ impl McpAccessController {
                 });
             }
         }
+
+        if let Some(latest_seen) = self.latest_request_time.get(agent_id)
+            && now_unix_seconds < *latest_seen
+        {
+            return Err(AccessError::NonMonotonicTime {
+                agent_id: agent_id.to_string(),
+            });
+        }
+        self.latest_request_time
+            .insert(agent_id.to_string(), now_unix_seconds);
 
         let requests = self.requests.entry(agent_id.to_string()).or_default();
         while let Some(ts) = requests.front() {
@@ -131,6 +165,12 @@ impl McpAccessController {
         requests.push_back(now_unix_seconds);
         Ok(())
     }
+}
+
+fn hash_api_key(api_key: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(api_key.as_bytes());
+    hasher.finalize().into()
 }
 
 pub fn validate_tool(tool: &McpTool, limits: ValidationLimits) -> Result<(), ValidationError> {
@@ -241,11 +281,11 @@ mod tests {
     }
 
     fn read_only_policy(limit: u32) -> AgentPolicy {
-        AgentPolicy {
-            api_key: "secret".to_string(),
-            permissions: BTreeSet::from([ToolPermission::QueryState]),
-            max_requests_per_minute: limit,
-        }
+        AgentPolicy::new(
+            "secret",
+            BTreeSet::from([ToolPermission::QueryState]),
+            limit,
+        )
     }
 
     #[test]
@@ -311,5 +351,22 @@ mod tests {
         access
             .authorize("agent-a", "secret", &McpTool::QueryState, 1_061)
             .expect("window advanced");
+    }
+
+    #[test]
+    fn rejects_non_monotonic_request_times() {
+        let mut access = McpAccessController::new([("agent-a".to_string(), read_only_policy(2))]);
+        access
+            .authorize("agent-a", "secret", &McpTool::QueryState, 1_000)
+            .expect("first");
+        let err = access
+            .authorize("agent-a", "secret", &McpTool::QueryState, 999)
+            .expect_err("must reject backwards time");
+        assert_eq!(
+            err,
+            AccessError::NonMonotonicTime {
+                agent_id: "agent-a".to_string(),
+            }
+        );
     }
 }

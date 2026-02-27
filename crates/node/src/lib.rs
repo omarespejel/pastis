@@ -5,6 +5,8 @@ use starknet_node_execution::ExecutionBackend;
 use starknet_node_storage::PapyrusStorageAdapter;
 use starknet_node_storage::StorageBackend;
 #[cfg(feature = "production-adapters")]
+use starknet_node_types::BlockId;
+#[cfg(feature = "production-adapters")]
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,13 +50,34 @@ pub enum NodeInitError {
     StorageCheck(String),
     #[error("storage backend reported unhealthy status")]
     StorageUnhealthy,
+    #[error("storage integrity check failed: {0}")]
+    StorageIntegrity(String),
 }
 
 #[cfg(feature = "production-adapters")]
 fn validate_bootstrap_storage<S: StorageBackend>(storage: &S) -> Result<(), NodeInitError> {
-    storage
+    let latest = storage
         .latest_block_number()
         .map_err(|error| NodeInitError::StorageCheck(error.to_string()))?;
+    storage
+        .get_state_reader(0)
+        .map_err(|error| NodeInitError::StorageIntegrity(error.to_string()))?;
+    if latest > 0 {
+        let tip = storage
+            .get_block(BlockId::Number(latest))
+            .map_err(|error| NodeInitError::StorageIntegrity(error.to_string()))?
+            .ok_or_else(|| {
+                NodeInitError::StorageIntegrity(format!(
+                    "latest block marker points to {latest}, but block body is missing"
+                ))
+            })?;
+        if tip.number != latest {
+            return Err(NodeInitError::StorageIntegrity(format!(
+                "latest block mismatch: expected {latest}, got {}",
+                tip.number
+            )));
+        }
+    }
     if !storage.is_healthy() {
         return Err(NodeInitError::StorageUnhealthy);
     }
@@ -294,5 +317,81 @@ mod tests {
     fn bootstrap_validation_accepts_healthy_storage() {
         let storage = InMemoryStorage::new(InMemoryState::default());
         validate_bootstrap_storage(&storage).expect("healthy storage");
+    }
+
+    #[cfg(feature = "production-adapters")]
+    struct InconsistentLatestStorage;
+
+    #[cfg(feature = "production-adapters")]
+    impl HealthCheck for InconsistentLatestStorage {
+        fn is_healthy(&self) -> bool {
+            true
+        }
+
+        fn detailed_status(&self) -> ComponentHealth {
+            ComponentHealth {
+                name: "inconsistent-latest-storage".to_string(),
+                status: HealthStatus::Healthy,
+                last_block_processed: Some(1),
+                sync_lag: None,
+                error: None,
+            }
+        }
+    }
+
+    #[cfg(feature = "production-adapters")]
+    impl StorageBackend for InconsistentLatestStorage {
+        fn get_state_reader(
+            &self,
+            block_number: u64,
+        ) -> Result<Box<dyn StateReader>, StorageError> {
+            if block_number == 0 {
+                Ok(Box::new(InMemoryState::default()))
+            } else {
+                Err(StorageError::BlockOutOfRange {
+                    requested: block_number,
+                    latest: 0,
+                })
+            }
+        }
+
+        fn apply_state_diff(&mut self, _diff: &StarknetStateDiff) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        fn insert_block(
+            &mut self,
+            _block: StarknetBlock,
+            _state_diff: StarknetStateDiff,
+        ) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        fn get_block(&self, _id: BlockId) -> Result<Option<StarknetBlock>, StorageError> {
+            Ok(None)
+        }
+
+        fn get_state_diff(
+            &self,
+            _block_number: u64,
+        ) -> Result<Option<StarknetStateDiff>, StorageError> {
+            Ok(None)
+        }
+
+        fn latest_block_number(&self) -> Result<u64, StorageError> {
+            Ok(1)
+        }
+
+        fn current_state_root(&self) -> String {
+            "0x0".to_string()
+        }
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn bootstrap_validation_rejects_missing_tip_block_body() {
+        let storage = InconsistentLatestStorage;
+        let err = validate_bootstrap_storage(&storage).expect_err("must fail");
+        assert!(matches!(err, NodeInitError::StorageIntegrity(_)));
     }
 }
