@@ -1,0 +1,11 @@
+[package]
+name = "starknet-node-storage"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hex = "0.4"
+semver = { workspace = true }
+sha2 = "0.10"
+starknet-node-types = { path = "../types" }
+thiserror = { workspace = true }

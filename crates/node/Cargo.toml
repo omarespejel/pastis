@@ -1,0 +1,10 @@
+[package]
+name = "starknet-node"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+starknet-node-execution = { path = "../execution" }
+starknet-node-storage = { path = "../storage" }
+starknet-node-types = { path = "../types" }
+thiserror = { workspace = true }

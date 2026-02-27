@@ -1,0 +1,10 @@
+[package]
+name = "starknet-node-execution"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+node-spec-core = { path = "../node-spec-core" }
+semver = { workspace = true }
+starknet-node-types = { path = "../types" }
+thiserror = { workspace = true }
