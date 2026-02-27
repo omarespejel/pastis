@@ -239,8 +239,8 @@ pub(crate) mod hashmap {
             // Estimate the layout of the entire table
             let table_layout = calculate_layout_for::<(K, V)>(buckets);
 
-            // Estimate the memory used by `length` elements
-            let used_layout = calculate_layout_for::<(K, V)>(length);
+            // Estimate the memory used by populated entries (without bucket/control overhead).
+            let used_layout = size_of::<(K, V)>() * length;
 
             (table_layout, used_layout)
         }

@@ -58,6 +58,8 @@ pub enum ManagerError {
     MissingSink(String),
     #[error("sink '{name}' failed: {message}")]
     SinkFailure { name: String, message: String },
+    #[error("multiple sinks failed in tier: {failures:?}")]
+    TierFailures { failures: Vec<(String, String)> },
     #[error("failed to encode notification to WAL: {0}")]
     WalEncode(String),
     #[error("failed to decode notification from WAL: {0}")]
@@ -206,7 +208,7 @@ impl ExExManager {
             return Ok(());
         }
 
-        let mut first_error = None;
+        let mut tier_failures: Vec<(String, String)> = Vec::new();
 
         for chunk in active_tier.chunks(MAX_PARALLEL_DELIVERY_WORKERS.max(1)) {
             let results: Vec<(String, Result<(), ManagerError>)> =
@@ -258,16 +260,29 @@ impl ExExManager {
                             self.disabled_sinks.insert(name);
                             continue;
                         }
-                        if first_error.is_none() {
-                            first_error = Some(err);
+                        match err {
+                            ManagerError::SinkFailure {
+                                name: failed_name,
+                                message,
+                            } => tier_failures.push((failed_name, message)),
+                            other => tier_failures.push((name, other.to_string())),
                         }
                     }
                 }
             }
         }
 
-        if let Some(err) = first_error {
-            return Err(err);
+        if tier_failures.len() == 1 {
+            let (name, message) = tier_failures
+                .into_iter()
+                .next()
+                .expect("exactly one failure");
+            return Err(ManagerError::SinkFailure { name, message });
+        }
+        if !tier_failures.is_empty() {
+            return Err(ManagerError::TierFailures {
+                failures: tier_failures,
+            });
         }
 
         Ok(())
@@ -587,11 +602,18 @@ mod tests {
 
         manager.enqueue(sample_notification()).expect("enqueue");
         let err = manager.drain_one().expect_err("must fail");
-        assert!(matches!(
-            err,
-            ManagerError::SinkFailure { name, message }
-            if name == "alpha" && message == "alpha-failure"
-        ));
+        match err {
+            ManagerError::TierFailures { failures } => {
+                assert_eq!(
+                    failures,
+                    vec![
+                        ("alpha".to_string(), "alpha-failure".to_string()),
+                        ("zeta".to_string(), "zeta-failure".to_string()),
+                    ]
+                );
+            }
+            other => panic!("expected TierFailures, got {other:?}"),
+        }
     }
 
     #[test]

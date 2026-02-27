@@ -25,6 +25,9 @@ jobs:
       - name: Verify vendored dependencies
         run: ./scripts/check-vendored-size-of.sh
 
+      - name: Verify transitive size-of requirement
+        run: ./scripts/check-size-of-transitive.sh
+
       - name: Format check
         run: cargo fmt --all --check
 

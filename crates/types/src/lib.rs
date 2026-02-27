@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use semver::Version;
@@ -116,16 +117,7 @@ pub struct GasPricePerToken {
     pub price_in_wei: u128,
 }
 
-impl Default for GasPricePerToken {
-    fn default() -> Self {
-        Self {
-            price_in_fri: 1,
-            price_in_wei: 1,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockGasPrices {
     pub l1_gas: GasPricePerToken,
     pub l1_data_gas: GasPricePerToken,
@@ -205,8 +197,8 @@ fn normalize_felt_hex(input: &str) -> String {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InMemoryState {
-    pub storage: BTreeMap<ContractAddress, BTreeMap<String, StarknetFelt>>,
-    pub nonces: BTreeMap<ContractAddress, StarknetFelt>,
+    pub storage: Arc<BTreeMap<ContractAddress, BTreeMap<String, StarknetFelt>>>,
+    pub nonces: Arc<BTreeMap<ContractAddress, StarknetFelt>>,
 }
 
 impl InMemoryState {
@@ -241,12 +233,15 @@ impl MutableState for InMemoryState {
     fn set_storage(&mut self, contract: ContractAddress, key: String, value: StarknetFelt) {
         let contract = normalize_felt_hex(&contract);
         let key = normalize_felt_hex(&key);
-        self.storage.entry(contract).or_default().insert(key, value);
+        Arc::make_mut(&mut self.storage)
+            .entry(contract)
+            .or_default()
+            .insert(key, value);
     }
 
     fn set_nonce(&mut self, contract: ContractAddress, nonce: StarknetFelt) {
         let contract = normalize_felt_hex(&contract);
-        self.nonces.insert(contract, nonce);
+        Arc::make_mut(&mut self.nonces).insert(contract, nonce);
     }
 
     fn boxed_clone(&self) -> Box<dyn MutableState> {
@@ -326,6 +321,29 @@ mod tests {
             state.nonce_of(&"0x1".to_string()),
             Some(StarknetFelt::from(3_u64))
         );
+    }
+
+    #[test]
+    fn clone_shares_maps_until_first_mutation() {
+        let mut state = InMemoryState::default();
+        state.set_storage(
+            "0x1".to_string(),
+            "0x2".to_string(),
+            StarknetFelt::from(9_u64),
+        );
+        state.set_nonce("0x1".to_string(), StarknetFelt::from(3_u64));
+
+        let snapshot = state.clone();
+        assert_eq!(Arc::as_ptr(&state.storage), Arc::as_ptr(&snapshot.storage));
+        assert_eq!(Arc::as_ptr(&state.nonces), Arc::as_ptr(&snapshot.nonces));
+
+        state.set_storage(
+            "0x1".to_string(),
+            "0x3".to_string(),
+            StarknetFelt::from(11_u64),
+        );
+        assert_ne!(Arc::as_ptr(&state.storage), Arc::as_ptr(&snapshot.storage));
+        assert_eq!(Arc::as_ptr(&state.nonces), Arc::as_ptr(&snapshot.nonces));
     }
 
     #[cfg(feature = "blockifier-adapter")]

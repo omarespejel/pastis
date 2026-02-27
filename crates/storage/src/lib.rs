@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 
 #[cfg(feature = "papyrus-adapter")]
+use papyrus_storage::body::BodyStorageReader;
+#[cfg(feature = "papyrus-adapter")]
 use papyrus_storage::header::HeaderStorageReader;
 #[cfg(feature = "papyrus-adapter")]
 use papyrus_storage::state::StateStorageReader;
@@ -22,6 +24,8 @@ use starknet_api::state::ThinStateDiff as PapyrusThinStateDiff;
 use starknet_api::state::{StateNumber as PapyrusStateNumber, StorageKey as PapyrusStorageKey};
 
 use starknet_crypto::poseidon_hash_many;
+#[cfg(feature = "papyrus-adapter")]
+use starknet_node_types::StarknetTransaction;
 #[cfg(feature = "papyrus-adapter")]
 use starknet_node_types::{BlockGasPrices, GasPricePerToken};
 use starknet_node_types::{
@@ -214,14 +218,14 @@ impl StorageBackend for InMemoryStorage {
         };
 
         let mut elements = Vec::new();
-        for (contract, writes) in &state.storage {
+        for (contract, writes) in state.storage.iter() {
             elements.push(felt_from_storage_component(contract));
             for (key, value) in writes {
                 elements.push(felt_from_storage_component(key));
                 elements.push(*value);
             }
         }
-        for (contract, nonce) in &state.nonces {
+        for (contract, nonce) in state.nonces.iter() {
             elements.push(felt_from_storage_component(contract));
             elements.push(*nonce);
         }
@@ -532,6 +536,13 @@ impl StorageBackend for PapyrusStorageAdapter {
             price_in_fri: header.l1_data_gas_price.price_in_fri.0,
             price_in_wei: header.l1_data_gas_price.price_in_wei.0,
         };
+        let transactions = txn
+            .get_block_transaction_hashes(number)
+            .map_err(|error| StorageError::Papyrus(error.to_string()))?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|hash| StarknetTransaction::new(format!("{:#x}", hash.0)))
+            .collect();
         Ok(Some(StarknetBlock {
             number: number.0,
             parent_hash: format!("{:#x}", header.parent_hash.0),
@@ -541,11 +552,15 @@ impl StorageBackend for PapyrusStorageAdapter {
             gas_prices: BlockGasPrices {
                 l1_gas,
                 l1_data_gas,
-                // Starknet v0.13 headers do not carry L2 gas prices.
-                l2_gas: GasPricePerToken::default(),
+                // Starknet v0.13 headers do not carry L2 gas prices. Use explicit fallback
+                // instead of implicit defaults to avoid accidental fee-policy drift.
+                l2_gas: GasPricePerToken {
+                    price_in_fri: 1,
+                    price_in_wei: 1,
+                },
             },
             protocol_version,
-            transactions: Vec::new(),
+            transactions,
         }))
     }
 
@@ -708,6 +723,7 @@ mod tests {
 mod papyrus_tests {
     use std::path::Path;
 
+    use papyrus_storage::body::BodyStorageWriter;
     use papyrus_storage::db::DbConfig;
     use papyrus_storage::header::HeaderStorageWriter;
     use papyrus_storage::mmap_file::MmapFileConfig;
@@ -726,6 +742,12 @@ mod papyrus_tests {
     use starknet_api::hash::StarkHash as PapyrusFelt;
     use starknet_api::state::{
         StorageKey as PapyrusStorageKey, ThinStateDiff as PapyrusThinStateDiff,
+    };
+    use starknet_api::transaction::{
+        L1HandlerTransaction as PapyrusL1HandlerTransaction,
+        L1HandlerTransactionOutput as PapyrusL1HandlerTransactionOutput,
+        Transaction as PapyrusTransaction, TransactionHash as PapyrusTransactionHash,
+        TransactionOutput as PapyrusTransactionOutput,
     };
     use tempfile::tempdir;
 
@@ -825,6 +847,32 @@ mod papyrus_tests {
             format!("{:#x}", key.0.key()),
             format!("{:#x}", class_hash.0),
         ))
+    }
+
+    fn seed_body_with_single_tx_hash(
+        adapter: &mut PapyrusStorageAdapter,
+        block_number: u64,
+        tx_hash: PapyrusFelt,
+    ) -> Result<(), StorageError> {
+        let tx = PapyrusL1HandlerTransaction::default();
+
+        let body = starknet_api::block::BlockBody {
+            transactions: vec![PapyrusTransaction::L1Handler(tx)],
+            transaction_outputs: vec![PapyrusTransactionOutput::L1Handler(
+                PapyrusL1HandlerTransactionOutput::default(),
+            )],
+            transaction_hashes: vec![PapyrusTransactionHash(tx_hash)],
+        };
+
+        adapter
+            ._writer
+            .begin_rw_txn()
+            .map_err(|error| StorageError::Papyrus(error.to_string()))?
+            .append_body(PapyrusBlockNumber(block_number), body)
+            .map_err(|error| StorageError::Papyrus(error.to_string()))?
+            .commit()
+            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+        Ok(())
     }
 
     #[test]
@@ -970,6 +1018,29 @@ mod papyrus_tests {
                 latest: fixture.block_number,
             }
         );
+    }
+
+    #[test]
+    fn papyrus_adapter_populates_block_transactions_from_body_hashes() {
+        let fixture = parse_fixture();
+        let dir = tempdir().expect("temp dir");
+        let mut adapter =
+            PapyrusStorageAdapter::open(papyrus_config(dir.path())).expect("open papyrus");
+
+        seed_header(&mut adapter, &fixture).expect("seed header");
+        seed_body_with_single_tx_hash(
+            &mut adapter,
+            fixture.block_number,
+            PapyrusFelt::from(0xabc_u64),
+        )
+        .expect("seed body");
+
+        let block = adapter
+            .get_block(BlockId::Number(fixture.block_number))
+            .expect("get block")
+            .expect("block exists");
+        assert_eq!(block.transactions.len(), 1);
+        assert_eq!(block.transactions[0].hash, "0xabc");
     }
 
     #[test]

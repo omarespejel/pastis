@@ -826,105 +826,112 @@ impl ExecutionBackend for BlockifierVmBackend {
         let block_context = self.build_block_context(block)?;
         let txs = self.map_block_transactions(block)?;
         let snapshot = self.snapshot_for_execution(state)?;
-
-        let mut executor = TransactionExecutor::pre_process_and_create(
-            BlockifierStateReaderAdapter::new(Arc::clone(&snapshot)),
-            block_context,
-            (block.number >= 10).then_some(BlockifierBlockHashAndNumber {
-                hash: BlockifierBlockHash::default(),
-                number: BlockifierBlockNumber(block.number.saturating_sub(10)),
-            }),
-            self.executor_config.clone(),
-        )
-        .map_err(|error| ExecutionError::Backend(error.to_string()))?;
-
-        let execution_results =
-            executor.execute_txs(&txs, Some(Instant::now() + self.execution_timeout));
-        if execution_results.len() != txs.len() {
-            return Err(ExecutionError::Backend(format!(
-                "blockifier returned {} execution results for {} transactions in block {}",
-                execution_results.len(),
-                txs.len(),
-                block.number
-            )));
-        }
-
-        let receipts = execution_results
-            .into_iter()
-            .zip(block.transactions.iter())
-            .map(|(result, tx)| match result {
-                Ok((execution_info, _)) => Ok(starknet_node_types::StarknetReceipt {
-                    tx_hash: tx.hash.clone(),
-                    execution_status: !execution_info.is_reverted(),
-                    events: execution_info
-                        .non_optional_call_infos()
-                        .map(|call_info| call_info.execution.events.len() as u64)
-                        .sum(),
-                    gas_consumed: Self::gas_consumed_from_receipt(&execution_info.receipt),
+        let result: Result<ExecutionOutput, ExecutionError> = (|| {
+            let mut executor = TransactionExecutor::pre_process_and_create(
+                BlockifierStateReaderAdapter::new(Arc::clone(&snapshot)),
+                block_context,
+                (block.number >= 10).then_some(BlockifierBlockHashAndNumber {
+                    hash: BlockifierBlockHash::default(),
+                    number: BlockifierBlockNumber(block.number.saturating_sub(10)),
                 }),
-                Err(TransactionExecutorError::TransactionExecutionError(_)) => {
-                    Ok(starknet_node_types::StarknetReceipt {
-                        tx_hash: tx.hash.clone(),
-                        execution_status: false,
-                        events: 0,
-                        gas_consumed: 0,
-                    })
-                }
-                Err(other) => Err(ExecutionError::Backend(format!(
-                    "fatal blockifier transaction executor error at block {}: {}",
-                    block.number, other
-                ))),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let summary = executor
-            .finalize()
+                self.executor_config.clone(),
+            )
             .map_err(|error| ExecutionError::Backend(error.to_string()))?;
 
-        let mut state_diff = starknet_node_types::StarknetStateDiff::default();
-        for (address, writes) in summary.state_diff.storage_updates {
-            let contract_felt: BlockifierFelt = address.into();
-            let contract = format!("{:#x}", contract_felt);
-            let contract_writes = state_diff.storage_diffs.entry(contract).or_default();
-            for (key, value) in writes {
-                let key_felt: BlockifierFelt = key.into();
-                contract_writes.insert(
-                    format!("{:#x}", key_felt),
-                    blockifier_felt_to_node_felt(value, "state_diff.storage_diffs")?,
+            let execution_results =
+                executor.execute_txs(&txs, Some(Instant::now() + self.execution_timeout));
+            if execution_results.len() != txs.len() {
+                return Err(ExecutionError::Backend(format!(
+                    "blockifier returned {} execution results for {} transactions in block {}",
+                    execution_results.len(),
+                    txs.len(),
+                    block.number
+                )));
+            }
+
+            let receipts = execution_results
+                .into_iter()
+                .zip(block.transactions.iter())
+                .map(|(result, tx)| match result {
+                    Ok((execution_info, _)) => Ok(starknet_node_types::StarknetReceipt {
+                        tx_hash: tx.hash.clone(),
+                        execution_status: !execution_info.is_reverted(),
+                        events: execution_info
+                            .non_optional_call_infos()
+                            .map(|call_info| call_info.execution.events.len() as u64)
+                            .sum(),
+                        gas_consumed: Self::gas_consumed_from_receipt(&execution_info.receipt),
+                    }),
+                    Err(TransactionExecutorError::TransactionExecutionError(_)) => {
+                        Ok(starknet_node_types::StarknetReceipt {
+                            tx_hash: tx.hash.clone(),
+                            execution_status: false,
+                            events: 0,
+                            gas_consumed: 0,
+                        })
+                    }
+                    Err(other) => Err(ExecutionError::Backend(format!(
+                        "fatal blockifier transaction executor error at block {}: {}",
+                        block.number, other
+                    ))),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let summary = executor
+                .finalize()
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+
+            let mut state_diff = starknet_node_types::StarknetStateDiff::default();
+            for (address, writes) in summary.state_diff.storage_updates {
+                let contract_felt: BlockifierFelt = address.into();
+                let contract = format!("{:#x}", contract_felt);
+                let contract_writes = state_diff.storage_diffs.entry(contract).or_default();
+                for (key, value) in writes {
+                    let key_felt: BlockifierFelt = key.into();
+                    contract_writes.insert(
+                        format!("{:#x}", key_felt),
+                        blockifier_felt_to_node_felt(value, "state_diff.storage_diffs")?,
+                    );
+                }
+            }
+            for (address, nonce) in summary.state_diff.address_to_nonce {
+                let contract_felt: BlockifierFelt = address.into();
+                state_diff.nonces.insert(
+                    format!("{:#x}", contract_felt),
+                    blockifier_felt_to_node_felt(nonce.0, "state_diff.nonces")?,
                 );
             }
-        }
-        for (address, nonce) in summary.state_diff.address_to_nonce {
-            let contract_felt: BlockifierFelt = address.into();
-            state_diff.nonces.insert(
-                format!("{:#x}", contract_felt),
-                blockifier_felt_to_node_felt(nonce.0, "state_diff.nonces")?,
-            );
-        }
-        for class_hash in summary.state_diff.class_hash_to_compiled_class_hash.keys() {
-            state_diff
-                .declared_classes
-                .push(format!("{:#x}", class_hash.0));
-        }
-
-        for (contract, writes) in &state_diff.storage_diffs {
-            for (key, value) in writes {
-                state.set_storage(contract.clone(), key.clone(), *value);
+            for class_hash in summary.state_diff.class_hash_to_compiled_class_hash.keys() {
+                state_diff
+                    .declared_classes
+                    .push(format!("{:#x}", class_hash.0));
             }
-        }
-        for (contract, nonce) in &state_diff.nonces {
-            state.set_nonce(contract.clone(), *nonce);
-        }
-        Self::apply_state_diff_to_snapshot(&snapshot, &state_diff)?;
 
-        let output = ExecutionOutput {
-            receipts,
-            state_diff,
-            builtin_stats: starknet_node_types::BuiltinStats::default(),
-            execution_time: started_at.elapsed(),
-        };
-        self.record_executed_block(block.number)?;
-        Ok(output)
+            for (contract, writes) in &state_diff.storage_diffs {
+                for (key, value) in writes {
+                    state.set_storage(contract.clone(), key.clone(), *value);
+                }
+            }
+            for (contract, nonce) in &state_diff.nonces {
+                state.set_nonce(contract.clone(), *nonce);
+            }
+            Self::apply_state_diff_to_snapshot(&snapshot, &state_diff)?;
+
+            let output = ExecutionOutput {
+                receipts,
+                state_diff,
+                builtin_stats: starknet_node_types::BuiltinStats::default(),
+                execution_time: started_at.elapsed(),
+            };
+            self.record_executed_block(block.number)?;
+            Ok(output)
+        })();
+
+        if result.is_err() {
+            // Never reuse a potentially partially-mutated cached snapshot after failure.
+            let _ = self.clear_state_snapshot();
+        }
+        result
     }
 
     fn simulate_tx(

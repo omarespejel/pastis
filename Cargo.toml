@@ -17,5 +17,5 @@ thiserror = "2.0"
 
 [patch.crates-io]
 # `size-of` is used transitively by upstream Starknet/Papyrus dependencies.
-# Pin to a reviewed vendored copy with CI integrity checks.
+# CI also verifies the dependency is still transitively required before vendoring.
 size-of = { path = "vendor/size-of" }

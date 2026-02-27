@@ -4,6 +4,8 @@ use starknet_node_execution::ExecutionBackend;
 #[cfg(feature = "production-adapters")]
 use starknet_node_storage::PapyrusStorageAdapter;
 use starknet_node_storage::StorageBackend;
+#[cfg(feature = "production-adapters")]
+use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeConfig {
@@ -37,6 +39,26 @@ pub struct StarknetNodeBuilder<Stor, Exec> {
     mcp_enabled: bool,
     storage: Stor,
     execution: Exec,
+}
+
+#[cfg(feature = "production-adapters")]
+#[derive(Debug, Error)]
+pub enum NodeInitError {
+    #[error("storage bootstrap check failed: {0}")]
+    StorageCheck(String),
+    #[error("storage backend reported unhealthy status")]
+    StorageUnhealthy,
+}
+
+#[cfg(feature = "production-adapters")]
+fn validate_bootstrap_storage<S: StorageBackend>(storage: &S) -> Result<(), NodeInitError> {
+    storage
+        .latest_block_number()
+        .map_err(|error| NodeInitError::StorageCheck(error.to_string()))?;
+    if !storage.is_healthy() {
+        return Err(NodeInitError::StorageUnhealthy);
+    }
+    Ok(())
 }
 
 impl StarknetNodeBuilder<NoStorage, NoExecution> {
@@ -105,11 +127,12 @@ impl<S: StorageBackend, E: ExecutionBackend> StarknetNodeBuilder<WithStorage<S>,
 pub fn build_mainnet_production_node(
     config: NodeConfig,
     storage: PapyrusStorageAdapter,
-) -> StarknetNode<PapyrusStorageAdapter, BlockifierVmBackend> {
-    StarknetNodeBuilder::new(config)
+) -> Result<StarknetNode<PapyrusStorageAdapter, BlockifierVmBackend>, NodeInitError> {
+    validate_bootstrap_storage(&storage)?;
+    Ok(StarknetNodeBuilder::new(config)
         .with_storage(storage)
         .with_execution(BlockifierVmBackend::starknet_mainnet())
-        .build()
+        .build())
 }
 
 #[cfg(test)]
@@ -118,10 +141,14 @@ mod tests {
 
     use starknet_node_execution::ExecutionError;
     use starknet_node_storage::InMemoryStorage;
+    #[cfg(feature = "production-adapters")]
+    use starknet_node_storage::StorageError;
     use starknet_node_types::{
         BlockContext, BuiltinStats, ExecutionOutput, InMemoryState, MutableState, SimulationResult,
         StarknetBlock, StarknetReceipt, StarknetStateDiff, StarknetTransaction, StateReader,
     };
+    #[cfg(feature = "production-adapters")]
+    use starknet_node_types::{BlockId, ComponentHealth, HealthCheck, HealthStatus};
 
     use super::*;
 
@@ -191,5 +218,81 @@ mod tests {
         .build();
 
         assert_eq!(node.config.chain_id, "SN_SEPOLIA");
+    }
+
+    #[cfg(feature = "production-adapters")]
+    struct UnhealthyStorage(InMemoryStorage);
+
+    #[cfg(feature = "production-adapters")]
+    impl HealthCheck for UnhealthyStorage {
+        fn is_healthy(&self) -> bool {
+            false
+        }
+
+        fn detailed_status(&self) -> ComponentHealth {
+            ComponentHealth {
+                name: "unhealthy-storage".to_string(),
+                status: HealthStatus::Unhealthy,
+                last_block_processed: None,
+                sync_lag: None,
+                error: Some("forced unhealthy".to_string()),
+            }
+        }
+    }
+
+    #[cfg(feature = "production-adapters")]
+    impl StorageBackend for UnhealthyStorage {
+        fn get_state_reader(
+            &self,
+            block_number: u64,
+        ) -> Result<Box<dyn StateReader>, StorageError> {
+            self.0.get_state_reader(block_number)
+        }
+
+        fn apply_state_diff(&mut self, diff: &StarknetStateDiff) -> Result<(), StorageError> {
+            self.0.apply_state_diff(diff)
+        }
+
+        fn insert_block(
+            &mut self,
+            block: StarknetBlock,
+            state_diff: StarknetStateDiff,
+        ) -> Result<(), StorageError> {
+            self.0.insert_block(block, state_diff)
+        }
+
+        fn get_block(&self, id: BlockId) -> Result<Option<StarknetBlock>, StorageError> {
+            self.0.get_block(id)
+        }
+
+        fn get_state_diff(
+            &self,
+            block_number: u64,
+        ) -> Result<Option<StarknetStateDiff>, StorageError> {
+            self.0.get_state_diff(block_number)
+        }
+
+        fn latest_block_number(&self) -> Result<u64, StorageError> {
+            self.0.latest_block_number()
+        }
+
+        fn current_state_root(&self) -> String {
+            self.0.current_state_root()
+        }
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn bootstrap_validation_rejects_unhealthy_storage() {
+        let storage = UnhealthyStorage(InMemoryStorage::new(InMemoryState::default()));
+        let err = validate_bootstrap_storage(&storage).expect_err("must fail");
+        assert!(matches!(err, NodeInitError::StorageUnhealthy));
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn bootstrap_validation_accepts_healthy_storage() {
+        let storage = InMemoryStorage::new(InMemoryState::default());
+        validate_bootstrap_storage(&storage).expect("healthy storage");
     }
 }
