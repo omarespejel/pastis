@@ -32,7 +32,8 @@ fi
 
 ACTUAL_HASH=$(
   while IFS= read -r relative_path; do
-    shasum -a 256 "${ROOT_DIR}/${relative_path}"
+    file_hash="$(shasum -a 256 "${ROOT_DIR}/${relative_path}" | awk '{print $1}')"
+    printf "%s  %s\n" "${file_hash}" "${relative_path}"
   done <<< "${FILES}" \
     | shasum -a 256 \
     | awk '{print $1}'
