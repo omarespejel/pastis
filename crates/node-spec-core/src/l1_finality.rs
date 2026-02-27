@@ -9,8 +9,14 @@ pub struct PostedStateRoot {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FinalityError {
-    #[error("duplicate L2 block {l2_block_number} in posted state-root tracker")]
-    DuplicatePostedRoot { l2_block_number: u64 },
+    #[error(
+        "conflicting state root for L2 block {l2_block_number}: existing {existing_root}, new {new_root}"
+    )]
+    ConflictingPostedRoot {
+        l2_block_number: u64,
+        existing_root: String,
+        new_root: String,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -29,9 +35,13 @@ impl L1FinalityTracker {
         &mut self,
         entry: PostedStateRoot,
     ) -> Result<(), FinalityError> {
-        if self.posted_by_l2_block.contains_key(&entry.l2_block_number) {
-            return Err(FinalityError::DuplicatePostedRoot {
+        if let Some(existing) = self.posted_by_l2_block.get(&entry.l2_block_number)
+            && existing.state_root != entry.state_root
+        {
+            return Err(FinalityError::ConflictingPostedRoot {
                 l2_block_number: entry.l2_block_number,
+                existing_root: existing.state_root.clone(),
+                new_root: entry.state_root.clone(),
             });
         }
         self.posted_by_l2_block.insert(entry.l2_block_number, entry);
@@ -66,16 +76,26 @@ impl L1FinalityTracker {
 
     pub fn latest_verified_block(&self) -> Option<u64> {
         let finalized = self.finalized_eth_block?;
-        self.posted_by_l2_block
-            .iter()
-            .rev()
-            .find_map(|(l2_block, entry)| {
-                if entry.eth_block_number <= finalized {
-                    Some(*l2_block)
-                } else {
-                    None
+        let mut latest_verified = None;
+        let mut expected_next = None;
+        for (l2_block, entry) in &self.posted_by_l2_block {
+            if entry.eth_block_number > finalized {
+                continue;
+            }
+            match expected_next {
+                None => {
+                    latest_verified = Some(*l2_block);
+                    expected_next = l2_block.checked_add(1);
                 }
-            })
+                Some(expected) if *l2_block == expected => {
+                    latest_verified = Some(*l2_block);
+                    expected_next = l2_block.checked_add(1);
+                }
+                Some(expected) if *l2_block > expected => break,
+                Some(_) => {}
+            }
+        }
+        latest_verified
     }
 }
 
@@ -173,20 +193,50 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_l2_block_posts() {
+    fn allows_idempotent_reposts_for_same_l2_state_root() {
+        let mut tracker = L1FinalityTracker::default();
+        tracker
+            .record_state_root_posted(root(120, 10_000))
+            .expect("first post");
+        tracker
+            .record_state_root_posted(root(120, 10_010))
+            .expect("idempotent repost");
+    }
+
+    #[test]
+    fn rejects_conflicting_duplicate_l2_block_posts() {
         let mut tracker = L1FinalityTracker::default();
         tracker
             .record_state_root_posted(root(120, 10_000))
             .expect("first insert");
-
         let err = tracker
-            .record_state_root_posted(root(120, 10_050))
-            .expect_err("duplicate should fail");
+            .record_state_root_posted(PostedStateRoot {
+                l2_block_number: 120,
+                state_root: "0xdead".to_string(),
+                eth_block_number: 10_050,
+            })
+            .expect_err("conflicting duplicate should fail");
         assert_eq!(
             err,
-            FinalityError::DuplicatePostedRoot {
-                l2_block_number: 120
+            FinalityError::ConflictingPostedRoot {
+                l2_block_number: 120,
+                existing_root: "0x78".to_string(),
+                new_root: "0xdead".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn does_not_advance_past_gaps_in_finalized_l2_sequence() {
+        let mut tracker = L1FinalityTracker::default();
+        tracker
+            .record_state_root_posted(root(120, 10_000))
+            .expect("record 120");
+        tracker
+            .record_state_root_posted(root(122, 10_001))
+            .expect("record 122");
+        tracker.update_finalized_eth_block(10_100);
+
+        assert_eq!(tracker.latest_verified_block(), Some(120));
     }
 }

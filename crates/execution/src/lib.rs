@@ -427,19 +427,9 @@ impl BlockifierProtocolVersionResolver {
         &self,
         requested: &Version,
     ) -> Result<BlockifierProtocolVersion, ExecutionError> {
-        if let Some(exact) = self.versions.get(requested) {
-            return Ok(*exact);
-        }
-
         self.versions
-            .iter()
-            .filter(|(version, _)| {
-                version.major == requested.major
-                    && version.minor == requested.minor
-                    && version.patch <= requested.patch
-            })
-            .max_by(|(left, _), (right, _)| left.cmp(right))
-            .map(|(_, resolved)| *resolved)
+            .get(requested)
+            .copied()
             .ok_or_else(|| ExecutionError::MissingConstants(requested.clone()))
     }
 }
@@ -1044,7 +1034,7 @@ mod tests {
                     events: 0,
                     gas_consumed: self.gas,
                 },
-                estimated_fee: self.gas,
+                estimated_fee: self.gas as u128,
             })
         }
     }
@@ -1520,12 +1510,15 @@ mod tests {
 
     #[cfg(feature = "blockifier-adapter")]
     #[test]
-    fn blockifier_protocol_resolver_falls_back_to_latest_patch() {
+    fn blockifier_protocol_resolver_rejects_unknown_patch() {
         let resolver = BlockifierProtocolVersionResolver::starknet_mainnet_defaults();
-        let resolved = resolver
+        let err = resolver
             .resolve_for_block(&Version::parse("0.14.3").expect("valid"))
-            .expect("resolve with patch fallback");
-        assert_eq!(resolved.to_string(), "0.14.2");
+            .expect_err("must fail closed");
+        assert_eq!(
+            err,
+            ExecutionError::MissingConstants(Version::parse("0.14.3").expect("valid"))
+        );
     }
 
     #[cfg(feature = "blockifier-adapter")]

@@ -71,6 +71,8 @@ pub enum StateRootSemantics {
 }
 
 pub trait StorageBackend: Send + Sync + HealthCheck {
+    /// Implementations expose mutable methods via `&mut self`; callers are expected to
+    /// synchronize access at the component boundary when mutating from multiple threads.
     fn get_state_reader(
         &self,
         block_number: BlockNumber,
@@ -95,6 +97,8 @@ pub trait StorageBackend: Send + Sync + HealthCheck {
 
 #[derive(Debug, Clone)]
 pub struct InMemoryStorage {
+    // Lightweight single-process backend for tests and local development.
+    // Mutation safety is enforced by `&mut self` and external synchronization.
     blocks: BTreeMap<BlockNumber, StarknetBlock>,
     state_diffs: BTreeMap<BlockNumber, StarknetStateDiff>,
     states: BTreeMap<BlockNumber, InMemoryState>,
@@ -538,7 +542,7 @@ impl StorageBackend for PapyrusStorageAdapter {
                 l1_gas,
                 l1_data_gas,
                 // Starknet v0.13 headers do not carry L2 gas prices.
-                l2_gas: l1_gas,
+                l2_gas: GasPricePerToken::default(),
             },
             protocol_version,
             transactions: Vec::new(),

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 #[cfg(test)]
@@ -71,6 +71,8 @@ pub enum ManagerError {
 pub struct ExExManager {
     tiers: Vec<Vec<String>>,
     sinks: HashMap<String, SharedSink>,
+    sink_failures: HashMap<String, u32>,
+    disabled_sinks: HashSet<String>,
     buffer: VecDeque<(u64, StarknetExExNotification)>,
     next_id: u64,
     max_capacity: usize,
@@ -80,12 +82,15 @@ pub struct ExExManager {
 
 const MAX_PARALLEL_DELIVERY_WORKERS: usize = 32;
 const MAX_WAL_REPLAY_ENTRIES: usize = 100_000;
+const MAX_CONSECUTIVE_SINK_FAILURES: u32 = 3;
 
 impl ExExManager {
     pub fn new(max_capacity: usize) -> Self {
         Self {
             tiers: Vec::new(),
             sinks: HashMap::new(),
+            sink_failures: HashMap::new(),
+            disabled_sinks: HashSet::new(),
             buffer: VecDeque::new(),
             next_id: 1,
             max_capacity,
@@ -108,6 +113,8 @@ impl ExExManager {
     pub fn register(&mut self, registrations: Vec<ExExRegistration>) -> Result<(), ManagerError> {
         let metas: Vec<ExExHandleMeta> = registrations.iter().map(|r| r.meta.clone()).collect();
         self.tiers = build_delivery_tiers(&metas)?;
+        self.sink_failures.clear();
+        self.disabled_sinks.clear();
         self.sinks = registrations
             .into_iter()
             .map(|registration| {
@@ -117,6 +124,9 @@ impl ExExManager {
                 )
             })
             .collect();
+        for name in self.sinks.keys() {
+            self.sink_failures.insert(name.clone(), 0);
+        }
         Ok(())
     }
 
@@ -157,7 +167,8 @@ impl ExExManager {
             return Ok(Some(notification_id));
         }
 
-        for tier in &self.tiers {
+        let tiers = self.tiers.clone();
+        for tier in &tiers {
             // Deterministic barrier: all sinks in current tier must finish before the next tier.
             self.deliver_tier(tier, &notification)?;
         }
@@ -182,17 +193,44 @@ impl ExExManager {
     }
 
     fn deliver_tier(
-        &self,
+        &mut self,
         tier: &[String],
         notification: &StarknetExExNotification,
     ) -> Result<(), ManagerError> {
+        let active_tier: Vec<String> = tier
+            .iter()
+            .filter(|name| !self.disabled_sinks.contains(*name))
+            .cloned()
+            .collect();
+        if active_tier.is_empty() {
+            return Ok(());
+        }
+
         let mut first_error = None;
 
-        let dispatch_batch = |names: &[String]| -> Vec<(String, Result<(), ManagerError>)> {
-            if let Some(pool) = &self.delivery_pool {
-                pool.install(|| {
-                    names
-                        .par_iter()
+        for chunk in active_tier.chunks(MAX_PARALLEL_DELIVERY_WORKERS.max(1)) {
+            let results: Vec<(String, Result<(), ManagerError>)> =
+                if let Some(pool) = &self.delivery_pool {
+                    pool.install(|| {
+                        chunk
+                            .par_iter()
+                            .map(|name| {
+                                let result = catch_unwind(AssertUnwindSafe(|| {
+                                    self.deliver_to_sink(name, notification)
+                                }))
+                                .unwrap_or_else(|_| {
+                                    Err(ManagerError::SinkFailure {
+                                        name: name.clone(),
+                                        message: "sink thread panicked".to_string(),
+                                    })
+                                });
+                                (name.clone(), result)
+                            })
+                            .collect()
+                    })
+                } else {
+                    chunk
+                        .iter()
                         .map(|name| {
                             let result = catch_unwind(AssertUnwindSafe(|| {
                                 self.deliver_to_sink(name, notification)
@@ -206,32 +244,24 @@ impl ExExManager {
                             (name.clone(), result)
                         })
                         .collect()
-                })
-            } else {
-                names
-                    .iter()
-                    .map(|name| {
-                        let result = catch_unwind(AssertUnwindSafe(|| {
-                            self.deliver_to_sink(name, notification)
-                        }))
-                        .unwrap_or_else(|_| {
-                            Err(ManagerError::SinkFailure {
-                                name: name.clone(),
-                                message: "sink thread panicked".to_string(),
-                            })
-                        });
-                        (name.clone(), result)
-                    })
-                    .collect()
-            }
-        };
+                };
 
-        for chunk in tier.chunks(MAX_PARALLEL_DELIVERY_WORKERS.max(1)) {
-            for (_, result) in dispatch_batch(chunk) {
-                if first_error.is_none()
-                    && let Err(err) = result
-                {
-                    first_error = Some(err);
+            for (name, result) in results {
+                match result {
+                    Ok(()) => {
+                        self.sink_failures.insert(name, 0);
+                    }
+                    Err(err) => {
+                        let failures = self.sink_failures.entry(name.clone()).or_insert(0);
+                        *failures = failures.saturating_add(1);
+                        if *failures >= MAX_CONSECUTIVE_SINK_FAILURES {
+                            self.disabled_sinks.insert(name);
+                            continue;
+                        }
+                        if first_error.is_none() {
+                            first_error = Some(err);
+                        }
+                    }
                 }
             }
         }
@@ -263,6 +293,11 @@ impl ExExManager {
                 name: name.to_string(),
                 message,
             })
+    }
+
+    #[cfg(test)]
+    fn is_sink_disabled(&self, name: &str) -> bool {
+        self.disabled_sinks.contains(name)
     }
 }
 
@@ -584,6 +619,51 @@ mod tests {
             if name == "failing" && message == "boom"
         ));
         assert_eq!(manager.buffer.len(), 1);
+    }
+
+    #[test]
+    fn disables_sink_after_repeated_failures_to_unblock_delivery() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut manager = ExExManager::new(8);
+        manager
+            .register(vec![
+                ExExRegistration {
+                    meta: ExExHandleMeta {
+                        name: "always-fail".to_string(),
+                        depends_on: vec![],
+                        priority: 1,
+                    },
+                    sink: Box::new(FailingSink {
+                        message: "permanent-failure".to_string(),
+                        delay: Duration::from_millis(1),
+                    }),
+                },
+                reg("healthy", &[], log.clone()),
+            ])
+            .expect("register");
+        manager.enqueue(sample_notification()).expect("enqueue");
+
+        let first = manager.drain_one().expect_err("first failure");
+        assert!(matches!(
+            first,
+            ManagerError::SinkFailure { name, message }
+            if name == "always-fail" && message == "permanent-failure"
+        ));
+        let second = manager.drain_one().expect_err("second failure");
+        assert!(matches!(
+            second,
+            ManagerError::SinkFailure { name, message }
+            if name == "always-fail" && message == "permanent-failure"
+        ));
+
+        let third = manager.drain_one().expect("circuit breaker should unblock");
+        assert_eq!(third, Some(1));
+        assert!(manager.is_sink_disabled("always-fail"));
+        assert!(manager.buffer.is_empty());
+        assert!(manager.wal().entries().is_empty());
+
+        let calls = log.lock().expect("lock log");
+        assert!(!calls.is_empty());
     }
 
     #[test]
