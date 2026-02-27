@@ -13,6 +13,8 @@ use starknet_node_types::{
 #[cfg(feature = "blockifier-adapter")]
 use std::collections::BTreeMap;
 #[cfg(feature = "blockifier-adapter")]
+use std::str::FromStr;
+#[cfg(feature = "blockifier-adapter")]
 use std::time::Instant;
 
 #[cfg(feature = "blockifier-adapter")]
@@ -494,6 +496,20 @@ impl BlockifierVmBackend {
             .iter()
             .map(|tx| {
                 let executable = self.tx_resolver.resolve(block.number, tx)?;
+                let expected_hash = BlockifierFelt::from_str(&tx.hash).map_err(|error| {
+                    ExecutionError::Backend(format!(
+                        "invalid tx hash '{}' in block {}: {}",
+                        tx.hash, block.number, error
+                    ))
+                })?;
+                if executable.tx_hash().0 != expected_hash {
+                    return Err(ExecutionError::Backend(format!(
+                        "resolver tx hash mismatch for block {}: expected {:#x}, got {:#x}",
+                        block.number,
+                        expected_hash,
+                        executable.tx_hash().0
+                    )));
+                }
                 Ok(BlockifierTransaction::new_for_sequencing(executable))
             })
             .collect()
@@ -766,9 +782,12 @@ mod tests {
         use starknet_api::executable_transaction::{
             L1HandlerTransaction as ExecutableL1Handler, Transaction as ExecutableTx,
         };
+        use starknet_api::transaction::TransactionHash;
         let mut executable = ExecutableL1Handler::default();
         // L1Handler payload size is calldata_len - 1; keep one slot to avoid underflow.
         executable.tx.calldata = vec![Default::default()].into();
+        executable.tx_hash =
+            TransactionHash(BlockifierFelt::from_str(hash).expect("valid tx hash"));
 
         StarknetTransaction::with_executable(hash.to_string(), ExecutableTx::L1Handler(executable))
     }
@@ -781,6 +800,33 @@ mod tests {
         fn resolve(
             &self,
             _block_number: u64,
+            tx: &StarknetTransaction,
+        ) -> Result<ExecutableStarknetTransaction, ExecutionError> {
+            use starknet_api::executable_transaction::{
+                L1HandlerTransaction as ExecutableL1Handler, Transaction as ExecutableTx,
+            };
+            use starknet_api::transaction::TransactionHash;
+
+            let mut executable = ExecutableL1Handler::default();
+            executable.tx.calldata = vec![Default::default()].into();
+            executable.tx_hash =
+                TransactionHash(BlockifierFelt::from_str(&tx.hash).map_err(|error| {
+                    ExecutionError::Backend(format!(
+                        "invalid tx hash provided to StaticExecutableResolver: {error}"
+                    ))
+                })?);
+            Ok(ExecutableTx::L1Handler(executable))
+        }
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    struct MismatchedHashResolver;
+
+    #[cfg(feature = "blockifier-adapter")]
+    impl ExecutableTransactionResolver for MismatchedHashResolver {
+        fn resolve(
+            &self,
+            _block_number: u64,
             _tx: &StarknetTransaction,
         ) -> Result<ExecutableStarknetTransaction, ExecutionError> {
             use starknet_api::executable_transaction::{
@@ -789,6 +835,7 @@ mod tests {
 
             let mut executable = ExecutableL1Handler::default();
             executable.tx.calldata = vec![Default::default()].into();
+            // Keep default tx hash (0x0) to force mismatch against requested tx hash.
             Ok(ExecutableTx::L1Handler(executable))
         }
     }
@@ -1010,6 +1057,24 @@ mod tests {
             .execute_block(&block(12, "0.14.2"), &mut state)
             .expect("execute via external resolver");
         assert_eq!(output.receipts.len(), 1);
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    #[test]
+    fn blockifier_backend_rejects_resolver_hash_mismatches() {
+        let backend = BlockifierVmBackend::starknet_mainnet()
+            .with_tx_resolver(Arc::new(MismatchedHashResolver));
+        let mut state = InMemoryState::default();
+
+        let err = backend
+            .execute_block(&block(12, "0.14.2"), &mut state)
+            .expect_err("must reject mismatched hashes");
+        match err {
+            ExecutionError::Backend(message) => {
+                assert!(message.contains("resolver tx hash mismatch"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
     }
 
     #[cfg(feature = "blockifier-adapter")]
