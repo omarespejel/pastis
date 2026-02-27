@@ -1,4 +1,6 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use node_spec_core::exex_delivery::{DeliveryPlanError, ExExHandleMeta, build_delivery_tiers};
 use node_spec_core::notification::{
@@ -34,6 +36,8 @@ pub struct ExExRegistration {
     pub sink: Box<dyn NotificationSink>,
 }
 
+type SharedSink = Arc<Mutex<Box<dyn NotificationSink>>>;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ManagerError {
     #[error("registration failed: {0}")]
@@ -52,7 +56,7 @@ pub enum ManagerError {
 
 pub struct ExExManager {
     tiers: Vec<Vec<String>>,
-    sinks: HashMap<String, Box<dyn NotificationSink>>,
+    sinks: HashMap<String, SharedSink>,
     buffer: VecDeque<(u64, StarknetExExNotification)>,
     next_id: u64,
     max_capacity: usize,
@@ -84,7 +88,12 @@ impl ExExManager {
         self.tiers = build_delivery_tiers(&metas)?;
         self.sinks = registrations
             .into_iter()
-            .map(|registration| (registration.meta.name, registration.sink))
+            .map(|registration| {
+                (
+                    registration.meta.name,
+                    Arc::new(Mutex::new(registration.sink)),
+                )
+            })
             .collect();
         Ok(())
     }
@@ -117,32 +126,13 @@ impl ExExManager {
         if self.tiers.is_empty() {
             let mut names: Vec<String> = self.sinks.keys().cloned().collect();
             names.sort();
-            for name in names {
-                let sink = self
-                    .sinks
-                    .get_mut(&name)
-                    .ok_or_else(|| ManagerError::MissingSink(name.clone()))?;
-                sink.on_notification(notification.clone())
-                    .map_err(|message| ManagerError::SinkFailure {
-                        name: name.clone(),
-                        message,
-                    })?;
-            }
+            self.deliver_tier(&names, &notification)?;
             return Ok(Some(notification_id));
         }
 
         for tier in &self.tiers {
-            for name in tier {
-                let sink = self
-                    .sinks
-                    .get_mut(name)
-                    .ok_or_else(|| ManagerError::MissingSink(name.clone()))?;
-                sink.on_notification(notification.clone())
-                    .map_err(|message| ManagerError::SinkFailure {
-                        name: name.clone(),
-                        message,
-                    })?;
-            }
+            // Deterministic barrier: all sinks in current tier must finish before the next tier.
+            self.deliver_tier(tier, &notification)?;
         }
 
         Ok(Some(notification_id))
@@ -155,11 +145,56 @@ impl ExExManager {
         }
         Ok(notifications)
     }
+
+    fn deliver_tier(
+        &self,
+        tier: &[String],
+        notification: &StarknetExExNotification,
+    ) -> Result<(), ManagerError> {
+        let mut workers = Vec::with_capacity(tier.len());
+        for name in tier {
+            let sink = self
+                .sinks
+                .get(name)
+                .cloned()
+                .ok_or_else(|| ManagerError::MissingSink(name.clone()))?;
+            let sink_name = name.clone();
+            let cloned_notification = notification.clone();
+            let worker = thread::spawn(move || -> Result<(), ManagerError> {
+                let mut sink_guard = sink.lock().map_err(|_| ManagerError::SinkFailure {
+                    name: sink_name.clone(),
+                    message: "sink mutex poisoned".to_string(),
+                })?;
+                sink_guard
+                    .on_notification(cloned_notification)
+                    .map_err(|message| ManagerError::SinkFailure {
+                        name: sink_name,
+                        message,
+                    })
+            });
+            workers.push(worker);
+        }
+
+        // Deterministic failure ordering: join in planned tier order, not completion order.
+        for worker in workers {
+            match worker.join() {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(ManagerError::SinkFailure {
+                        name: "unknown".to_string(),
+                        message: "sink thread panicked".to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
 
     use node_spec_core::notification::{NotificationV2, StarknetExExNotification};
 
@@ -189,6 +224,57 @@ mod tests {
                 .expect("lock order log")
                 .push(self.name.clone());
             Ok(())
+        }
+    }
+
+    struct SlowSink {
+        name: String,
+        delay: Duration,
+        timeline: Arc<Mutex<HashMap<String, (Instant, Instant)>>>,
+    }
+
+    impl SlowSink {
+        fn new(
+            name: &str,
+            delay: Duration,
+            timeline: Arc<Mutex<HashMap<String, (Instant, Instant)>>>,
+        ) -> Self {
+            Self {
+                name: name.to_string(),
+                delay,
+                timeline,
+            }
+        }
+    }
+
+    impl NotificationSink for SlowSink {
+        fn on_notification(
+            &mut self,
+            _notification: StarknetExExNotification,
+        ) -> Result<(), String> {
+            let start = Instant::now();
+            std::thread::sleep(self.delay);
+            let end = Instant::now();
+            self.timeline
+                .lock()
+                .expect("lock timeline")
+                .insert(self.name.clone(), (start, end));
+            Ok(())
+        }
+    }
+
+    struct FailingSink {
+        message: String,
+        delay: Duration,
+    }
+
+    impl NotificationSink for FailingSink {
+        fn on_notification(
+            &mut self,
+            _notification: StarknetExExNotification,
+        ) -> Result<(), String> {
+            std::thread::sleep(self.delay);
+            Err(self.message.clone())
         }
     }
 
@@ -283,5 +369,158 @@ mod tests {
                 tx_count: 1
             })
         ));
+    }
+
+    #[test]
+    fn delivers_tiers_in_parallel_with_barrier_between_tiers() {
+        let timeline = Arc::new(Mutex::new(HashMap::<String, (Instant, Instant)>::new()));
+        let mut manager = ExExManager::new(8);
+        manager
+            .register(vec![
+                ExExRegistration {
+                    meta: ExExHandleMeta {
+                        name: "tier1-a".to_string(),
+                        depends_on: vec![],
+                        priority: 1,
+                    },
+                    sink: Box::new(SlowSink::new(
+                        "tier1-a",
+                        Duration::from_millis(70),
+                        timeline.clone(),
+                    )),
+                },
+                ExExRegistration {
+                    meta: ExExHandleMeta {
+                        name: "tier1-b".to_string(),
+                        depends_on: vec![],
+                        priority: 1,
+                    },
+                    sink: Box::new(SlowSink::new(
+                        "tier1-b",
+                        Duration::from_millis(70),
+                        timeline.clone(),
+                    )),
+                },
+                ExExRegistration {
+                    meta: ExExHandleMeta {
+                        name: "tier2".to_string(),
+                        depends_on: vec!["tier1-a".to_string(), "tier1-b".to_string()],
+                        priority: 1,
+                    },
+                    sink: Box::new(SlowSink::new(
+                        "tier2",
+                        Duration::from_millis(5),
+                        timeline.clone(),
+                    )),
+                },
+            ])
+            .expect("register");
+
+        let started = Instant::now();
+        manager.enqueue(sample_notification()).expect("enqueue");
+        manager.drain_one().expect("drain");
+        let elapsed = started.elapsed();
+
+        let times = timeline.lock().expect("lock timeline");
+        let tier1_a = times.get("tier1-a").expect("tier1-a");
+        let tier1_b = times.get("tier1-b").expect("tier1-b");
+        let tier2 = times.get("tier2").expect("tier2");
+
+        assert!(elapsed < Duration::from_millis(120));
+        assert!(tier2.0 >= tier1_a.1);
+        assert!(tier2.0 >= tier1_b.1);
+    }
+
+    #[test]
+    fn picks_failures_in_deterministic_tier_order() {
+        let mut manager = ExExManager::new(8);
+        manager
+            .register(vec![
+                ExExRegistration {
+                    meta: ExExHandleMeta {
+                        name: "alpha".to_string(),
+                        depends_on: vec![],
+                        priority: 1,
+                    },
+                    sink: Box::new(FailingSink {
+                        message: "alpha-failure".to_string(),
+                        delay: Duration::from_millis(35),
+                    }),
+                },
+                ExExRegistration {
+                    meta: ExExHandleMeta {
+                        name: "zeta".to_string(),
+                        depends_on: vec![],
+                        priority: 1,
+                    },
+                    sink: Box::new(FailingSink {
+                        message: "zeta-failure".to_string(),
+                        delay: Duration::from_millis(1),
+                    }),
+                },
+            ])
+            .expect("register");
+
+        manager.enqueue(sample_notification()).expect("enqueue");
+        let err = manager.drain_one().expect_err("must fail");
+        assert!(matches!(
+            err,
+            ManagerError::SinkFailure { name, message }
+            if name == "alpha" && message == "alpha-failure"
+        ));
+    }
+
+    #[test]
+    fn wal_recovery_is_stable_under_concurrent_enqueues() {
+        struct NoopSink;
+        impl NotificationSink for NoopSink {
+            fn on_notification(
+                &mut self,
+                _notification: StarknetExExNotification,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let manager = Arc::new(Mutex::new(ExExManager::new(1_024)));
+        manager
+            .lock()
+            .expect("lock manager")
+            .register(vec![ExExRegistration {
+                meta: ExExHandleMeta {
+                    name: "noop".to_string(),
+                    depends_on: vec![],
+                    priority: 1,
+                },
+                sink: Box::new(NoopSink),
+            }])
+            .expect("register");
+
+        let producers = 8usize;
+        let per_producer = 50usize;
+        let mut threads = Vec::new();
+        for _ in 0..producers {
+            let manager = Arc::clone(&manager);
+            threads.push(thread::spawn(move || {
+                for _ in 0..per_producer {
+                    manager
+                        .lock()
+                        .expect("lock manager")
+                        .enqueue(sample_notification())
+                        .expect("enqueue");
+                }
+            }));
+        }
+
+        for t in threads {
+            t.join().expect("join producer");
+        }
+
+        let replayed = manager
+            .lock()
+            .expect("lock manager")
+            .replay_wal()
+            .expect("replay wal");
+        assert_eq!(replayed.len(), producers * per_producer);
     }
 }

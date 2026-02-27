@@ -8,6 +8,51 @@ use starknet_node_types::{
     BlockContext, ExecutionOutput, MutableState, SimulationResult, StarknetBlock,
     StarknetTransaction, StateReader,
 };
+#[cfg(feature = "blockifier-adapter")]
+use std::collections::BTreeMap;
+#[cfg(feature = "blockifier-adapter")]
+use std::time::Instant;
+
+#[cfg(feature = "blockifier-adapter")]
+use blockifier::blockifier::config::TransactionExecutorConfig;
+#[cfg(feature = "blockifier-adapter")]
+use blockifier::blockifier::transaction_executor::TransactionExecutor;
+#[cfg(feature = "blockifier-adapter")]
+use blockifier::blockifier_versioned_constants::VersionedConstants as BlockifierVersionedConstants;
+#[cfg(feature = "blockifier-adapter")]
+use blockifier::bouncer::BouncerConfig;
+#[cfg(feature = "blockifier-adapter")]
+use blockifier::context::{
+    BlockContext as BlockifierBlockContext, ChainInfo as BlockifierChainInfo,
+};
+#[cfg(feature = "blockifier-adapter")]
+use blockifier::execution::contract_class::RunnableCompiledClass;
+#[cfg(feature = "blockifier-adapter")]
+use blockifier::state::errors::StateError;
+#[cfg(feature = "blockifier-adapter")]
+use blockifier::state::state_api::StateReader as BlockifierStateReader;
+#[cfg(feature = "blockifier-adapter")]
+use blockifier::transaction::transaction_execution::Transaction as BlockifierTransaction;
+#[cfg(feature = "blockifier-adapter")]
+use num_traits::ToPrimitive;
+#[cfg(feature = "blockifier-adapter")]
+use starknet_api::block::{
+    BlockHash as BlockifierBlockHash, BlockHashAndNumber as BlockifierBlockHashAndNumber,
+    BlockInfo as BlockifierBlockInfo, BlockNumber as BlockifierBlockNumber,
+    BlockTimestamp as BlockifierBlockTimestamp, GasPrices as BlockifierGasPrices,
+    StarknetVersion as BlockifierProtocolVersion,
+};
+#[cfg(feature = "blockifier-adapter")]
+use starknet_api::core::{
+    ClassHash as BlockifierClassHash, CompiledClassHash as BlockifierCompiledClassHash,
+    ContractAddress as BlockifierContractAddress, Nonce as BlockifierNonce,
+};
+#[cfg(feature = "blockifier-adapter")]
+use starknet_api::hash::StarkHash as BlockifierFelt;
+#[cfg(feature = "blockifier-adapter")]
+use starknet_api::state::StorageKey as BlockifierStorageKey;
+#[cfg(feature = "blockifier-adapter")]
+use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ExecutionError {
@@ -205,6 +250,235 @@ impl ProtocolVersionSelector {
     }
 }
 
+#[cfg(feature = "blockifier-adapter")]
+#[derive(Clone, Debug)]
+pub struct BlockifierProtocolVersionResolver {
+    versions: BTreeMap<Version, BlockifierProtocolVersion>,
+}
+
+#[cfg(feature = "blockifier-adapter")]
+impl BlockifierProtocolVersionResolver {
+    pub fn new(entries: impl IntoIterator<Item = (Version, BlockifierProtocolVersion)>) -> Self {
+        Self {
+            versions: entries.into_iter().collect(),
+        }
+    }
+
+    pub fn starknet_mainnet_defaults() -> Self {
+        let versions = [
+            "0.13.0", "0.13.1", "0.13.2", "0.13.3", "0.13.4", "0.13.5", "0.13.6", "0.14.0",
+            "0.14.1", "0.14.2",
+        ];
+        let entries = versions.into_iter().map(|raw| {
+            let semver = Version::parse(raw).expect("known valid protocol version");
+            let protocol = BlockifierProtocolVersion::try_from(raw)
+                .expect("blockifier supports bundled protocol version");
+            (semver, protocol)
+        });
+        Self::new(entries)
+    }
+
+    pub fn resolve_for_block(
+        &self,
+        requested: &Version,
+    ) -> Result<BlockifierProtocolVersion, ExecutionError> {
+        if let Some(exact) = self.versions.get(requested) {
+            return Ok(*exact);
+        }
+
+        self.versions
+            .iter()
+            .filter(|(version, _)| {
+                version.major == requested.major
+                    && version.minor == requested.minor
+                    && version.patch <= requested.patch
+            })
+            .max_by(|(left, _), (right, _)| left.patch.cmp(&right.patch))
+            .map(|(_, resolved)| *resolved)
+            .ok_or_else(|| ExecutionError::MissingConstants(requested.clone()))
+    }
+}
+
+#[cfg(feature = "blockifier-adapter")]
+#[derive(Clone)]
+struct NullBlockifierStateReader;
+
+#[cfg(feature = "blockifier-adapter")]
+impl BlockifierStateReader for NullBlockifierStateReader {
+    fn get_storage_at(
+        &self,
+        _contract_address: BlockifierContractAddress,
+        _key: BlockifierStorageKey,
+    ) -> Result<BlockifierFelt, StateError> {
+        Ok(BlockifierFelt::ZERO)
+    }
+
+    fn get_nonce_at(
+        &self,
+        _contract_address: BlockifierContractAddress,
+    ) -> Result<BlockifierNonce, StateError> {
+        Ok(BlockifierNonce::default())
+    }
+
+    fn get_class_hash_at(
+        &self,
+        _contract_address: BlockifierContractAddress,
+    ) -> Result<BlockifierClassHash, StateError> {
+        Ok(BlockifierClassHash::default())
+    }
+
+    fn get_compiled_class(
+        &self,
+        class_hash: BlockifierClassHash,
+    ) -> Result<RunnableCompiledClass, StateError> {
+        Err(StateError::UndeclaredClassHash(class_hash))
+    }
+
+    fn get_compiled_class_hash(
+        &self,
+        _class_hash: BlockifierClassHash,
+    ) -> Result<BlockifierCompiledClassHash, StateError> {
+        Ok(BlockifierCompiledClassHash::default())
+    }
+}
+
+#[cfg(feature = "blockifier-adapter")]
+pub struct BlockifierVmBackend {
+    version_resolver: BlockifierProtocolVersionResolver,
+    chain_info: BlockifierChainInfo,
+    executor_config: TransactionExecutorConfig,
+}
+
+#[cfg(feature = "blockifier-adapter")]
+impl BlockifierVmBackend {
+    pub fn new(
+        version_resolver: BlockifierProtocolVersionResolver,
+        chain_info: BlockifierChainInfo,
+        executor_config: TransactionExecutorConfig,
+    ) -> Self {
+        Self {
+            version_resolver,
+            chain_info,
+            executor_config,
+        }
+    }
+
+    pub fn starknet_mainnet() -> Self {
+        Self::new(
+            BlockifierProtocolVersionResolver::starknet_mainnet_defaults(),
+            BlockifierChainInfo::default(),
+            TransactionExecutorConfig::default(),
+        )
+    }
+
+    fn build_block_context(
+        &self,
+        block: &StarknetBlock,
+    ) -> Result<BlockifierBlockContext, ExecutionError> {
+        let protocol = self
+            .version_resolver
+            .resolve_for_block(&block.protocol_version)?;
+        let versioned_constants = BlockifierVersionedConstants::get(&protocol)
+            .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+
+        let block_info = BlockifierBlockInfo {
+            block_number: BlockifierBlockNumber(block.number),
+            block_timestamp: BlockifierBlockTimestamp(block.number),
+            starknet_version: protocol,
+            sequencer_address: BlockifierContractAddress::default(),
+            gas_prices: BlockifierGasPrices::default(),
+            use_kzg_da: false,
+        };
+
+        Ok(BlockifierBlockContext::new(
+            block_info,
+            self.chain_info.clone(),
+            versioned_constants.clone(),
+            BouncerConfig::default(),
+        ))
+    }
+}
+
+#[cfg(feature = "blockifier-adapter")]
+impl ExecutionBackend for BlockifierVmBackend {
+    fn execute_block(
+        &self,
+        block: &StarknetBlock,
+        _state: &mut dyn MutableState,
+    ) -> Result<ExecutionOutput, ExecutionError> {
+        let block_context = self.build_block_context(block)?;
+
+        if !block.transactions.is_empty() {
+            return Err(ExecutionError::Backend(
+                "unsupported transaction payload for blockifier backend; expected native \
+                 executable transactions"
+                    .to_string(),
+            ));
+        }
+
+        let mut executor = TransactionExecutor::pre_process_and_create(
+            NullBlockifierStateReader,
+            block_context,
+            (block.number >= 10).then_some(BlockifierBlockHashAndNumber {
+                hash: BlockifierBlockHash::default(),
+                number: BlockifierBlockNumber(block.number.saturating_sub(10)),
+            }),
+            self.executor_config.clone(),
+        )
+        .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+
+        let txs: Vec<BlockifierTransaction> = Vec::new();
+        let _ = executor.execute_txs(
+            &txs,
+            Some(Instant::now() + std::time::Duration::from_secs(1)),
+        );
+        let summary = executor
+            .finalize()
+            .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+
+        let mut state_diff = starknet_node_types::StarknetStateDiff::default();
+        for (address, writes) in summary.state_diff.storage_updates {
+            let contract_felt: BlockifierFelt = address.into();
+            let contract = format!("{:#x}", contract_felt);
+            let contract_writes = state_diff.storage_diffs.entry(contract).or_default();
+            for (key, value) in writes {
+                let key_felt: BlockifierFelt = key.into();
+                contract_writes.insert(format!("{:#x}", key_felt), value.to_u64().unwrap_or(0));
+            }
+        }
+        for (address, nonce) in summary.state_diff.address_to_nonce {
+            let contract_felt: BlockifierFelt = address.into();
+            state_diff.nonces.insert(
+                format!("{:#x}", contract_felt),
+                nonce.0.to_u64().unwrap_or(0),
+            );
+        }
+        for class_hash in summary.state_diff.class_hash_to_compiled_class_hash.keys() {
+            state_diff
+                .declared_classes
+                .push(format!("{:#x}", class_hash.0));
+        }
+
+        Ok(ExecutionOutput {
+            receipts: Vec::new(),
+            state_diff,
+            builtin_stats: starknet_node_types::BuiltinStats::default(),
+            execution_time: std::time::Duration::from_millis(0),
+        })
+    }
+
+    fn simulate_tx(
+        &self,
+        _tx: &StarknetTransaction,
+        _state: &dyn StateReader,
+        _block_context: &BlockContext,
+    ) -> Result<SimulationResult, ExecutionError> {
+        Err(ExecutionError::Backend(
+            "simulate_tx is not yet implemented for blockifier backend adapter".to_string(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -309,6 +583,15 @@ mod tests {
             transactions: vec![StarknetTransaction {
                 hash: format!("0x{number:x}"),
             }],
+        }
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    fn empty_block(number: u64, version: &str) -> StarknetBlock {
+        StarknetBlock {
+            number,
+            protocol_version: Version::parse(version).expect("valid version"),
+            transactions: Vec::new(),
         }
     }
 
@@ -481,5 +764,39 @@ mod tests {
             err,
             ExecutionError::MissingConstants(Version::parse("0.15.0").expect("valid"))
         );
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    #[test]
+    fn blockifier_protocol_resolver_falls_back_to_latest_patch() {
+        let resolver = BlockifierProtocolVersionResolver::starknet_mainnet_defaults();
+        let resolved = resolver
+            .resolve_for_block(&Version::parse("0.14.3").expect("valid"))
+            .expect("resolve with patch fallback");
+        assert_eq!(resolved.to_string(), "0.14.2");
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    #[test]
+    fn blockifier_backend_executes_empty_block_with_real_context() {
+        let backend = BlockifierVmBackend::starknet_mainnet();
+        let mut state = InMemoryState::default();
+
+        let output = backend
+            .execute_block(&empty_block(11, "0.14.2"), &mut state)
+            .expect("execute empty block");
+        assert!(output.receipts.is_empty());
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    #[test]
+    fn blockifier_backend_fails_closed_for_unconverted_transactions() {
+        let backend = BlockifierVmBackend::starknet_mainnet();
+        let mut state = InMemoryState::default();
+
+        let err = backend
+            .execute_block(&block(12, "0.14.2"), &mut state)
+            .expect_err("must fail");
+        assert!(matches!(err, ExecutionError::Backend(_)));
     }
 }

@@ -1,5 +1,17 @@
 use std::collections::BTreeMap;
 
+#[cfg(feature = "papyrus-adapter")]
+use papyrus_storage::header::HeaderStorageReader;
+#[cfg(feature = "papyrus-adapter")]
+use papyrus_storage::state::StateStorageReader;
+#[cfg(feature = "papyrus-adapter")]
+use papyrus_storage::{
+    StorageConfig as PapyrusStorageConfig, StorageReader as PapyrusStorageReader,
+    StorageWriter as PapyrusStorageWriter, open_storage as open_papyrus_storage,
+};
+#[cfg(feature = "papyrus-adapter")]
+use starknet_api::block::BlockNumber as PapyrusBlockNumber;
+
 use sha2::{Digest, Sha256};
 use starknet_node_types::{
     BlockId, BlockNumber, ComponentHealth, HealthCheck, HealthStatus, InMemoryState, StarknetBlock,
@@ -10,6 +22,14 @@ use starknet_node_types::{
 pub enum StorageError {
     #[error("block {0} does not extend current tip")]
     NonSequentialBlock(BlockNumber),
+    #[error("operation not supported by backend: {0}")]
+    UnsupportedOperation(&'static str),
+    #[cfg(feature = "papyrus-adapter")]
+    #[error("papyrus storage error: {0}")]
+    Papyrus(String),
+    #[cfg(feature = "papyrus-adapter")]
+    #[error("invalid protocol version in papyrus header: {0}")]
+    InvalidProtocolVersion(String),
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -180,6 +200,175 @@ impl CheckpointSyncVerifier {
     }
 }
 
+#[cfg(feature = "papyrus-adapter")]
+pub struct PapyrusStorageAdapter {
+    reader: PapyrusStorageReader,
+    _writer: PapyrusStorageWriter,
+}
+
+#[cfg(feature = "papyrus-adapter")]
+impl PapyrusStorageAdapter {
+    pub fn open(config: PapyrusStorageConfig) -> Result<Self, StorageError> {
+        let (reader, writer) = open_papyrus_storage(config)
+            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+        Ok(Self {
+            reader,
+            _writer: writer,
+        })
+    }
+
+    pub fn from_parts(reader: PapyrusStorageReader, writer: PapyrusStorageWriter) -> Self {
+        Self {
+            reader,
+            _writer: writer,
+        }
+    }
+
+    pub fn read_current_state_root(&self) -> Result<String, StorageError> {
+        let txn = self
+            .reader
+            .begin_ro_txn()
+            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+        let marker = txn
+            .get_header_marker()
+            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+        let Some(latest_number) = latest_block_from_marker(marker) else {
+            return Ok("0x0".to_string());
+        };
+
+        let header = txn
+            .get_block_header(latest_number)
+            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+        match header {
+            Some(header) => Ok(format!("{:#x}", header.state_root.0)),
+            None => Ok("0x0".to_string()),
+        }
+    }
+}
+
+#[cfg(feature = "papyrus-adapter")]
+fn latest_block_from_marker(marker: PapyrusBlockNumber) -> Option<PapyrusBlockNumber> {
+    marker.0.checked_sub(1).map(PapyrusBlockNumber)
+}
+
+#[cfg(feature = "papyrus-adapter")]
+impl HealthCheck for PapyrusStorageAdapter {
+    fn is_healthy(&self) -> bool {
+        self.read_current_state_root().is_ok()
+    }
+
+    fn detailed_status(&self) -> ComponentHealth {
+        let latest_block_processed = self.latest_block_number().ok();
+        let error = self
+            .read_current_state_root()
+            .err()
+            .map(|error| error.to_string());
+        ComponentHealth {
+            name: "papyrus-storage-adapter".to_string(),
+            status: if error.is_none() {
+                HealthStatus::Healthy
+            } else {
+                HealthStatus::Unhealthy
+            },
+            last_block_processed: latest_block_processed,
+            sync_lag: None,
+            error,
+        }
+    }
+}
+
+#[cfg(feature = "papyrus-adapter")]
+impl StorageBackend for PapyrusStorageAdapter {
+    fn get_state_reader(
+        &self,
+        _block_number: BlockNumber,
+    ) -> Result<Box<dyn StateReader>, StorageError> {
+        Err(StorageError::UnsupportedOperation(
+            "get_state_reader is not yet implemented for papyrus adapter",
+        ))
+    }
+
+    fn apply_state_diff(&mut self, _diff: &StarknetStateDiff) -> Result<(), StorageError> {
+        Err(StorageError::UnsupportedOperation(
+            "apply_state_diff is not supported for papyrus adapter",
+        ))
+    }
+
+    fn insert_block(
+        &mut self,
+        _block: StarknetBlock,
+        _state_diff: StarknetStateDiff,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::UnsupportedOperation(
+            "insert_block is not supported for papyrus adapter",
+        ))
+    }
+
+    fn get_block(&self, id: BlockId) -> Result<Option<StarknetBlock>, StorageError> {
+        let txn = self
+            .reader
+            .begin_ro_txn()
+            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+        let number = match id {
+            BlockId::Number(number) => PapyrusBlockNumber(number),
+            BlockId::Latest => {
+                let marker = txn
+                    .get_header_marker()
+                    .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+                let Some(latest) = latest_block_from_marker(marker) else {
+                    return Ok(None);
+                };
+                latest
+            }
+        };
+
+        let header = txn
+            .get_block_header(number)
+            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+        let Some(header) = header else {
+            return Ok(None);
+        };
+
+        let protocol_version = semver::Version::parse(&header.starknet_version.to_string())
+            .map_err(|error| StorageError::InvalidProtocolVersion(error.to_string()))?;
+        Ok(Some(StarknetBlock {
+            number: number.0,
+            protocol_version,
+            transactions: Vec::new(),
+        }))
+    }
+
+    fn get_state_diff(
+        &self,
+        block_number: BlockNumber,
+    ) -> Result<Option<StarknetStateDiff>, StorageError> {
+        let txn = self
+            .reader
+            .begin_ro_txn()
+            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+        let maybe_diff = txn
+            .get_state_diff(PapyrusBlockNumber(block_number))
+            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+        Ok(maybe_diff.map(|_| StarknetStateDiff::default()))
+    }
+
+    fn latest_block_number(&self) -> Result<BlockNumber, StorageError> {
+        let txn = self
+            .reader
+            .begin_ro_txn()
+            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+        let marker = txn
+            .get_header_marker()
+            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+        Ok(latest_block_from_marker(marker).map(|n| n.0).unwrap_or(0))
+    }
+
+    fn current_state_root(&self) -> String {
+        self.read_current_state_root()
+            .unwrap_or_else(|_| "0x0".to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use semver::Version;
@@ -258,5 +447,112 @@ mod tests {
             .expect("get latest")
             .expect("must exist");
         assert_eq!(latest.number, 2);
+    }
+}
+
+#[cfg(all(test, feature = "papyrus-adapter"))]
+mod papyrus_tests {
+    use std::path::Path;
+
+    use papyrus_storage::db::DbConfig;
+    use papyrus_storage::header::HeaderStorageWriter;
+    use papyrus_storage::mmap_file::MmapFileConfig;
+    use papyrus_storage::{StorageConfig as PapyrusStorageConfig, StorageScope};
+    use serde::Deserialize;
+    use starknet_api::block::{
+        BlockHeader, BlockNumber as PapyrusBlockNumber, StarknetVersion as PapyrusVersion,
+    };
+    use starknet_api::core::ChainId;
+    use starknet_types_core::felt::Felt;
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[derive(Debug, Deserialize)]
+    struct StarknetFixture {
+        block_number: u64,
+        state_root: String,
+        protocol_version: String,
+    }
+
+    fn papyrus_config(path: &Path) -> PapyrusStorageConfig {
+        PapyrusStorageConfig {
+            db_config: DbConfig {
+                path_prefix: path.to_path_buf(),
+                chain_id: ChainId::Other("SN_MAIN".to_string()),
+                enforce_file_exists: false,
+                min_size: 1 << 20,
+                max_size: 1 << 35,
+                growth_step: 1 << 26,
+            },
+            mmap_file_config: MmapFileConfig {
+                max_size: 1 << 24,
+                growth_step: 1 << 20,
+                max_object_size: 1 << 16,
+            },
+            scope: StorageScope::FullArchive,
+        }
+    }
+
+    fn parse_fixture() -> StarknetFixture {
+        serde_json::from_str(include_str!(
+            "../tests/fixtures/starknet_mainnet_block0.json"
+        ))
+        .expect("valid fixture json")
+    }
+
+    fn seed_header(
+        adapter: &mut PapyrusStorageAdapter,
+        fixture: &StarknetFixture,
+    ) -> Result<(), StorageError> {
+        let root = Felt::from_hex(&fixture.state_root)
+            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+        let header = BlockHeader {
+            state_root: starknet_api::core::GlobalRoot(root),
+            starknet_version: PapyrusVersion(fixture.protocol_version.clone()),
+            ..BlockHeader::default()
+        };
+
+        adapter
+            ._writer
+            .begin_rw_txn()
+            .map_err(|error| StorageError::Papyrus(error.to_string()))?
+            .append_header(PapyrusBlockNumber(fixture.block_number), &header)
+            .map_err(|error| StorageError::Papyrus(error.to_string()))?
+            .commit()
+            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn papyrus_adapter_reads_fixture_root_and_latest_block() {
+        let fixture = parse_fixture();
+        let dir = tempdir().expect("temp dir");
+        let mut adapter =
+            PapyrusStorageAdapter::open(papyrus_config(dir.path())).expect("open papyrus");
+
+        seed_header(&mut adapter, &fixture).expect("seed header");
+
+        assert_eq!(
+            adapter.latest_block_number().expect("latest"),
+            fixture.block_number
+        );
+        let root = adapter.read_current_state_root().expect("root");
+        let actual = Felt::from_hex(&root).expect("hex root");
+        let expected = Felt::from_hex(&fixture.state_root).expect("fixture root");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn checkpoint_verifier_accepts_fixture_root_from_papyrus_adapter() {
+        let fixture = parse_fixture();
+        let dir = tempdir().expect("temp dir");
+        let mut adapter =
+            PapyrusStorageAdapter::open(papyrus_config(dir.path())).expect("open papyrus");
+
+        seed_header(&mut adapter, &fixture).expect("seed header");
+
+        CheckpointSyncVerifier::verify(&adapter, &fixture.state_root).expect("checkpoint ok");
     }
 }
