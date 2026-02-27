@@ -9,6 +9,8 @@ use semver::Version;
 #[cfg(feature = "blockifier-adapter")]
 use starknet_node_types::BlockGasPrices;
 #[cfg(feature = "blockifier-adapter")]
+use starknet_node_types::GasPricePerToken;
+#[cfg(feature = "blockifier-adapter")]
 use starknet_node_types::StarknetFelt;
 use starknet_node_types::{
     BlockContext, ExecutionOutput, MutableState, SimulationResult, StarknetBlock,
@@ -588,6 +590,80 @@ impl BlockifierStateReader for BlockifierStateReaderAdapter {
 }
 
 #[cfg(feature = "blockifier-adapter")]
+struct BlockifierReadOnlyStateAdapter<'a> {
+    state: &'a dyn StateReader,
+}
+
+#[cfg(feature = "blockifier-adapter")]
+impl<'a> BlockifierReadOnlyStateAdapter<'a> {
+    fn new(state: &'a dyn StateReader) -> Self {
+        Self { state }
+    }
+}
+
+#[cfg(feature = "blockifier-adapter")]
+impl BlockifierStateReader for BlockifierReadOnlyStateAdapter<'_> {
+    fn get_storage_at(
+        &self,
+        contract_address: BlockifierContractAddress,
+        key: BlockifierStorageKey,
+    ) -> Result<BlockifierFelt, StateError> {
+        let contract_felt: BlockifierFelt = contract_address.into();
+        let key_felt: BlockifierFelt = key.into();
+        let value = self
+            .state
+            .get_storage(
+                &format!("{:#x}", contract_felt),
+                &format!("{:#x}", key_felt),
+            )
+            .unwrap_or_default();
+        node_felt_to_blockifier(value, "state.storage")
+    }
+
+    fn get_nonce_at(
+        &self,
+        contract_address: BlockifierContractAddress,
+    ) -> Result<BlockifierNonce, StateError> {
+        let contract_felt: BlockifierFelt = contract_address.into();
+        let nonce = self
+            .state
+            .nonce_of(&format!("{:#x}", contract_felt))
+            .unwrap_or_default();
+        Ok(BlockifierNonce(node_felt_to_blockifier(
+            nonce,
+            "state.nonce",
+        )?))
+    }
+
+    fn get_class_hash_at(
+        &self,
+        _contract_address: BlockifierContractAddress,
+    ) -> Result<BlockifierClassHash, StateError> {
+        Err(StateError::StateReadError(
+            "class hash lookup unsupported by generic StateReader adapter".to_string(),
+        ))
+    }
+
+    fn get_compiled_class(
+        &self,
+        _class_hash: BlockifierClassHash,
+    ) -> Result<RunnableCompiledClass, StateError> {
+        Err(StateError::StateReadError(
+            "compiled class lookup unsupported by generic StateReader adapter".to_string(),
+        ))
+    }
+
+    fn get_compiled_class_hash(
+        &self,
+        _class_hash: BlockifierClassHash,
+    ) -> Result<BlockifierCompiledClassHash, StateError> {
+        Err(StateError::StateReadError(
+            "compiled class hash lookup unsupported by generic StateReader adapter".to_string(),
+        ))
+    }
+}
+
+#[cfg(feature = "blockifier-adapter")]
 pub trait ExecutableTransactionResolver: Send + Sync {
     fn resolve(
         &self,
@@ -663,21 +739,40 @@ impl BlockifierVmBackend {
         )
     }
 
-    fn build_block_context(
+    fn simulation_gas_prices() -> BlockGasPrices {
+        BlockGasPrices {
+            l1_gas: GasPricePerToken {
+                price_in_fri: 1,
+                price_in_wei: 1,
+            },
+            l1_data_gas: GasPricePerToken {
+                price_in_fri: 1,
+                price_in_wei: 1,
+            },
+            l2_gas: GasPricePerToken {
+                price_in_fri: 1,
+                price_in_wei: 1,
+            },
+        }
+    }
+
+    fn build_block_context_from_parts(
         &self,
-        block: &StarknetBlock,
+        block_number: u64,
+        timestamp: u64,
+        protocol_version: &Version,
+        sequencer_address: &str,
+        gas_prices: &BlockGasPrices,
     ) -> Result<BlockifierBlockContext, ExecutionError> {
-        let protocol = self
-            .version_resolver
-            .resolve_for_block(&block.protocol_version)?;
+        let protocol = self.version_resolver.resolve_for_block(protocol_version)?;
         let versioned_constants = BlockifierVersionedConstants::get(&protocol)
             .map_err(|error| ExecutionError::Backend(error.to_string()))?;
-        let sequencer_address = parse_blockifier_sequencer_address(&block.sequencer_address)?;
-        let gas_prices = map_block_gas_prices(&block.gas_prices)?;
+        let sequencer_address = parse_blockifier_sequencer_address(sequencer_address)?;
+        let gas_prices = map_block_gas_prices(gas_prices)?;
 
         let block_info = BlockifierBlockInfo {
-            block_number: BlockifierBlockNumber(block.number),
-            block_timestamp: BlockifierBlockTimestamp(block.timestamp),
+            block_number: BlockifierBlockNumber(block_number),
+            block_timestamp: BlockifierBlockTimestamp(timestamp),
             starknet_version: protocol,
             sequencer_address,
             gas_prices,
@@ -692,6 +787,64 @@ impl BlockifierVmBackend {
         ))
     }
 
+    fn build_block_context(
+        &self,
+        block: &StarknetBlock,
+    ) -> Result<BlockifierBlockContext, ExecutionError> {
+        self.build_block_context_from_parts(
+            block.number,
+            block.timestamp,
+            &block.protocol_version,
+            &block.sequencer_address,
+            &block.gas_prices,
+        )
+    }
+
+    fn build_simulation_context(
+        &self,
+        block_context: &BlockContext,
+    ) -> Result<BlockifierBlockContext, ExecutionError> {
+        self.build_block_context_from_parts(
+            block_context.block_number,
+            0,
+            &block_context.protocol_version,
+            "0x1",
+            &Self::simulation_gas_prices(),
+        )
+    }
+
+    fn map_transaction_for_block(
+        &self,
+        block_number: u64,
+        tx: &StarknetTransaction,
+    ) -> Result<BlockifierTransaction, ExecutionError> {
+        let executable = self.tx_resolver.resolve(block_number, tx)?;
+        let expected_hash = BlockifierFelt::from_str(&tx.hash).map_err(|error| {
+            ExecutionError::Backend(format!(
+                "invalid tx hash '{}' in block {}: {}",
+                tx.hash, block_number, error
+            ))
+        })?;
+        if executable.tx_hash().0 != expected_hash {
+            return Err(ExecutionError::Backend(format!(
+                "resolver tx hash mismatch for block {}: expected {:#x}, got {:#x}",
+                block_number,
+                expected_hash,
+                executable.tx_hash().0
+            )));
+        }
+        if let ExecutableStarknetTransaction::L1Handler(l1_handler) = &executable
+            && l1_handler.tx.calldata.0.is_empty()
+        {
+            return Err(ExecutionError::Backend(format!(
+                "invalid L1 handler tx {} in block {}: calldata must include the from-address \
+                 slot",
+                tx.hash, block_number
+            )));
+        }
+        Ok(BlockifierTransaction::new_for_sequencing(executable))
+    }
+
     fn map_block_transactions(
         &self,
         block: &StarknetBlock,
@@ -699,33 +852,7 @@ impl BlockifierVmBackend {
         block
             .transactions
             .iter()
-            .map(|tx| {
-                let executable = self.tx_resolver.resolve(block.number, tx)?;
-                let expected_hash = BlockifierFelt::from_str(&tx.hash).map_err(|error| {
-                    ExecutionError::Backend(format!(
-                        "invalid tx hash '{}' in block {}: {}",
-                        tx.hash, block.number, error
-                    ))
-                })?;
-                if executable.tx_hash().0 != expected_hash {
-                    return Err(ExecutionError::Backend(format!(
-                        "resolver tx hash mismatch for block {}: expected {:#x}, got {:#x}",
-                        block.number,
-                        expected_hash,
-                        executable.tx_hash().0
-                    )));
-                }
-                if let ExecutableStarknetTransaction::L1Handler(l1_handler) = &executable
-                    && l1_handler.tx.calldata.0.is_empty()
-                {
-                    return Err(ExecutionError::Backend(format!(
-                        "invalid L1 handler tx {} in block {}: calldata must include the \
-                         from-address slot",
-                        tx.hash, block.number
-                    )));
-                }
-                Ok(BlockifierTransaction::new_for_sequencing(executable))
-            })
+            .map(|tx| self.map_transaction_for_block(block.number, tx))
             .collect()
     }
 
@@ -936,13 +1063,53 @@ impl ExecutionBackend for BlockifierVmBackend {
 
     fn simulate_tx(
         &self,
-        _tx: &StarknetTransaction,
-        _state: &dyn StateReader,
-        _block_context: &BlockContext,
+        tx: &StarknetTransaction,
+        state: &dyn StateReader,
+        block_context: &BlockContext,
     ) -> Result<SimulationResult, ExecutionError> {
-        Err(ExecutionError::Backend(
-            "simulate_tx is not yet implemented for blockifier backend adapter".to_string(),
-        ))
+        let blockifier_context = self.build_simulation_context(block_context)?;
+        let mapped_tx = self.map_transaction_for_block(block_context.block_number, tx)?;
+        let mut executor = TransactionExecutor::pre_process_and_create(
+            BlockifierReadOnlyStateAdapter::new(state),
+            blockifier_context,
+            (block_context.block_number >= 10).then_some(BlockifierBlockHashAndNumber {
+                hash: BlockifierBlockHash::default(),
+                number: BlockifierBlockNumber(block_context.block_number.saturating_sub(10)),
+            }),
+            self.executor_config.clone(),
+        )
+        .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+
+        match executor.execute(&mapped_tx) {
+            Ok((execution_info, _)) => {
+                let gas_consumed = Self::gas_consumed_from_receipt(&execution_info.receipt);
+                Ok(SimulationResult {
+                    receipt: starknet_node_types::StarknetReceipt {
+                        tx_hash: tx.hash.clone(),
+                        execution_status: !execution_info.is_reverted(),
+                        events: execution_info
+                            .non_optional_call_infos()
+                            .map(|call_info| call_info.execution.events.len() as u64)
+                            .sum(),
+                        gas_consumed,
+                    },
+                    estimated_fee: u128::from(gas_consumed),
+                })
+            }
+            Err(TransactionExecutorError::TransactionExecutionError(_)) => Ok(SimulationResult {
+                receipt: starknet_node_types::StarknetReceipt {
+                    tx_hash: tx.hash.clone(),
+                    execution_status: false,
+                    events: 0,
+                    gas_consumed: 0,
+                },
+                estimated_fee: 0,
+            }),
+            Err(other) => Err(ExecutionError::Backend(format!(
+                "fatal blockifier simulation error at block {} for tx {}: {}",
+                block_context.block_number, tx.hash, other
+            ))),
+        }
     }
 }
 
@@ -1113,6 +1280,14 @@ mod tests {
             gas_prices: sample_gas_prices(),
             protocol_version: Version::parse(version).expect("valid version"),
             transactions: vec![StarknetTransaction::new(format!("0x{number:x}"))],
+        }
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    fn context(block_number: u64, version: &str) -> BlockContext {
+        BlockContext {
+            block_number,
+            protocol_version: Version::parse(version).expect("valid version"),
         }
     }
 
@@ -1655,5 +1830,38 @@ mod tests {
             .expect("second block");
 
         assert_eq!(clone_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    #[test]
+    fn blockifier_backend_simulate_tx_executes_via_blockifier_context() {
+        let backend = BlockifierVmBackend::starknet_mainnet();
+        let state = InMemoryState::default();
+        let tx = executable_l1_handler_tx("0xabc");
+
+        let simulation = backend
+            .simulate_tx(&tx, &state, &context(12, "0.14.2"))
+            .expect("simulate tx");
+        assert_eq!(simulation.receipt.tx_hash, "0xabc");
+        assert_eq!(
+            simulation.estimated_fee,
+            u128::from(simulation.receipt.gas_consumed)
+        );
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    #[test]
+    fn blockifier_backend_simulate_tx_fails_closed_on_unknown_protocol() {
+        let backend = BlockifierVmBackend::starknet_mainnet();
+        let state = InMemoryState::default();
+        let tx = executable_l1_handler_tx("0xabc");
+
+        let err = backend
+            .simulate_tx(&tx, &state, &context(12, "0.14.3"))
+            .expect_err("must fail closed on unknown protocol");
+        assert_eq!(
+            err,
+            ExecutionError::MissingConstants(Version::parse("0.14.3").expect("valid version"))
+        );
     }
 }
