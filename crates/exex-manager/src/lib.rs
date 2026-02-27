@@ -172,16 +172,16 @@ impl ExExManager {
                         message,
                     })
             });
-            workers.push(worker);
+            workers.push((name.clone(), worker));
         }
 
         // Deterministic failure ordering: join in planned tier order, not completion order.
-        for worker in workers {
+        for (name, worker) in workers {
             match worker.join() {
                 Ok(result) => result?,
                 Err(_) => {
                     return Err(ManagerError::SinkFailure {
-                        name: "unknown".to_string(),
+                        name,
                         message: "sink thread panicked".to_string(),
                     });
                 }
@@ -275,6 +275,17 @@ mod tests {
         ) -> Result<(), String> {
             std::thread::sleep(self.delay);
             Err(self.message.clone())
+        }
+    }
+
+    struct PanickingSink;
+
+    impl NotificationSink for PanickingSink {
+        fn on_notification(
+            &mut self,
+            _notification: StarknetExExNotification,
+        ) -> Result<(), String> {
+            panic!("intentional sink panic for test");
         }
     }
 
@@ -522,5 +533,28 @@ mod tests {
             .replay_wal()
             .expect("replay wal");
         assert_eq!(replayed.len(), producers * per_producer);
+    }
+
+    #[test]
+    fn reports_panicking_sink_name_deterministically() {
+        let mut manager = ExExManager::new(8);
+        manager
+            .register(vec![ExExRegistration {
+                meta: ExExHandleMeta {
+                    name: "panic-sink".to_string(),
+                    depends_on: vec![],
+                    priority: 1,
+                },
+                sink: Box::new(PanickingSink),
+            }])
+            .expect("register");
+
+        manager.enqueue(sample_notification()).expect("enqueue");
+        let err = manager.drain_one().expect_err("must fail on panic");
+        assert!(matches!(
+            err,
+            ManagerError::SinkFailure { name, message }
+            if name == "panic-sink" && message == "sink thread panicked"
+        ));
     }
 }
