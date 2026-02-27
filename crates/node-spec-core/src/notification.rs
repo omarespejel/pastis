@@ -1,3 +1,4 @@
+use bincode::Options;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,22 +20,44 @@ pub enum StarknetExExNotification {
     V2(NotificationV2),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum NotificationDecodeError {
+    #[error("wal entry size {size} exceeds max {max}")]
+    EntryTooLarge { size: usize, max: usize },
     #[error("failed to decode WAL entry: {0}")]
     Decode(String),
 }
 
+const LEGACY_V1_ENTRY_SIZE_BYTES: usize = core::mem::size_of::<u64>() * 2;
+const MAX_NOTIFICATION_ENTRY_BYTES: usize = 1024 * 1024;
+
+fn wal_bincode_options() -> impl Options {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+}
+
 pub fn decode_wal_entry(bytes: &[u8]) -> Result<StarknetExExNotification, NotificationDecodeError> {
-    match bincode::deserialize::<StarknetExExNotification>(bytes) {
+    if bytes.len() > MAX_NOTIFICATION_ENTRY_BYTES {
+        return Err(NotificationDecodeError::EntryTooLarge {
+            size: bytes.len(),
+            max: MAX_NOTIFICATION_ENTRY_BYTES,
+        });
+    }
+
+    match wal_bincode_options().deserialize::<StarknetExExNotification>(bytes) {
         Ok(notification) => Ok(notification),
-        Err(enum_error) => bincode::deserialize::<NotificationV1>(bytes)
+        Err(enum_error) if bytes.len() == LEGACY_V1_ENTRY_SIZE_BYTES => wal_bincode_options()
+            .deserialize::<NotificationV1>(bytes)
             .map(StarknetExExNotification::V1)
             .map_err(|legacy_error| {
                 NotificationDecodeError::Decode(format!(
                     "enum decode error: {enum_error}; legacy decode error: {legacy_error}"
                 ))
             }),
+        Err(enum_error) => Err(NotificationDecodeError::Decode(format!(
+            "enum decode error: {enum_error}"
+        ))),
     }
 }
 
@@ -44,12 +67,13 @@ mod tests {
 
     #[test]
     fn decodes_versioned_v2_entry() {
-        let encoded = bincode::serialize(&StarknetExExNotification::V2(NotificationV2 {
-            block_number: 42,
-            tx_count: 6,
-            event_count: 9,
-        }))
-        .expect("serialize v2");
+        let encoded = wal_bincode_options()
+            .serialize(&StarknetExExNotification::V2(NotificationV2 {
+                block_number: 42,
+                tx_count: 6,
+                event_count: 9,
+            }))
+            .expect("serialize v2");
 
         let decoded = decode_wal_entry(&encoded).expect("decode v2");
         assert_eq!(
@@ -64,11 +88,12 @@ mod tests {
 
     #[test]
     fn decodes_legacy_v1_payload_without_enum_wrapper() {
-        let legacy_bytes = bincode::serialize(&NotificationV1 {
-            block_number: 9,
-            tx_count: 3,
-        })
-        .expect("serialize v1");
+        let legacy_bytes = wal_bincode_options()
+            .serialize(&NotificationV1 {
+                block_number: 9,
+                tx_count: 3,
+            })
+            .expect("serialize v1");
 
         let decoded = decode_wal_entry(&legacy_bytes).expect("decode legacy");
         assert_eq!(
@@ -77,6 +102,33 @@ mod tests {
                 block_number: 9,
                 tx_count: 3,
             })
+        );
+    }
+
+    #[test]
+    fn rejects_v1_fallback_for_non_legacy_payload_lengths() {
+        let mut legacy_plus_tail = wal_bincode_options()
+            .serialize(&NotificationV1 {
+                block_number: 9,
+                tx_count: 3,
+            })
+            .expect("serialize v1");
+        legacy_plus_tail.push(0xAA);
+
+        let err = decode_wal_entry(&legacy_plus_tail).expect_err("must fail");
+        assert!(matches!(err, NotificationDecodeError::Decode(_)));
+    }
+
+    #[test]
+    fn rejects_oversized_wal_entry_before_deserialization() {
+        let bytes = vec![0u8; MAX_NOTIFICATION_ENTRY_BYTES + 1];
+        let err = decode_wal_entry(&bytes).expect_err("must fail");
+        assert_eq!(
+            err,
+            NotificationDecodeError::EntryTooLarge {
+                size: MAX_NOTIFICATION_ENTRY_BYTES + 1,
+                max: MAX_NOTIFICATION_ENTRY_BYTES,
+            }
         );
     }
 }

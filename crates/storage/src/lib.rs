@@ -1,9 +1,6 @@
 use std::collections::BTreeMap;
-#[cfg(feature = "papyrus-adapter")]
 use std::str::FromStr;
 
-#[cfg(feature = "papyrus-adapter")]
-use num_traits::cast::ToPrimitive;
 #[cfg(feature = "papyrus-adapter")]
 use papyrus_storage::header::HeaderStorageReader;
 #[cfg(feature = "papyrus-adapter")]
@@ -24,20 +21,31 @@ use starknet_api::state::ThinStateDiff as PapyrusThinStateDiff;
 #[cfg(feature = "papyrus-adapter")]
 use starknet_api::state::{StateNumber as PapyrusStateNumber, StorageKey as PapyrusStorageKey};
 
-use sha2::{Digest, Sha256};
+use starknet_crypto::poseidon_hash_many;
 use starknet_node_types::{
     BlockId, BlockNumber, ComponentHealth, HealthCheck, HealthStatus, InMemoryState, StarknetBlock,
-    StarknetStateDiff, StateReader,
+    StarknetFelt, StarknetStateDiff, StateReader,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum StorageError {
     #[error("block {0} does not extend current tip")]
     NonSequentialBlock(BlockNumber),
+    #[error("block number overflow while extending chain tip {tip}")]
+    BlockNumberOverflow { tip: BlockNumber },
+    #[error("requested block {requested} is beyond available state at block {latest}")]
+    BlockOutOfRange {
+        requested: BlockNumber,
+        latest: BlockNumber,
+    },
     #[error("operation not supported by backend: {0}")]
     UnsupportedOperation(&'static str),
-    #[error("value out of range for {field}: {value}")]
-    ValueOutOfRange { field: &'static str, value: String },
+    #[error("invalid felt encoding for {field}: {value} ({error})")]
+    InvalidFeltEncoding {
+        field: &'static str,
+        value: String,
+        error: String,
+    },
     #[cfg(feature = "papyrus-adapter")]
     #[error("papyrus storage error: {0}")]
     Papyrus(String),
@@ -123,9 +131,7 @@ impl StorageBackend for InMemoryStorage {
 
     fn apply_state_diff(&mut self, diff: &StarknetStateDiff) -> Result<(), StorageError> {
         let tip = self.latest_block_number()?;
-        let mut state = self.states.get(&tip).cloned().unwrap_or_default();
-        state.apply_state_diff(diff);
-        self.states.insert(tip, state);
+        self.states.entry(tip).or_default().apply_state_diff(diff);
         Ok(())
     }
 
@@ -134,7 +140,10 @@ impl StorageBackend for InMemoryStorage {
         block: StarknetBlock,
         state_diff: StarknetStateDiff,
     ) -> Result<(), StorageError> {
-        let expected = self.latest_block_number()? + 1;
+        let tip = self.latest_block_number()?;
+        let expected = tip
+            .checked_add(1)
+            .ok_or(StorageError::BlockNumberOverflow { tip })?;
         if block.number != expected {
             return Err(StorageError::NonSequentialBlock(block.number));
         }
@@ -177,22 +186,28 @@ impl StorageBackend for InMemoryStorage {
 
     fn current_state_root(&self) -> String {
         let latest = self.latest_block_number().unwrap_or(0);
-        let state = self.states.get(&latest).cloned().unwrap_or_default();
+        let Some(state) = self.states.get(&latest) else {
+            return "0x0".to_string();
+        };
 
-        let mut hasher = Sha256::new();
+        let mut elements = Vec::new();
         for (contract, writes) in &state.storage {
-            hasher.update(contract.as_bytes());
+            elements.push(felt_from_storage_component(contract));
             for (key, value) in writes {
-                hasher.update(key.as_bytes());
-                hasher.update(value.to_be_bytes());
+                elements.push(felt_from_storage_component(key));
+                elements.push(*value);
             }
         }
         for (contract, nonce) in &state.nonces {
-            hasher.update(contract.as_bytes());
-            hasher.update(nonce.to_be_bytes());
+            elements.push(felt_from_storage_component(contract));
+            elements.push(*nonce);
         }
 
-        format!("0x{}", hex::encode(hasher.finalize()))
+        if elements.is_empty() {
+            "0x0".to_string()
+        } else {
+            format!("{:#x}", poseidon_hash_many(&elements))
+        }
     }
 }
 
@@ -223,7 +238,7 @@ struct PapyrusStateReaderAdapter {
 
 #[cfg(feature = "papyrus-adapter")]
 impl StateReader for PapyrusStateReaderAdapter {
-    fn get_storage(&self, contract: &String, key: &str) -> Option<u64> {
+    fn get_storage(&self, contract: &String, key: &str) -> Option<StarknetFelt> {
         let contract = parse_contract_address(contract)?;
         let key = parse_storage_key(key)?;
         let txn = self.reader.begin_ro_txn().ok()?;
@@ -231,17 +246,17 @@ impl StateReader for PapyrusStateReaderAdapter {
         let value = state_reader
             .get_storage_at(self.state_number, &contract, &key)
             .ok()?;
-        value.to_u64()
+        papyrus_felt_to_node_felt(value).ok()
     }
 
-    fn nonce_of(&self, contract: &String) -> Option<u64> {
+    fn nonce_of(&self, contract: &String) -> Option<StarknetFelt> {
         let contract = parse_contract_address(contract)?;
         let txn = self.reader.begin_ro_txn().ok()?;
         let state_reader = txn.get_state_reader().ok()?;
         let nonce: PapyrusNonce = state_reader
             .get_nonce_at(self.state_number, &contract)
             .ok()??;
-        nonce.0.to_u64()
+        papyrus_felt_to_node_felt(nonce.0).ok()
     }
 }
 
@@ -296,6 +311,11 @@ fn latest_block_from_marker(marker: PapyrusBlockNumber) -> Option<PapyrusBlockNu
     marker.0.checked_sub(1).map(PapyrusBlockNumber)
 }
 
+fn felt_from_storage_component(raw: &str) -> StarknetFelt {
+    StarknetFelt::from_str(raw)
+        .unwrap_or_else(|_| StarknetFelt::from_bytes_be_slice(raw.as_bytes()))
+}
+
 #[cfg(feature = "papyrus-adapter")]
 fn parse_contract_address(raw: &str) -> Option<PapyrusContractAddress> {
     let felt = PapyrusFelt::from_str(raw).ok()?;
@@ -309,10 +329,12 @@ fn parse_storage_key(raw: &str) -> Option<PapyrusStorageKey> {
 }
 
 #[cfg(feature = "papyrus-adapter")]
-fn felt_to_u64(value: PapyrusFelt, field: &'static str) -> Result<u64, StorageError> {
-    value.to_u64().ok_or_else(|| StorageError::ValueOutOfRange {
-        field,
-        value: format!("{:#x}", value),
+fn papyrus_felt_to_node_felt(value: PapyrusFelt) -> Result<StarknetFelt, StorageError> {
+    let encoded = format!("{:#x}", value);
+    StarknetFelt::from_hex(&encoded).map_err(|error| StorageError::InvalidFeltEncoding {
+        field: "papyrus_felt",
+        value: encoded,
+        error: error.to_string(),
     })
 }
 
@@ -325,14 +347,14 @@ fn map_thin_state_diff(diff: PapyrusThinStateDiff) -> Result<StarknetStateDiff, 
         for (key, value) in writes {
             mapped_writes.insert(
                 format!("{:#x}", key.0.key()),
-                felt_to_u64(value, "state_diff.storage_diffs")?,
+                papyrus_felt_to_node_felt(value)?,
             );
         }
     }
     for (address, nonce) in diff.nonces {
         mapped.nonces.insert(
             format!("{:#x}", address.0.key()),
-            felt_to_u64(nonce.0, "state_diff.nonces")?,
+            papyrus_felt_to_node_felt(nonce.0)?,
         );
     }
     for class_hash in diff.declared_classes.keys() {
@@ -350,16 +372,18 @@ fn parse_starknet_version_to_semver(raw: &str) -> Result<semver::Version, Storag
         return Ok(version);
     }
 
-    // Starknet versions can have a 4th component (for example, 0.13.1.1).
     let parts: Vec<&str> = raw.split('.').collect();
-    if parts.len() == 4 {
+    if parts.len() == 4 && parts.iter().all(|part| !part.is_empty()) {
         let normalized = format!("{}.{}.{}-{}", parts[0], parts[1], parts[2], parts[3]);
-        return semver::Version::parse(&normalized)
-            .map_err(|error| StorageError::InvalidProtocolVersion(error.to_string()));
+        return semver::Version::parse(&normalized).map_err(|error| {
+            StorageError::InvalidProtocolVersion(format!(
+                "failed to normalize 4-component version '{raw}': {error}"
+            ))
+        });
     }
 
     Err(StorageError::InvalidProtocolVersion(format!(
-        "unsupported Starknet version format: {raw}"
+        "unsupported Starknet version format '{raw}'; expected semver (x.y.z) or x.y.z.w"
     )))
 }
 
@@ -403,13 +427,21 @@ impl StorageBackend for PapyrusStorageAdapter {
             .get_state_marker()
             .map_err(|error| StorageError::Papyrus(error.to_string()))?;
         let latest_state_block = latest_block_from_marker(state_marker);
-        let effective_block = latest_state_block
-            .map(|latest| PapyrusBlockNumber(block_number.min(latest.0)))
-            .unwrap_or(PapyrusBlockNumber(0));
-        let state_number = if latest_state_block.is_some() {
-            PapyrusStateNumber::unchecked_right_after_block(effective_block)
-        } else {
+        let state_number = if let Some(latest) = latest_state_block {
+            if block_number > latest.0 {
+                return Err(StorageError::BlockOutOfRange {
+                    requested: block_number,
+                    latest: latest.0,
+                });
+            }
+            PapyrusStateNumber::unchecked_right_after_block(PapyrusBlockNumber(block_number))
+        } else if block_number == 0 {
             PapyrusStateNumber::right_before_block(PapyrusBlockNumber(0))
+        } else {
+            return Err(StorageError::BlockOutOfRange {
+                requested: block_number,
+                latest: 0,
+            });
         };
         Ok(Box::new(PapyrusStateReaderAdapter {
             reader: self.reader.clone(),
@@ -462,6 +494,7 @@ impl StorageBackend for PapyrusStorageAdapter {
             parse_starknet_version_to_semver(&header.starknet_version.to_string())?;
         Ok(Some(StarknetBlock {
             number: number.0,
+            timestamp: header.timestamp.0,
             protocol_version,
             transactions: Vec::new(),
         }))
@@ -501,13 +534,14 @@ impl StorageBackend for PapyrusStorageAdapter {
 #[cfg(test)]
 mod tests {
     use semver::Version;
-    use starknet_node_types::{ContractAddress, StarknetTransaction};
+    use starknet_node_types::{ContractAddress, StarknetFelt, StarknetTransaction};
 
     use super::*;
 
     fn block(number: BlockNumber) -> StarknetBlock {
         StarknetBlock {
             number,
+            timestamp: 1_700_000_000 + number,
             protocol_version: Version::parse("0.14.2").expect("valid semver"),
             transactions: vec![StarknetTransaction::new(format!("0x{number:x}"))],
         }
@@ -518,7 +552,7 @@ mod tests {
         diff.storage_diffs
             .entry(contract.to_string())
             .or_default()
-            .insert("balance".to_string(), value);
+            .insert("balance".to_string(), StarknetFelt::from(value));
         diff
     }
 
@@ -534,7 +568,7 @@ mod tests {
         let reader = storage.get_state_reader(1).expect("state reader");
         assert_eq!(
             reader.get_storage(&ContractAddress::from("0xabc"), "balance"),
-            Some(11)
+            Some(StarknetFelt::from(11_u64))
         );
     }
 
@@ -589,7 +623,8 @@ mod papyrus_tests {
     use semver::Version;
     use serde::Deserialize;
     use starknet_api::block::{
-        BlockHeader, BlockNumber as PapyrusBlockNumber, StarknetVersion as PapyrusVersion,
+        BlockHeader, BlockNumber as PapyrusBlockNumber, BlockTimestamp as PapyrusBlockTimestamp,
+        StarknetVersion as PapyrusVersion,
     };
     use starknet_api::core::{
         ChainId, ClassHash as PapyrusClassHash, CompiledClassHash as PapyrusCompiledClassHash,
@@ -599,7 +634,6 @@ mod papyrus_tests {
     use starknet_api::state::{
         StorageKey as PapyrusStorageKey, ThinStateDiff as PapyrusThinStateDiff,
     };
-    use starknet_types_core::felt::Felt;
     use tempfile::tempdir;
 
     use super::*;
@@ -641,11 +675,12 @@ mod papyrus_tests {
         adapter: &mut PapyrusStorageAdapter,
         fixture: &StarknetFixture,
     ) -> Result<(), StorageError> {
-        let root = Felt::from_hex(&fixture.state_root)
+        let root = PapyrusFelt::from_hex(&fixture.state_root)
             .map_err(|error| StorageError::Papyrus(error.to_string()))?;
         let header = BlockHeader {
             state_root: starknet_api::core::GlobalRoot(root),
             starknet_version: PapyrusVersion(fixture.protocol_version.clone()),
+            timestamp: PapyrusBlockTimestamp(1_700_000_000 + fixture.block_number),
             ..BlockHeader::default()
         };
 
@@ -713,8 +748,8 @@ mod papyrus_tests {
             fixture.block_number
         );
         let root = adapter.read_current_state_root().expect("root");
-        let actual = Felt::from_hex(&root).expect("hex root");
-        let expected = Felt::from_hex(&fixture.state_root).expect("fixture root");
+        let actual = PapyrusFelt::from_hex(&root).expect("hex root");
+        let expected = PapyrusFelt::from_hex(&fixture.state_root).expect("fixture root");
         assert_eq!(actual, expected);
     }
 
@@ -749,6 +784,7 @@ mod papyrus_tests {
             block.protocol_version,
             Version::parse("0.13.1-1").expect("normalized semver")
         );
+        assert_eq!(block.timestamp, 1_700_000_000 + fixture.block_number);
     }
 
     #[test]
@@ -769,8 +805,11 @@ mod papyrus_tests {
         let reader = adapter
             .get_state_reader(fixture.block_number)
             .expect("state reader");
-        assert_eq!(reader.get_storage(&contract, &key), Some(77));
-        assert_eq!(reader.nonce_of(&contract), Some(5));
+        assert_eq!(
+            reader.get_storage(&contract, &key),
+            Some(StarknetFelt::from(77_u64))
+        );
+        assert_eq!(reader.nonce_of(&contract), Some(StarknetFelt::from(5_u64)));
 
         let diff = adapter
             .get_state_diff(fixture.block_number)
@@ -781,14 +820,17 @@ mod papyrus_tests {
                 .get(&contract)
                 .and_then(|writes| writes.get(&key))
                 .copied(),
-            Some(77)
+            Some(StarknetFelt::from(77_u64))
         );
-        assert_eq!(diff.nonces.get(&contract).copied(), Some(5));
+        assert_eq!(
+            diff.nonces.get(&contract).copied(),
+            Some(StarknetFelt::from(5_u64))
+        );
         assert!(diff.declared_classes.contains(&declared_class));
     }
 
     #[test]
-    fn papyrus_adapter_rejects_state_diff_values_that_overflow_u64() {
+    fn papyrus_adapter_preserves_large_state_diff_values_without_truncation() {
         let fixture = parse_fixture();
         let dir = tempdir().expect("temp dir");
         let mut adapter =
@@ -798,15 +840,60 @@ mod papyrus_tests {
         let huge = PapyrusFelt::from_hex("0x10000000000000000").expect("felt");
         seed_state_diff(&mut adapter, fixture.block_number, huge).expect("seed state diff");
 
-        let err = adapter
+        let diff = adapter
             .get_state_diff(fixture.block_number)
-            .expect_err("must fail on overflow");
-        assert!(matches!(
+            .expect("state diff")
+            .expect("state diff present");
+
+        let value = diff
+            .storage_diffs
+            .values()
+            .next()
+            .and_then(|writes| writes.get("0x1"))
+            .copied()
+            .expect("huge value present");
+        assert_eq!(
+            value,
+            StarknetFelt::from_hex("0x10000000000000000").expect("felt")
+        );
+    }
+
+    #[test]
+    fn papyrus_adapter_rejects_future_state_reader_requests() {
+        let fixture = parse_fixture();
+        let dir = tempdir().expect("temp dir");
+        let mut adapter =
+            PapyrusStorageAdapter::open(papyrus_config(dir.path())).expect("open papyrus");
+        seed_header(&mut adapter, &fixture).expect("seed header");
+
+        let err = match adapter.get_state_reader(fixture.block_number + 1) {
+            Ok(_) => panic!("future block must fail"),
+            Err(err) => err,
+        };
+        assert_eq!(
             err,
-            StorageError::ValueOutOfRange {
-                field: "state_diff.storage_diffs",
-                ..
+            StorageError::BlockOutOfRange {
+                requested: fixture.block_number + 1,
+                latest: fixture.block_number,
             }
-        ));
+        );
+    }
+
+    #[test]
+    fn parse_starknet_version_supports_semver_and_four_component_variants() {
+        assert_eq!(
+            parse_starknet_version_to_semver("0.14.2").expect("semver"),
+            Version::parse("0.14.2").expect("version")
+        );
+        assert_eq!(
+            parse_starknet_version_to_semver("0.13.1.1").expect("four component"),
+            Version::parse("0.13.1-1").expect("normalized version")
+        );
+    }
+
+    #[test]
+    fn parse_starknet_version_rejects_unknown_shapes() {
+        let err = parse_starknet_version_to_semver("0.13.1.1.9").expect_err("must fail");
+        assert!(matches!(err, StorageError::InvalidProtocolVersion(_)));
     }
 }

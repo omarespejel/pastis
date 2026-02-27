@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use crate::{collections::btree::estimate_btree_size, SizeOf, TotalSize};
+use crate::{collections::btree::estimate_btree_size, HumanBytes, SizeOf, TotalSize};
 use alloc::{
     boxed::Box,
     collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
@@ -35,6 +35,13 @@ fn primitives() {
         TotalSize::total(size_of_val::<&str>(&"Hello World!")),
     );
     assert_eq!(true.size_of(), TotalSize::total(1));
+}
+
+#[test]
+fn human_bytes_uses_inclusive_unit_boundaries() {
+    assert_eq!(HumanBytes::new(1_024).to_string(), "1.00 KiB");
+    assert_eq!(HumanBytes::new(1_024 * 1_024).to_string(), "1.00 MiB");
+    assert_eq!(HumanBytes::new(1_024 * 1_024 * 1_024).to_string(), "1.00 GiB");
 }
 
 #[test]

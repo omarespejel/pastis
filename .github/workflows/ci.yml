@@ -1,5 +1,8 @@
 name: Rust CI
 
+permissions:
+  contents: read
+
 on:
   push:
     branches:
@@ -11,13 +14,16 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5
+
+      - name: Verify vendored dependencies
+        run: ./scripts/check-vendored-size-of.sh
 
       - name: Format check
         run: cargo fmt --all --check

@@ -14,19 +14,25 @@ impl_total_size_childless! {
 
 impl SizeOf for BigUint {
     fn size_of_children(&self, context: &mut Context) {
-        // TODO: There's no way to access allocated capacity
-        context
-            .add_arraylike(self.iter_u64_digits().len(), size_of::<u64>())
-            .add_distinct_allocation();
+        // TODO: There's no way to access allocated capacity.
+        let digits = self.iter_u64_digits().len();
+        if digits != 0 {
+            context
+                .add_arraylike(digits, size_of::<u64>())
+                .add_distinct_allocation();
+        }
     }
 }
 
 impl SizeOf for BigInt {
     fn size_of_children(&self, context: &mut Context) {
-        // TODO: There's no way to access allocated capacity
-        context
-            .add_arraylike(self.iter_u64_digits().len(), size_of::<u64>())
-            .add_distinct_allocation();
+        // TODO: There's no way to access allocated capacity.
+        let digits = self.iter_u64_digits().len();
+        if digits != 0 {
+            context
+                .add_arraylike(digits, size_of::<u64>())
+                .add_distinct_allocation();
+        }
     }
 }
 

@@ -40,7 +40,7 @@ impl VersionedConstantsResolver {
                     && version.minor == requested.minor
                     && version.patch <= requested.patch
             })
-            .max_by(|(left, _), (right, _)| left.patch.cmp(&right.patch))
+            .max_by(|(left, _), (right, _)| left.cmp(right))
             .map(|(_, constants)| constants)
             .ok_or_else(|| VersionResolutionError::Missing {
                 requested: requested.clone(),
@@ -134,5 +134,28 @@ mod tests {
                 requested: v("0.15.0"),
             }
         );
+    }
+
+    #[test]
+    fn prefers_release_over_prerelease_for_same_patch() {
+        let resolver = VersionedConstantsResolver::new([
+            (
+                v("0.14.2-alpha.1"),
+                VersionedConstants {
+                    id: "v14_2_alpha".to_string(),
+                },
+            ),
+            (
+                v("0.14.2"),
+                VersionedConstants {
+                    id: "v14_2_release".to_string(),
+                },
+            ),
+        ]);
+
+        let selected = resolver
+            .resolve_for_protocol(&v("0.14.3"))
+            .expect("resolve");
+        assert_eq!(selected.id, "v14_2_release");
     }
 }

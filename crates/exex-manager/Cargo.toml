@@ -2,6 +2,7 @@
 name = "starknet-node-exex-manager"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [dependencies]
 bincode = { workspace = true }

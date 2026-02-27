@@ -14,6 +14,11 @@ pub struct L1FinalityTracker {
 }
 
 impl L1FinalityTracker {
+    /// Returns the latest finalized Ethereum block observed by this tracker.
+    pub fn finalized_eth_block(&self) -> Option<u64> {
+        self.finalized_eth_block
+    }
+
     pub fn record_state_root_posted(&mut self, entry: PostedStateRoot) {
         self.posted_by_l2_block.insert(entry.l2_block_number, entry);
     }
@@ -25,6 +30,11 @@ impl L1FinalityTracker {
         );
     }
 
+    /// Removes state roots that are not finalized and were posted at or after the given
+    /// Ethereum block number.
+    ///
+    /// Callers must synchronize concurrent mutation externally if multiple threads update
+    /// finality and reorg state.
     pub fn invalidate_unfinalized_from_eth_block(&mut self, from_eth_block: u64) {
         let finalized = self.finalized_eth_block.unwrap_or_default();
         self.posted_by_l2_block.retain(|_, entry| {
@@ -93,5 +103,20 @@ mod tests {
         tracker.invalidate_unfinalized_from_eth_block(10_005);
         tracker.update_finalized_eth_block(10_100);
         assert_eq!(tracker.latest_verified_block(), Some(120));
+    }
+
+    #[test]
+    fn finalized_eth_block_updates_are_monotonic() {
+        let mut tracker = L1FinalityTracker::default();
+        assert_eq!(tracker.finalized_eth_block(), None);
+
+        tracker.update_finalized_eth_block(100);
+        assert_eq!(tracker.finalized_eth_block(), Some(100));
+
+        tracker.update_finalized_eth_block(95);
+        assert_eq!(tracker.finalized_eth_block(), Some(100));
+
+        tracker.update_finalized_eth_block(250);
+        assert_eq!(tracker.finalized_eth_block(), Some(250));
     }
 }

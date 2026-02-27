@@ -11,4 +11,5 @@ blockifier-adapter = ["dep:starknet_api"]
 semver = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+starknet-types-core = "0.2.4"
 starknet_api = { version = "0.18.0-dev.0", optional = true }

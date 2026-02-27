@@ -4,7 +4,7 @@ A crate for measuring the total memory usage of an object at runtime
 
 ## Features
 
-`size-of` has built-in support for many 3rd party crates that can be enabled with feature flags
+`size-of` has built-in support for many third-party crates that can be enabled with feature flags.
 
 - `std`: Enables support for the rust standard library (enabled by default, when disabled `size-of` is `#![no_std]` compatible)
 - `derive`: Enables support for `#[derive(SizeOf)]` (enabled by default)
@@ -18,6 +18,6 @@ A crate for measuring the total memory usage of an object at runtime
 - `ahash`: Enables support for the [`ahash`](https://docs.rs/ahash) crate
   - `ahash-std`: Enables support for `ahash`'s `std` feature
 - `xxhash-rust`: Enables support for the [`xxhash-rust`](https://docs.rs/xxhash-rust) crate
-  - `xxhash-xxh32`: Enables support for `xxhhash-rust`'s `xxh32` feature
-  - `xxhash-xxh64`: Enables support for `xxhhash-rust`'s `xxh64` feature
-  - `xxhash-xxh3`: Enables support for `xxhhash-rust`'s `xxh3` feature
+  - `xxhash-xxh32`: Enables support for `xxhash-rust`'s `xxh32` feature
+  - `xxhash-xxh64`: Enables support for `xxhash-rust`'s `xxh64` feature
+  - `xxhash-xxh3`: Enables support for `xxhash-rust`'s `xxh3` feature

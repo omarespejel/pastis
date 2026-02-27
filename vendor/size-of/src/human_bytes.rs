@@ -54,24 +54,22 @@ const GB: f64 = KB * KB * KB;
 const TB: f64 = KB * KB * KB * KB;
 const PB: f64 = KB * KB * KB * KB * KB;
 const EB: f64 = KB * KB * KB * KB * KB * KB;
-// const ZB: u64 = KB * KB * KB * KB * KB * KB * KB;
-// const YB: u64 = KB * KB * KB * KB * KB * KB * KB * KB;
 
 impl Display for HumanBytes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let bytes = self.bytes as f64;
 
-        if bytes / EB > 1.0 {
+        if bytes / EB >= 1.0 {
             write!(f, "{:.02} EiB", bytes / EB)
-        } else if bytes / PB > 1.0 {
+        } else if bytes / PB >= 1.0 {
             write!(f, "{:.02} PiB", bytes / PB)
-        } else if bytes / TB > 1.0 {
+        } else if bytes / TB >= 1.0 {
             write!(f, "{:.02} TiB", bytes / TB)
-        } else if bytes / GB > 1.0 {
+        } else if bytes / GB >= 1.0 {
             write!(f, "{:.02} GiB", bytes / GB)
-        } else if bytes / MB > 1.0 {
+        } else if bytes / MB >= 1.0 {
             write!(f, "{:.02} MiB", bytes / MB)
-        } else if bytes / KB > 1.0 {
+        } else if bytes / KB >= 1.0 {
             write!(f, "{:.02} KiB", bytes / KB)
         } else {
             write!(f, "{} B", self.bytes)

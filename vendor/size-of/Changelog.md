@@ -6,32 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 <!-- next-header -->
-## [Unreleased] - ReleaseDate
+## [Unreleased]
 
 ## [0.1.5] - 2023-02-23
 
-## Added
+### Added
 
 - Implemented `SizeOf` for `std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6}`
 - Added support for the [`bigdecimal`](https://crates.io/crates/bigdecimal) crate under the `bigdecimal` feature
 - Added support for the [`num-bigint`](https://crates.io/crates/num-bigint) crate under the `num-bigint` feature
 
-## Changed
+### Changed
 
 - Implemented `SizeOf` for `NonNull<T>` where `T: ?Sized`
 - Updated the `hashbrown` crate
 
-## Fixed
+### Fixed
 
 - Made `Box`, `Vec`, `VecDeque` and `BinaryHeap` not log allocations when they contain ZSTs
 
 ## [0.1.4] - 2022-11-04
 
-## Added
+### Added
 
 - Implemented `SizeOf` for `core::any::TypeId`
 
-## Changed
+### Changed
 
 - Made `SizeOf` impls for `Context`, `TotalSize` and `HumanBytes` unconditional
   (were previously dependent on the `derive` feature)
@@ -39,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.3] - 2022-10-21
 
-## Added
+### Added
 
 - Support for the [`xxhash-rust`](https://docs.rs/xxhash-rust) crate with the `xxhash-xxh32`, `xxhash-xxh64`
   and `xxhash-xxh3` features for the associated `xxh32`, `xxh64` and `xxh3` features within `xxhash-rust` 

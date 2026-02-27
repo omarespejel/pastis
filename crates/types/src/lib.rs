@@ -3,11 +3,13 @@ use std::time::Duration;
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use starknet_types_core::felt::Felt;
 
 pub type BlockNumber = u64;
 pub type TxHash = String;
 pub type ClassHash = String;
 pub type ContractAddress = String;
+pub type StarknetFelt = Felt;
 
 #[cfg(feature = "blockifier-adapter")]
 pub type ExecutableStarknetTransaction = starknet_api::executable_transaction::Transaction;
@@ -63,14 +65,15 @@ pub struct BuiltinStats {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StarknetStateDiff {
-    pub storage_diffs: BTreeMap<ContractAddress, BTreeMap<String, u64>>,
-    pub nonces: BTreeMap<ContractAddress, u64>,
+    pub storage_diffs: BTreeMap<ContractAddress, BTreeMap<String, StarknetFelt>>,
+    pub nonces: BTreeMap<ContractAddress, StarknetFelt>,
     pub declared_classes: Vec<ClassHash>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StarknetBlock {
     pub number: BlockNumber,
+    pub timestamp: u64,
     pub protocol_version: Version,
     pub transactions: Vec<StarknetTransaction>,
 }
@@ -118,20 +121,20 @@ impl StarknetNodeTypes for StarknetMainnet {
 }
 
 pub trait StateReader: Send + Sync {
-    fn get_storage(&self, contract: &ContractAddress, key: &str) -> Option<u64>;
-    fn nonce_of(&self, contract: &ContractAddress) -> Option<u64>;
+    fn get_storage(&self, contract: &ContractAddress, key: &str) -> Option<StarknetFelt>;
+    fn nonce_of(&self, contract: &ContractAddress) -> Option<StarknetFelt>;
 }
 
 pub trait MutableState: StateReader {
-    fn set_storage(&mut self, contract: ContractAddress, key: String, value: u64);
-    fn set_nonce(&mut self, contract: ContractAddress, nonce: u64);
+    fn set_storage(&mut self, contract: ContractAddress, key: String, value: StarknetFelt);
+    fn set_nonce(&mut self, contract: ContractAddress, nonce: StarknetFelt);
     fn boxed_clone(&self) -> Box<dyn MutableState>;
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InMemoryState {
-    pub storage: BTreeMap<ContractAddress, BTreeMap<String, u64>>,
-    pub nonces: BTreeMap<ContractAddress, u64>,
+    pub storage: BTreeMap<ContractAddress, BTreeMap<String, StarknetFelt>>,
+    pub nonces: BTreeMap<ContractAddress, StarknetFelt>,
 }
 
 impl InMemoryState {
@@ -148,23 +151,23 @@ impl InMemoryState {
 }
 
 impl StateReader for InMemoryState {
-    fn get_storage(&self, contract: &ContractAddress, key: &str) -> Option<u64> {
+    fn get_storage(&self, contract: &ContractAddress, key: &str) -> Option<StarknetFelt> {
         self.storage
             .get(contract)
             .and_then(|slots| slots.get(key).copied())
     }
 
-    fn nonce_of(&self, contract: &ContractAddress) -> Option<u64> {
+    fn nonce_of(&self, contract: &ContractAddress) -> Option<StarknetFelt> {
         self.nonces.get(contract).copied()
     }
 }
 
 impl MutableState for InMemoryState {
-    fn set_storage(&mut self, contract: ContractAddress, key: String, value: u64) {
+    fn set_storage(&mut self, contract: ContractAddress, key: String, value: StarknetFelt) {
         self.storage.entry(contract).or_default().insert(key, value);
     }
 
-    fn set_nonce(&mut self, contract: ContractAddress, nonce: u64) {
+    fn set_nonce(&mut self, contract: ContractAddress, nonce: StarknetFelt) {
         self.nonces.insert(contract, nonce);
     }
 
@@ -205,12 +208,19 @@ mod tests {
         diff.storage_diffs
             .entry("0xabc".to_string())
             .or_default()
-            .insert("balance".to_string(), 7);
-        diff.nonces.insert("0xabc".to_string(), 2);
+            .insert("balance".to_string(), StarknetFelt::from(7_u64));
+        diff.nonces
+            .insert("0xabc".to_string(), StarknetFelt::from(2_u64));
 
         state.apply_state_diff(&diff);
 
-        assert_eq!(state.get_storage(&"0xabc".to_string(), "balance"), Some(7));
-        assert_eq!(state.nonce_of(&"0xabc".to_string()), Some(2));
+        assert_eq!(
+            state.get_storage(&"0xabc".to_string(), "balance"),
+            Some(StarknetFelt::from(7_u64))
+        );
+        assert_eq!(
+            state.nonce_of(&"0xabc".to_string()),
+            Some(StarknetFelt::from(2_u64))
+        );
     }
 }

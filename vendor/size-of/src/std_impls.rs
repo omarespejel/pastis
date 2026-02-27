@@ -17,14 +17,8 @@ use std::{
     time::{Instant, SystemTime},
 };
 
-/// The size of elements within `PathBuf` and `OsString`
-const PATH_ELEM_SIZE: usize = if cfg!(windows) {
-    // Windows uses u16 elements
-    size_of::<u16>()
-} else {
-    // Assume everything else uses u8 elements
-    size_of::<u8>()
-};
+/// `OsString`/`PathBuf` capacity is reported in byte-like units on all platforms.
+const PATH_ELEM_SIZE: usize = size_of::<u8>();
 
 impl_total_size_childless! {
     Path,
@@ -79,7 +73,7 @@ where
         // big it is https://github.com/rust-lang/rust/blob/98f3001eecbe4cbd091c10ffab45b4c164bb507b/library/std/src/sys/hermit/mutex.rs#L95-L98
 
         // Ignore any errors that occur while trying to lock a Mutex
-        if let Ok(contents) = self.lock() {
+        if let Ok(contents) = self.try_lock() {
             contents.size_of_children(context);
         }
     }
@@ -152,7 +146,7 @@ where
 {
     fn size_of_children(&self, context: &mut Context) {
         // Ignore any errors that occur while trying to lock an RwLock
-        if let Ok(contents) = self.read() {
+        if let Ok(contents) = self.try_read() {
             contents.size_of_children(context);
         }
     }

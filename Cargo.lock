@@ -4101,14 +4101,12 @@ name = "starknet-node-storage"
 version = "0.1.0"
 dependencies = [
  "hex",
- "num-traits",
  "papyrus_storage",
  "semver",
  "serde",
  "serde_json",
- "sha2",
+ "starknet-crypto 0.8.1",
  "starknet-node-types",
- "starknet-types-core 0.1.9",
  "starknet_api 0.13.0-rc.1",
  "tempfile",
  "thiserror 2.0.18",
@@ -4120,6 +4118,7 @@ version = "0.1.0"
 dependencies = [
  "semver",
  "serde",
+ "starknet-types-core 0.2.4",
  "starknet_api 0.18.0-dev.0",
  "thiserror 2.0.18",
 ]

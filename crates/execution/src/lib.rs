@@ -6,6 +6,8 @@ use node_spec_core::protocol_version::{
     VersionResolutionError, VersionedConstants, VersionedConstantsResolver,
 };
 use semver::Version;
+#[cfg(feature = "blockifier-adapter")]
+use starknet_node_types::StarknetFelt;
 use starknet_node_types::{
     BlockContext, ExecutionOutput, MutableState, SimulationResult, StarknetBlock,
     StarknetTransaction, StateReader,
@@ -37,8 +39,6 @@ use blockifier::state::errors::StateError;
 use blockifier::state::state_api::StateReader as BlockifierStateReader;
 #[cfg(feature = "blockifier-adapter")]
 use blockifier::transaction::transaction_execution::Transaction as BlockifierTransaction;
-#[cfg(feature = "blockifier-adapter")]
-use num_traits::ToPrimitive;
 #[cfg(feature = "blockifier-adapter")]
 use starknet_api::block::{
     BlockHash as BlockifierBlockHash, BlockHashAndNumber as BlockifierBlockHashAndNumber,
@@ -128,6 +128,7 @@ pub struct DualExecutionBackend {
     mismatch_policy: MismatchPolicy,
     metrics: Mutex<DualExecutionMetrics>,
     cooldown_remaining: Mutex<u64>,
+    verification_tip: Mutex<Option<u64>>,
 }
 
 impl DualExecutionBackend {
@@ -144,11 +145,72 @@ impl DualExecutionBackend {
             mismatch_policy,
             metrics: Mutex::new(DualExecutionMetrics::default()),
             cooldown_remaining: Mutex::new(0),
+            verification_tip: Mutex::new(None),
         }
     }
 
-    pub fn metrics(&self) -> DualExecutionMetrics {
-        self.metrics.lock().expect("lock metrics").clone()
+    pub fn set_verification_tip(&self, tip: u64) -> Result<(), ExecutionError> {
+        let mut guard = self
+            .verification_tip
+            .lock()
+            .map_err(|_| ExecutionError::Backend("verification tip mutex poisoned".to_string()))?;
+        *guard = Some(tip);
+        Ok(())
+    }
+
+    pub fn clear_verification_tip(&self) -> Result<(), ExecutionError> {
+        let mut guard = self
+            .verification_tip
+            .lock()
+            .map_err(|_| ExecutionError::Backend("verification tip mutex poisoned".to_string()))?;
+        *guard = None;
+        Ok(())
+    }
+
+    pub fn metrics(&self) -> Result<DualExecutionMetrics, ExecutionError> {
+        let guard = self
+            .metrics
+            .lock()
+            .map_err(|_| ExecutionError::Backend("metrics mutex poisoned".to_string()))?;
+        Ok(guard.clone())
+    }
+
+    fn with_metrics(
+        &self,
+        f: impl FnOnce(&mut DualExecutionMetrics),
+    ) -> Result<(), ExecutionError> {
+        let mut guard = self
+            .metrics
+            .lock()
+            .map_err(|_| ExecutionError::Backend("metrics mutex poisoned".to_string()))?;
+        f(&mut guard);
+        Ok(())
+    }
+
+    fn should_verify_block(
+        &self,
+        block_number: u64,
+        verification_depth: u64,
+    ) -> Result<bool, ExecutionError> {
+        if verification_depth == 0 {
+            return Ok(false);
+        }
+
+        let tip = *self
+            .verification_tip
+            .lock()
+            .map_err(|_| ExecutionError::Backend("verification tip mutex poisoned".to_string()))?;
+        let Some(tip) = tip else {
+            return Ok(true);
+        };
+
+        if block_number > tip {
+            return Ok(true);
+        }
+
+        let window = verification_depth.saturating_sub(1);
+        let window_start = tip.saturating_sub(window);
+        Ok(block_number >= window_start)
     }
 
     pub fn execute_verified(
@@ -156,7 +218,10 @@ impl DualExecutionBackend {
         block: &StarknetBlock,
         state: &mut dyn MutableState,
     ) -> Result<ExecutionOutput, ExecutionError> {
-        let mut cooldown = self.cooldown_remaining.lock().expect("lock cooldown");
+        let mut cooldown = self
+            .cooldown_remaining
+            .lock()
+            .map_err(|_| ExecutionError::Backend("cooldown mutex poisoned".to_string()))?;
         let forced_canonical = if *cooldown > 0 {
             *cooldown -= 1;
             true
@@ -174,57 +239,57 @@ impl DualExecutionBackend {
         match effective_mode {
             ExecutionMode::CanonicalOnly => {
                 let out = self.canonical.execute_block(block, state)?;
-                self.metrics
-                    .lock()
-                    .expect("lock metrics")
-                    .canonical_executions += 1;
+                self.with_metrics(|metrics| metrics.canonical_executions += 1)?;
                 Ok(out)
             }
             ExecutionMode::FastOnly => {
                 if let Some(fast) = &self.fast {
                     let out = fast.execute_block(block, state)?;
-                    self.metrics.lock().expect("lock metrics").fast_executions += 1;
+                    self.with_metrics(|metrics| metrics.fast_executions += 1)?;
                     Ok(out)
                 } else {
                     let out = self.canonical.execute_block(block, state)?;
-                    self.metrics
-                        .lock()
-                        .expect("lock metrics")
-                        .canonical_executions += 1;
+                    self.with_metrics(|metrics| metrics.canonical_executions += 1)?;
                     Ok(out)
                 }
             }
-            ExecutionMode::DualWithVerification { .. } => {
+            ExecutionMode::DualWithVerification { verification_depth } => {
                 let Some(fast) = &self.fast else {
                     let out = self.canonical.execute_block(block, state)?;
-                    self.metrics
-                        .lock()
-                        .expect("lock metrics")
-                        .canonical_executions += 1;
+                    self.with_metrics(|metrics| metrics.canonical_executions += 1)?;
                     return Ok(out);
                 };
+
+                if !self.should_verify_block(block.number, verification_depth)? {
+                    let out = fast.execute_block(block, state)?;
+                    self.with_metrics(|metrics| metrics.fast_executions += 1)?;
+                    return Ok(out);
+                }
 
                 // Canonical mutates the authoritative state; fast runs on a cloned state.
                 let mut fast_state = state.boxed_clone();
                 let fast_output = fast.execute_block(block, fast_state.as_mut())?;
                 let canonical_output = self.canonical.execute_block(block, state)?;
 
-                let mut metrics = self.metrics.lock().expect("lock metrics");
-                metrics.fast_executions += 1;
-                metrics.canonical_executions += 1;
+                self.with_metrics(|metrics| {
+                    metrics.fast_executions += 1;
+                    metrics.canonical_executions += 1;
+                })?;
 
                 if fast_output == canonical_output {
                     return Ok(fast_output);
                 }
 
-                metrics.mismatches += 1;
-                drop(metrics);
+                self.with_metrics(|metrics| metrics.mismatches += 1)?;
 
                 match self.mismatch_policy {
                     MismatchPolicy::WarnAndFallback => Ok(canonical_output),
                     MismatchPolicy::Halt => Err(ExecutionError::Halted),
                     MismatchPolicy::CooldownThenRetry { cooldown_blocks } => {
-                        *self.cooldown_remaining.lock().expect("lock cooldown") = cooldown_blocks;
+                        let mut cooldown = self.cooldown_remaining.lock().map_err(|_| {
+                            ExecutionError::Backend("cooldown mutex poisoned".to_string())
+                        })?;
+                        *cooldown = cooldown_blocks;
                         Ok(canonical_output)
                     }
                 }
@@ -309,16 +374,35 @@ impl BlockifierProtocolVersionResolver {
                     && version.minor == requested.minor
                     && version.patch <= requested.patch
             })
-            .max_by(|(left, _), (right, _)| left.patch.cmp(&right.patch))
+            .max_by(|(left, _), (right, _)| left.cmp(right))
             .map(|(_, resolved)| *resolved)
             .ok_or_else(|| ExecutionError::MissingConstants(requested.clone()))
     }
 }
 
 #[cfg(feature = "blockifier-adapter")]
-fn felt_to_u64(value: BlockifierFelt, field: &'static str) -> Result<u64, ExecutionError> {
-    value.to_u64().ok_or_else(|| {
-        ExecutionError::Backend(format!("value out of range for {field}: {:#x}", value))
+fn blockifier_felt_to_node_felt(
+    value: BlockifierFelt,
+    field: &'static str,
+) -> Result<StarknetFelt, ExecutionError> {
+    let encoded = format!("{:#x}", value);
+    StarknetFelt::from_hex(&encoded).map_err(|error| {
+        ExecutionError::Backend(format!(
+            "failed to parse blockifier felt for {field}: {encoded} ({error})"
+        ))
+    })
+}
+
+#[cfg(feature = "blockifier-adapter")]
+fn node_felt_to_blockifier(
+    value: StarknetFelt,
+    field: &'static str,
+) -> Result<BlockifierFelt, StateError> {
+    let encoded = format!("{:#x}", value);
+    BlockifierFelt::from_str(&encoded).map_err(|error| {
+        StateError::StateReadError(format!(
+            "failed to encode felt for blockifier {field}: {encoded} ({error})"
+        ))
     })
 }
 
@@ -345,14 +429,14 @@ impl BlockifierStateReader for BlockifierStateReaderAdapter {
     ) -> Result<BlockifierFelt, StateError> {
         let contract_felt: BlockifierFelt = contract_address.into();
         let key_felt: BlockifierFelt = key.into();
-        Ok(self
+        let value = self
             .state
             .get_storage(
                 &format!("{:#x}", contract_felt),
                 &format!("{:#x}", key_felt),
             )
-            .map(BlockifierFelt::from)
-            .unwrap_or(BlockifierFelt::ZERO))
+            .unwrap_or_default();
+        node_felt_to_blockifier(value, "state.storage")
     }
 
     fn get_nonce_at(
@@ -364,7 +448,10 @@ impl BlockifierStateReader for BlockifierStateReaderAdapter {
             .state
             .nonce_of(&format!("{:#x}", contract_felt))
             .unwrap_or_default();
-        Ok(BlockifierNonce(BlockifierFelt::from(nonce)))
+        Ok(BlockifierNonce(node_felt_to_blockifier(
+            nonce,
+            "state.nonce",
+        )?))
     }
 
     fn get_class_hash_at(
@@ -472,7 +559,7 @@ impl BlockifierVmBackend {
 
         let block_info = BlockifierBlockInfo {
             block_number: BlockifierBlockNumber(block.number),
-            block_timestamp: BlockifierBlockTimestamp(block.number),
+            block_timestamp: BlockifierBlockTimestamp(block.timestamp),
             starknet_version: protocol,
             sequencer_address: BlockifierContractAddress::default(),
             gas_prices: BlockifierGasPrices::default(),
@@ -510,14 +597,14 @@ impl BlockifierVmBackend {
                         executable.tx_hash().0
                     )));
                 }
-                if let ExecutableStarknetTransaction::L1Handler(l1_handler) = &executable {
-                    if l1_handler.tx.calldata.0.is_empty() {
-                        return Err(ExecutionError::Backend(format!(
-                            "invalid L1 handler tx {} in block {}: calldata must include the \
-                             from-address slot",
-                            tx.hash, block.number
-                        )));
-                    }
+                if let ExecutableStarknetTransaction::L1Handler(l1_handler) = &executable
+                    && l1_handler.tx.calldata.0.is_empty()
+                {
+                    return Err(ExecutionError::Backend(format!(
+                        "invalid L1 handler tx {} in block {}: calldata must include the \
+                         from-address slot",
+                        tx.hash, block.number
+                    )));
                 }
                 Ok(BlockifierTransaction::new_for_sequencing(executable))
             })
@@ -610,7 +697,7 @@ impl ExecutionBackend for BlockifierVmBackend {
                 let key_felt: BlockifierFelt = key.into();
                 contract_writes.insert(
                     format!("{:#x}", key_felt),
-                    felt_to_u64(value, "state_diff.storage_diffs")?,
+                    blockifier_felt_to_node_felt(value, "state_diff.storage_diffs")?,
                 );
             }
         }
@@ -618,7 +705,7 @@ impl ExecutionBackend for BlockifierVmBackend {
             let contract_felt: BlockifierFelt = address.into();
             state_diff.nonces.insert(
                 format!("{:#x}", contract_felt),
-                felt_to_u64(nonce.0, "state_diff.nonces")?,
+                blockifier_felt_to_node_felt(nonce.0, "state_diff.nonces")?,
             );
         }
         for class_hash in summary.state_diff.class_hash_to_compiled_class_hash.keys() {
@@ -666,7 +753,8 @@ mod tests {
     use semver::Version;
     use starknet_node_types::{
         BuiltinStats, ExecutionOutput, InMemoryState, MutableState, SimulationResult,
-        StarknetBlock, StarknetReceipt, StarknetStateDiff, StarknetTransaction, StateReader,
+        StarknetBlock, StarknetFelt, StarknetReceipt, StarknetStateDiff, StarknetTransaction,
+        StateReader,
     };
 
     use super::*;
@@ -724,7 +812,7 @@ mod tests {
 
     struct StateWritingBackend {
         gas: u64,
-        value: u64,
+        value: StarknetFelt,
     }
 
     impl ExecutionBackend for StateWritingBackend {
@@ -758,6 +846,7 @@ mod tests {
     fn block(number: u64, version: &str) -> StarknetBlock {
         StarknetBlock {
             number,
+            timestamp: 1_700_000_000 + number,
             protocol_version: Version::parse(version).expect("valid version"),
             transactions: vec![StarknetTransaction::new(format!("0x{number:x}"))],
         }
@@ -767,6 +856,7 @@ mod tests {
     fn empty_block(number: u64, version: &str) -> StarknetBlock {
         StarknetBlock {
             number,
+            timestamp: 1_700_000_000 + number,
             protocol_version: Version::parse(version).expect("valid version"),
             transactions: Vec::new(),
         }
@@ -864,13 +954,14 @@ mod tests {
             };
             use starknet_api::transaction::TransactionHash;
 
-            let mut executable = ExecutableL1Handler::default();
-            executable.tx_hash =
-                TransactionHash(BlockifierFelt::from_str(&tx.hash).map_err(|error| {
+            let executable = ExecutableL1Handler {
+                tx_hash: TransactionHash(BlockifierFelt::from_str(&tx.hash).map_err(|error| {
                     ExecutionError::Backend(format!(
                         "invalid tx hash provided to MalformedL1Resolver: {error}"
                     ))
-                })?);
+                })?),
+                ..Default::default()
+            };
             // Keep calldata empty to ensure adapter guards against upstream underflow panic.
             Ok(ExecutableTx::L1Handler(executable))
         }
@@ -914,6 +1005,58 @@ mod tests {
     }
 
     #[test]
+    fn verification_depth_zero_skips_canonical_reverification() {
+        let fast = ScriptedBackend::new("fast", BTreeMap::from([(1, output(1))]), output(1));
+        let canonical =
+            ScriptedBackend::new("canonical", BTreeMap::from([(1, output(7))]), output(7));
+        let backend = DualExecutionBackend::new(
+            Some(Box::new(fast)),
+            Box::new(canonical),
+            ExecutionMode::DualWithVerification {
+                verification_depth: 0,
+            },
+            MismatchPolicy::WarnAndFallback,
+        );
+
+        let mut state = InMemoryState::default();
+        let result = backend.execute_verified(&block(1, "0.14.2"), &mut state);
+        assert_eq!(result.expect("fast path only").receipts[0].gas_consumed, 1);
+    }
+
+    #[test]
+    fn verification_depth_applies_to_latest_tip_window() {
+        let fast = ScriptedBackend::new(
+            "fast",
+            BTreeMap::from([(98, output(2)), (99, output(3))]),
+            output(1),
+        );
+        let canonical = ScriptedBackend::new(
+            "canonical",
+            BTreeMap::from([(98, output(20)), (99, output(30))]),
+            output(10),
+        );
+        let backend = DualExecutionBackend::new(
+            Some(Box::new(fast)),
+            Box::new(canonical),
+            ExecutionMode::DualWithVerification {
+                verification_depth: 2,
+            },
+            MismatchPolicy::WarnAndFallback,
+        );
+        backend.set_verification_tip(100).expect("set tip");
+
+        let mut state = InMemoryState::default();
+        let old_block = backend
+            .execute_verified(&block(98, "0.14.2"), &mut state)
+            .expect("outside verification window should use fast");
+        let recent_block = backend
+            .execute_verified(&block(99, "0.14.2"), &mut state)
+            .expect("inside verification window should use canonical on mismatch");
+        assert_eq!(old_block.receipts[0].gas_consumed, 2);
+        assert_eq!(recent_block.receipts[0].gas_consumed, 30);
+    }
+
+    #[test]
     fn mismatch_with_halt_policy_fails_closed() {
         let fast = ScriptedBackend::new("fast", BTreeMap::from([(1, output(1))]), output(1));
         let canonical =
@@ -936,8 +1079,14 @@ mod tests {
 
     #[test]
     fn canonical_state_wins_when_dual_execution_mismatches() {
-        let fast = StateWritingBackend { gas: 1, value: 111 };
-        let canonical = StateWritingBackend { gas: 7, value: 999 };
+        let fast = StateWritingBackend {
+            gas: 1,
+            value: StarknetFelt::from(111_u64),
+        };
+        let canonical = StateWritingBackend {
+            gas: 7,
+            value: StarknetFelt::from(999_u64),
+        };
         let backend = DualExecutionBackend::new(
             Some(Box::new(fast)),
             Box::new(canonical),
@@ -952,7 +1101,10 @@ mod tests {
             .execute_verified(&block(1, "0.14.2"), &mut state)
             .expect("fallback");
         assert_eq!(result.receipts[0].gas_consumed, 7);
-        assert_eq!(state.get_storage(&"0x1".to_string(), "slot"), Some(999));
+        assert_eq!(
+            state.get_storage(&"0x1".to_string(), "slot"),
+            Some(StarknetFelt::from(999_u64))
+        );
     }
 
     #[test]
@@ -1138,6 +1290,7 @@ mod tests {
         let mut state = InMemoryState::default();
         let block = StarknetBlock {
             number: 12,
+            timestamp: 1_700_000_012,
             protocol_version: Version::parse("0.14.2").expect("valid version"),
             transactions: vec![executable_l1_handler_tx("0xabc")],
         };

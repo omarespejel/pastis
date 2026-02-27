@@ -52,6 +52,8 @@ pub enum ManagerError {
     WalEncode(String),
     #[error("failed to decode notification from WAL: {0}")]
     WalDecode(#[from] NotificationDecodeError),
+    #[error("notification id counter overflowed")]
+    NotificationIdOverflow,
 }
 
 pub struct ExExManager {
@@ -62,6 +64,8 @@ pub struct ExExManager {
     max_capacity: usize,
     wal: InMemoryWal,
 }
+
+const MAX_PARALLEL_DELIVERY_WORKERS: usize = 32;
 
 impl ExExManager {
     pub fn new(max_capacity: usize) -> Self {
@@ -113,13 +117,16 @@ impl ExExManager {
         self.wal.append(encoded);
 
         let notification_id = self.next_id;
-        self.next_id += 1;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or(ManagerError::NotificationIdOverflow)?;
         self.buffer.push_back((notification_id, notification));
         Ok(notification_id)
     }
 
     pub fn drain_one(&mut self) -> Result<Option<u64>, ManagerError> {
-        let Some((notification_id, notification)) = self.buffer.pop_front() else {
+        let Some((notification_id, notification)) = self.buffer.front().cloned() else {
             return Ok(None);
         };
 
@@ -127,6 +134,7 @@ impl ExExManager {
             let mut names: Vec<String> = self.sinks.keys().cloned().collect();
             names.sort();
             self.deliver_tier(&names, &notification)?;
+            self.buffer.pop_front();
             return Ok(Some(notification_id));
         }
 
@@ -135,6 +143,7 @@ impl ExExManager {
             self.deliver_tier(tier, &notification)?;
         }
 
+        self.buffer.pop_front();
         Ok(Some(notification_id))
     }
 
@@ -151,42 +160,55 @@ impl ExExManager {
         tier: &[String],
         notification: &StarknetExExNotification,
     ) -> Result<(), ManagerError> {
-        let mut workers = Vec::with_capacity(tier.len());
-        for name in tier {
-            let sink = self
-                .sinks
-                .get(name)
-                .cloned()
-                .ok_or_else(|| ManagerError::MissingSink(name.clone()))?;
-            let sink_name = name.clone();
-            let cloned_notification = notification.clone();
-            let worker = thread::spawn(move || -> Result<(), ManagerError> {
-                let mut sink_guard = sink.lock().map_err(|_| ManagerError::SinkFailure {
-                    name: sink_name.clone(),
-                    message: "sink mutex poisoned".to_string(),
-                })?;
-                sink_guard
-                    .on_notification(cloned_notification)
-                    .map_err(|message| ManagerError::SinkFailure {
-                        name: sink_name,
-                        message,
-                    })
-            });
-            workers.push((name.clone(), worker));
-        }
+        let mut first_error = None;
 
-        // Deterministic failure ordering: join in planned tier order, not completion order.
-        for (name, worker) in workers {
-            match worker.join() {
-                Ok(result) => result?,
-                Err(_) => {
-                    return Err(ManagerError::SinkFailure {
+        for chunk in tier.chunks(MAX_PARALLEL_DELIVERY_WORKERS.max(1)) {
+            let mut workers = Vec::with_capacity(chunk.len());
+            for name in chunk {
+                let sink = self
+                    .sinks
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| ManagerError::MissingSink(name.clone()))?;
+                let sink_name = name.clone();
+                let cloned_notification = notification.clone();
+                let worker = thread::spawn(move || -> Result<(), ManagerError> {
+                    let mut sink_guard = sink.lock().map_err(|_| ManagerError::SinkFailure {
+                        name: sink_name.clone(),
+                        message: "sink mutex poisoned".to_string(),
+                    })?;
+                    sink_guard
+                        .on_notification(cloned_notification)
+                        .map_err(|message| ManagerError::SinkFailure {
+                            name: sink_name,
+                            message,
+                        })
+                });
+                workers.push((name.clone(), worker));
+            }
+
+            // Deterministic failure ordering: capture first error in planned order while
+            // guaranteeing every worker is joined before returning.
+            for (name, worker) in workers {
+                let result = match worker.join() {
+                    Ok(result) => result,
+                    Err(_) => Err(ManagerError::SinkFailure {
                         name,
                         message: "sink thread panicked".to_string(),
-                    });
+                    }),
+                };
+                if first_error.is_none()
+                    && let Err(err) = result
+                {
+                    first_error = Some(err);
                 }
             }
         }
+
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+
         Ok(())
     }
 }
@@ -482,6 +504,33 @@ mod tests {
     }
 
     #[test]
+    fn retains_notification_in_buffer_when_delivery_fails() {
+        let mut manager = ExExManager::new(8);
+        manager
+            .register(vec![ExExRegistration {
+                meta: ExExHandleMeta {
+                    name: "failing".to_string(),
+                    depends_on: vec![],
+                    priority: 1,
+                },
+                sink: Box::new(FailingSink {
+                    message: "boom".to_string(),
+                    delay: Duration::from_millis(1),
+                }),
+            }])
+            .expect("register");
+        manager.enqueue(sample_notification()).expect("enqueue");
+
+        let err = manager.drain_one().expect_err("must fail");
+        assert!(matches!(
+            err,
+            ManagerError::SinkFailure { name, message }
+            if name == "failing" && message == "boom"
+        ));
+        assert_eq!(manager.buffer.len(), 1);
+    }
+
+    #[test]
     fn wal_recovery_is_stable_under_concurrent_enqueues() {
         struct NoopSink;
         impl NotificationSink for NoopSink {
@@ -556,5 +605,16 @@ mod tests {
             ManagerError::SinkFailure { name, message }
             if name == "panic-sink" && message == "sink thread panicked"
         ));
+    }
+
+    #[test]
+    fn rejects_enqueue_when_notification_id_overflows() {
+        let mut manager = ExExManager::new(8);
+        manager.next_id = u64::MAX;
+
+        let err = manager
+            .enqueue(sample_notification())
+            .expect_err("must fail");
+        assert!(matches!(err, ManagerError::NotificationIdOverflow));
     }
 }
