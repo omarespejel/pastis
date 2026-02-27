@@ -1,0 +1,45 @@
+{
+  "strictness": 3,
+  "commentTypes": ["logic", "syntax", "style", "info"],
+  "triggerOnUpdates": true,
+  "ignorePatterns": "**/target/**\ndist/**\nnode_modules/**\n**/*.lock\n**/.git/**",
+  "summarySection": {
+    "included": true,
+    "collapsible": true,
+    "defaultOpen": true
+  },
+  "instructions": "This is a Cairo/Starknet project. Focus on smart contract security, felt252 type safety, storage optimization, proper use of Starknet decorators (#[starknet::contract], #[storage], #[event], #[abi(embed_v0)]), and Cairo-specific patterns. Flag any potential reentrancy, access control, or overflow issues. Ensure tests cover edge cases and failure paths.",
+  "rules": [
+    {
+      "id": "cairo-security-checks",
+      "rule": "All external functions in Starknet contracts must have proper access control checks. Flag any external/public function missing authorization validation.",
+      "scope": ["**/*.cairo"],
+      "severity": "high"
+    },
+    {
+      "id": "cairo-event-emission",
+      "rule": "State-changing functions must emit events. Flag any function that modifies storage but does not emit an event.",
+      "scope": ["**/*.cairo"],
+      "severity": "medium"
+    },
+    {
+      "id": "cairo-error-handling",
+      "rule": "Use descriptive error messages in assert statements and custom errors. Do not use bare assert without a message.",
+      "scope": ["**/*.cairo"],
+      "severity": "medium"
+    },
+    {
+      "id": "cairo-test-coverage",
+      "rule": "Every public function should have corresponding test cases covering both success and failure paths.",
+      "scope": ["**/tests/**"],
+      "severity": "medium"
+    },
+    {
+      "id": "no-hardcoded-addresses",
+      "rule": "Do not hardcode contract addresses or keys. Use configuration or constructor parameters instead.",
+      "scope": ["**/*.cairo"],
+      "severity": "high"
+    }
+  ],
+  "disabledRules": []
+}
