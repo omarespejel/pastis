@@ -39,3 +39,6 @@ jobs:
 
       - name: Production adapter wiring build
         run: cargo test -p starknet-node --features production-adapters --no-run
+
+      - name: Performance budget check
+        run: ./scripts/perf-budget-check.sh
