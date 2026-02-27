@@ -5,7 +5,12 @@ edition = "2024"
 
 [features]
 default = []
-blockifier-adapter = ["dep:blockifier", "dep:starknet_api", "dep:num-traits"]
+blockifier-adapter = [
+    "dep:blockifier",
+    "dep:starknet_api",
+    "dep:num-traits",
+    "starknet-node-types/blockifier-adapter",
+]
 
 [dependencies]
 node-spec-core = { path = "../node-spec-core" }

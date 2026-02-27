@@ -509,9 +509,7 @@ mod tests {
         StarknetBlock {
             number,
             protocol_version: Version::parse("0.14.2").expect("valid semver"),
-            transactions: vec![StarknetTransaction {
-                hash: format!("0x{number:x}"),
-            }],
+            transactions: vec![StarknetTransaction::new(format!("0x{number:x}"))],
         }
     }
 

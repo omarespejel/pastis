@@ -9,9 +9,36 @@ pub type TxHash = String;
 pub type ClassHash = String;
 pub type ContractAddress = String;
 
+#[cfg(feature = "blockifier-adapter")]
+pub type ExecutableStarknetTransaction = starknet_api::executable_transaction::Transaction;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StarknetTransaction {
     pub hash: TxHash,
+    #[cfg(feature = "blockifier-adapter")]
+    #[serde(default)]
+    pub executable: Option<ExecutableStarknetTransaction>,
+}
+
+impl StarknetTransaction {
+    pub fn new(hash: impl Into<TxHash>) -> Self {
+        Self {
+            hash: hash.into(),
+            #[cfg(feature = "blockifier-adapter")]
+            executable: None,
+        }
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    pub fn with_executable(
+        hash: impl Into<TxHash>,
+        executable: ExecutableStarknetTransaction,
+    ) -> Self {
+        Self {
+            hash: hash.into(),
+            executable: Some(executable),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

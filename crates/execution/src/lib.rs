@@ -1,3 +1,5 @@
+#[cfg(feature = "blockifier-adapter")]
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use node_spec_core::protocol_version::{
@@ -16,7 +18,7 @@ use std::time::Instant;
 #[cfg(feature = "blockifier-adapter")]
 use blockifier::blockifier::config::TransactionExecutorConfig;
 #[cfg(feature = "blockifier-adapter")]
-use blockifier::blockifier::transaction_executor::TransactionExecutor;
+use blockifier::blockifier::transaction_executor::{TransactionExecutor, TransactionExecutorError};
 #[cfg(feature = "blockifier-adapter")]
 use blockifier::blockifier_versioned_constants::VersionedConstants as BlockifierVersionedConstants;
 #[cfg(feature = "blockifier-adapter")]
@@ -53,6 +55,8 @@ use starknet_api::hash::StarkHash as BlockifierFelt;
 use starknet_api::state::StorageKey as BlockifierStorageKey;
 #[cfg(feature = "blockifier-adapter")]
 use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
+#[cfg(feature = "blockifier-adapter")]
+use starknet_node_types::ExecutableStarknetTransaction;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ExecutionError {
@@ -317,45 +321,104 @@ fn felt_to_u64(value: BlockifierFelt, field: &'static str) -> Result<u64, Execut
 }
 
 #[cfg(feature = "blockifier-adapter")]
-#[derive(Clone)]
-struct NullBlockifierStateReader;
+struct BlockifierStateReaderAdapter {
+    state: Box<dyn MutableState>,
+}
 
 #[cfg(feature = "blockifier-adapter")]
-impl BlockifierStateReader for NullBlockifierStateReader {
+impl BlockifierStateReaderAdapter {
+    fn new(state: &dyn MutableState) -> Self {
+        Self {
+            state: state.boxed_clone(),
+        }
+    }
+}
+
+#[cfg(feature = "blockifier-adapter")]
+impl BlockifierStateReader for BlockifierStateReaderAdapter {
     fn get_storage_at(
         &self,
-        _contract_address: BlockifierContractAddress,
-        _key: BlockifierStorageKey,
+        contract_address: BlockifierContractAddress,
+        key: BlockifierStorageKey,
     ) -> Result<BlockifierFelt, StateError> {
-        Ok(BlockifierFelt::ZERO)
+        let contract_felt: BlockifierFelt = contract_address.into();
+        let key_felt: BlockifierFelt = key.into();
+        Ok(self
+            .state
+            .get_storage(
+                &format!("{:#x}", contract_felt),
+                &format!("{:#x}", key_felt),
+            )
+            .map(BlockifierFelt::from)
+            .unwrap_or(BlockifierFelt::ZERO))
     }
 
     fn get_nonce_at(
         &self,
-        _contract_address: BlockifierContractAddress,
+        contract_address: BlockifierContractAddress,
     ) -> Result<BlockifierNonce, StateError> {
-        Ok(BlockifierNonce::default())
+        let contract_felt: BlockifierFelt = contract_address.into();
+        let nonce = self
+            .state
+            .nonce_of(&format!("{:#x}", contract_felt))
+            .unwrap_or_default();
+        Ok(BlockifierNonce(BlockifierFelt::from(nonce)))
     }
 
     fn get_class_hash_at(
         &self,
         _contract_address: BlockifierContractAddress,
     ) -> Result<BlockifierClassHash, StateError> {
-        Ok(BlockifierClassHash::default())
+        Err(StateError::StateReadError(
+            "class hash lookup unsupported by generic MutableState adapter".to_string(),
+        ))
     }
 
     fn get_compiled_class(
         &self,
-        class_hash: BlockifierClassHash,
+        _class_hash: BlockifierClassHash,
     ) -> Result<RunnableCompiledClass, StateError> {
-        Err(StateError::UndeclaredClassHash(class_hash))
+        Err(StateError::StateReadError(
+            "compiled class lookup unsupported by generic MutableState adapter".to_string(),
+        ))
     }
 
     fn get_compiled_class_hash(
         &self,
         _class_hash: BlockifierClassHash,
     ) -> Result<BlockifierCompiledClassHash, StateError> {
-        Ok(BlockifierCompiledClassHash::default())
+        Err(StateError::StateReadError(
+            "compiled class hash lookup unsupported by generic MutableState adapter".to_string(),
+        ))
+    }
+}
+
+#[cfg(feature = "blockifier-adapter")]
+pub trait ExecutableTransactionResolver: Send + Sync {
+    fn resolve(
+        &self,
+        block_number: u64,
+        tx: &StarknetTransaction,
+    ) -> Result<ExecutableStarknetTransaction, ExecutionError>;
+}
+
+#[cfg(feature = "blockifier-adapter")]
+#[derive(Default)]
+pub struct EmbeddedExecutablePayloadResolver;
+
+#[cfg(feature = "blockifier-adapter")]
+impl ExecutableTransactionResolver for EmbeddedExecutablePayloadResolver {
+    fn resolve(
+        &self,
+        block_number: u64,
+        tx: &StarknetTransaction,
+    ) -> Result<ExecutableStarknetTransaction, ExecutionError> {
+        tx.executable.clone().ok_or_else(|| {
+            ExecutionError::Backend(format!(
+                "missing executable payload for tx {} in block {}",
+                tx.hash, block_number
+            ))
+        })
     }
 }
 
@@ -364,6 +427,7 @@ pub struct BlockifierVmBackend {
     version_resolver: BlockifierProtocolVersionResolver,
     chain_info: BlockifierChainInfo,
     executor_config: TransactionExecutorConfig,
+    tx_resolver: Arc<dyn ExecutableTransactionResolver>,
 }
 
 #[cfg(feature = "blockifier-adapter")]
@@ -377,7 +441,13 @@ impl BlockifierVmBackend {
             version_resolver,
             chain_info,
             executor_config,
+            tx_resolver: Arc::new(EmbeddedExecutablePayloadResolver),
         }
+    }
+
+    pub fn with_tx_resolver(mut self, tx_resolver: Arc<dyn ExecutableTransactionResolver>) -> Self {
+        self.tx_resolver = tx_resolver;
+        self
     }
 
     pub fn starknet_mainnet() -> Self {
@@ -414,6 +484,29 @@ impl BlockifierVmBackend {
             BouncerConfig::default(),
         ))
     }
+
+    fn map_block_transactions(
+        &self,
+        block: &StarknetBlock,
+    ) -> Result<Vec<BlockifierTransaction>, ExecutionError> {
+        block
+            .transactions
+            .iter()
+            .map(|tx| {
+                let executable = self.tx_resolver.resolve(block.number, tx)?;
+                Ok(BlockifierTransaction::new_for_sequencing(executable))
+            })
+            .collect()
+    }
+
+    fn gas_consumed_from_receipt(receipt: &blockifier::fee::receipt::TransactionReceipt) -> u64 {
+        receipt
+            .gas
+            .l1_gas
+            .0
+            .saturating_add(receipt.gas.l1_data_gas.0)
+            .saturating_add(receipt.gas.l2_gas.0)
+    }
 }
 
 #[cfg(feature = "blockifier-adapter")]
@@ -421,20 +514,14 @@ impl ExecutionBackend for BlockifierVmBackend {
     fn execute_block(
         &self,
         block: &StarknetBlock,
-        _state: &mut dyn MutableState,
+        state: &mut dyn MutableState,
     ) -> Result<ExecutionOutput, ExecutionError> {
+        let started_at = Instant::now();
         let block_context = self.build_block_context(block)?;
-
-        if !block.transactions.is_empty() {
-            return Err(ExecutionError::Backend(
-                "unsupported transaction payload for blockifier backend; expected native \
-                 executable transactions"
-                    .to_string(),
-            ));
-        }
+        let txs = self.map_block_transactions(block)?;
 
         let mut executor = TransactionExecutor::pre_process_and_create(
-            NullBlockifierStateReader,
+            BlockifierStateReaderAdapter::new(state),
             block_context,
             (block.number >= 10).then_some(BlockifierBlockHashAndNumber {
                 hash: BlockifierBlockHash::default(),
@@ -444,11 +531,47 @@ impl ExecutionBackend for BlockifierVmBackend {
         )
         .map_err(|error| ExecutionError::Backend(error.to_string()))?;
 
-        let txs: Vec<BlockifierTransaction> = Vec::new();
-        let _ = executor.execute_txs(
+        let execution_results = executor.execute_txs(
             &txs,
             Some(Instant::now() + std::time::Duration::from_secs(1)),
         );
+        if execution_results.len() != txs.len() {
+            return Err(ExecutionError::Backend(format!(
+                "blockifier returned {} execution results for {} transactions in block {}",
+                execution_results.len(),
+                txs.len(),
+                block.number
+            )));
+        }
+
+        let receipts = execution_results
+            .into_iter()
+            .zip(block.transactions.iter())
+            .map(|(result, tx)| match result {
+                Ok((execution_info, _)) => Ok(starknet_node_types::StarknetReceipt {
+                    tx_hash: tx.hash.clone(),
+                    execution_status: !execution_info.is_reverted(),
+                    events: execution_info
+                        .non_optional_call_infos()
+                        .map(|call_info| call_info.execution.events.len() as u64)
+                        .sum(),
+                    gas_consumed: Self::gas_consumed_from_receipt(&execution_info.receipt),
+                }),
+                Err(TransactionExecutorError::TransactionExecutionError(_)) => {
+                    Ok(starknet_node_types::StarknetReceipt {
+                        tx_hash: tx.hash.clone(),
+                        execution_status: false,
+                        events: 0,
+                        gas_consumed: 0,
+                    })
+                }
+                Err(other) => Err(ExecutionError::Backend(format!(
+                    "fatal blockifier transaction executor error at block {}: {}",
+                    block.number, other
+                ))),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         let summary = executor
             .finalize()
             .map_err(|error| ExecutionError::Backend(error.to_string()))?;
@@ -479,11 +602,20 @@ impl ExecutionBackend for BlockifierVmBackend {
                 .push(format!("{:#x}", class_hash.0));
         }
 
+        for (contract, writes) in &state_diff.storage_diffs {
+            for (key, value) in writes {
+                state.set_storage(contract.clone(), key.clone(), *value);
+            }
+        }
+        for (contract, nonce) in &state_diff.nonces {
+            state.set_nonce(contract.clone(), *nonce);
+        }
+
         Ok(ExecutionOutput {
-            receipts: Vec::new(),
+            receipts,
             state_diff,
             builtin_stats: starknet_node_types::BuiltinStats::default(),
-            execution_time: std::time::Duration::from_millis(0),
+            execution_time: started_at.elapsed(),
         })
     }
 
@@ -502,6 +634,8 @@ impl ExecutionBackend for BlockifierVmBackend {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    #[cfg(feature = "blockifier-adapter")]
+    use std::sync::Arc;
     use std::time::Duration;
 
     use semver::Version;
@@ -600,9 +734,7 @@ mod tests {
         StarknetBlock {
             number,
             protocol_version: Version::parse(version).expect("valid version"),
-            transactions: vec![StarknetTransaction {
-                hash: format!("0x{number:x}"),
-            }],
+            transactions: vec![StarknetTransaction::new(format!("0x{number:x}"))],
         }
     }
 
@@ -626,6 +758,38 @@ mod tests {
             state_diff: StarknetStateDiff::default(),
             builtin_stats: BuiltinStats::default(),
             execution_time: Duration::from_millis(1),
+        }
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    fn executable_l1_handler_tx(hash: &str) -> StarknetTransaction {
+        use starknet_api::executable_transaction::{
+            L1HandlerTransaction as ExecutableL1Handler, Transaction as ExecutableTx,
+        };
+        let mut executable = ExecutableL1Handler::default();
+        // L1Handler payload size is calldata_len - 1; keep one slot to avoid underflow.
+        executable.tx.calldata = vec![Default::default()].into();
+
+        StarknetTransaction::with_executable(hash.to_string(), ExecutableTx::L1Handler(executable))
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    struct StaticExecutableResolver;
+
+    #[cfg(feature = "blockifier-adapter")]
+    impl ExecutableTransactionResolver for StaticExecutableResolver {
+        fn resolve(
+            &self,
+            _block_number: u64,
+            _tx: &StarknetTransaction,
+        ) -> Result<ExecutableStarknetTransaction, ExecutionError> {
+            use starknet_api::executable_transaction::{
+                L1HandlerTransaction as ExecutableL1Handler, Transaction as ExecutableTx,
+            };
+
+            let mut executable = ExecutableL1Handler::default();
+            executable.tx.calldata = vec![Default::default()].into();
+            Ok(ExecutableTx::L1Handler(executable))
         }
     }
 
@@ -827,6 +991,43 @@ mod tests {
         let err = backend
             .execute_block(&block(12, "0.14.2"), &mut state)
             .expect_err("must fail");
-        assert!(matches!(err, ExecutionError::Backend(_)));
+        match err {
+            ExecutionError::Backend(message) => {
+                assert!(message.contains("missing executable payload"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    #[test]
+    fn blockifier_backend_accepts_external_transaction_resolver() {
+        let backend = BlockifierVmBackend::starknet_mainnet()
+            .with_tx_resolver(Arc::new(StaticExecutableResolver));
+        let mut state = InMemoryState::default();
+
+        let output = backend
+            .execute_block(&block(12, "0.14.2"), &mut state)
+            .expect("execute via external resolver");
+        assert_eq!(output.receipts.len(), 1);
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    #[test]
+    fn blockifier_backend_processes_non_empty_blocks_with_executable_payloads() {
+        let backend = BlockifierVmBackend::starknet_mainnet();
+        let mut state = InMemoryState::default();
+        let block = StarknetBlock {
+            number: 12,
+            protocol_version: Version::parse("0.14.2").expect("valid version"),
+            transactions: vec![executable_l1_handler_tx("0xabc")],
+        };
+
+        let output = backend
+            .execute_block(&block, &mut state)
+            .expect("execute non-empty block");
+        assert_eq!(output.receipts.len(), 1);
+        assert_eq!(output.receipts[0].tx_hash, "0xabc");
+        assert!(!output.receipts[0].execution_status);
     }
 }

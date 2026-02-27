@@ -3,7 +3,12 @@ name = "starknet-node-types"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+blockifier-adapter = ["dep:starknet_api"]
+
 [dependencies]
 semver = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+starknet_api = { version = "0.18.0-dev.0", optional = true }
