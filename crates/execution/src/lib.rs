@@ -7,6 +7,8 @@ use node_spec_core::protocol_version::{
 };
 use semver::Version;
 #[cfg(feature = "blockifier-adapter")]
+use starknet_node_types::BlockGasPrices;
+#[cfg(feature = "blockifier-adapter")]
 use starknet_node_types::StarknetFelt;
 use starknet_node_types::{
     BlockContext, ExecutionOutput, MutableState, SimulationResult, StarknetBlock,
@@ -43,8 +45,9 @@ use blockifier::transaction::transaction_execution::Transaction as BlockifierTra
 use starknet_api::block::{
     BlockHash as BlockifierBlockHash, BlockHashAndNumber as BlockifierBlockHashAndNumber,
     BlockInfo as BlockifierBlockInfo, BlockNumber as BlockifierBlockNumber,
-    BlockTimestamp as BlockifierBlockTimestamp, GasPrices as BlockifierGasPrices,
-    StarknetVersion as BlockifierProtocolVersion,
+    BlockTimestamp as BlockifierBlockTimestamp, GasPrice as BlockifierGasPrice,
+    GasPriceVector as BlockifierGasPriceVector, GasPrices as BlockifierGasPrices,
+    NonzeroGasPrice as BlockifierNonzeroGasPrice, StarknetVersion as BlockifierProtocolVersion,
 };
 #[cfg(feature = "blockifier-adapter")]
 use starknet_api::core::{
@@ -276,8 +279,11 @@ impl DualExecutionBackend {
                     metrics.canonical_executions += 1;
                 })?;
 
-                if fast_output == canonical_output {
-                    return Ok(fast_output);
+                let outputs_match = fast_output.receipts == canonical_output.receipts
+                    && fast_output.state_diff == canonical_output.state_diff
+                    && fast_output.builtin_stats == canonical_output.builtin_stats;
+                if outputs_match {
+                    return Ok(canonical_output);
                 }
 
                 self.with_metrics(|metrics| metrics.mismatches += 1)?;
@@ -407,6 +413,50 @@ fn node_felt_to_blockifier(
 }
 
 #[cfg(feature = "blockifier-adapter")]
+fn parse_blockifier_sequencer_address(
+    value: &str,
+) -> Result<BlockifierContractAddress, ExecutionError> {
+    let felt = BlockifierFelt::from_str(value).map_err(|error| {
+        ExecutionError::Backend(format!("invalid sequencer_address '{value}': {error}"))
+    })?;
+    BlockifierContractAddress::try_from(felt).map_err(|error| {
+        ExecutionError::Backend(format!("sequencer_address out of range '{value}': {error}"))
+    })
+}
+
+#[cfg(feature = "blockifier-adapter")]
+fn nonzero_gas_price(
+    value: u128,
+    field: &'static str,
+) -> Result<BlockifierNonzeroGasPrice, ExecutionError> {
+    BlockifierNonzeroGasPrice::try_from(BlockifierGasPrice(value)).map_err(|error| {
+        ExecutionError::Backend(format!("invalid {field} gas price {value}: {error}"))
+    })
+}
+
+#[cfg(feature = "blockifier-adapter")]
+fn map_block_gas_prices(prices: &BlockGasPrices) -> Result<BlockifierGasPrices, ExecutionError> {
+    Ok(BlockifierGasPrices {
+        eth_gas_prices: BlockifierGasPriceVector {
+            l1_gas_price: nonzero_gas_price(prices.l1_gas.price_in_wei, "l1_gas.price_in_wei")?,
+            l1_data_gas_price: nonzero_gas_price(
+                prices.l1_data_gas.price_in_wei,
+                "l1_data_gas.price_in_wei",
+            )?,
+            l2_gas_price: nonzero_gas_price(prices.l2_gas.price_in_wei, "l2_gas.price_in_wei")?,
+        },
+        strk_gas_prices: BlockifierGasPriceVector {
+            l1_gas_price: nonzero_gas_price(prices.l1_gas.price_in_fri, "l1_gas.price_in_fri")?,
+            l1_data_gas_price: nonzero_gas_price(
+                prices.l1_data_gas.price_in_fri,
+                "l1_data_gas.price_in_fri",
+            )?,
+            l2_gas_price: nonzero_gas_price(prices.l2_gas.price_in_fri, "l2_gas.price_in_fri")?,
+        },
+    })
+}
+
+#[cfg(feature = "blockifier-adapter")]
 struct BlockifierStateReaderAdapter {
     state: Box<dyn MutableState>,
 }
@@ -517,6 +567,7 @@ pub struct BlockifierVmBackend {
     chain_info: BlockifierChainInfo,
     executor_config: TransactionExecutorConfig,
     tx_resolver: Arc<dyn ExecutableTransactionResolver>,
+    last_executed_block: Mutex<Option<u64>>,
 }
 
 #[cfg(feature = "blockifier-adapter")]
@@ -531,6 +582,7 @@ impl BlockifierVmBackend {
             chain_info,
             executor_config,
             tx_resolver: Arc::new(EmbeddedExecutablePayloadResolver),
+            last_executed_block: Mutex::new(None),
         }
     }
 
@@ -556,13 +608,15 @@ impl BlockifierVmBackend {
             .resolve_for_block(&block.protocol_version)?;
         let versioned_constants = BlockifierVersionedConstants::get(&protocol)
             .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+        let sequencer_address = parse_blockifier_sequencer_address(&block.sequencer_address)?;
+        let gas_prices = map_block_gas_prices(&block.gas_prices)?;
 
         let block_info = BlockifierBlockInfo {
             block_number: BlockifierBlockNumber(block.number),
             block_timestamp: BlockifierBlockTimestamp(block.timestamp),
             starknet_version: protocol,
-            sequencer_address: BlockifierContractAddress::default(),
-            gas_prices: BlockifierGasPrices::default(),
+            sequencer_address,
+            gas_prices,
             use_kzg_da: false,
         };
 
@@ -619,6 +673,35 @@ impl BlockifierVmBackend {
             .saturating_add(receipt.gas.l1_data_gas.0)
             .saturating_add(receipt.gas.l2_gas.0)
     }
+
+    fn validate_sequential_block(&self, block_number: u64) -> Result<(), ExecutionError> {
+        let guard = self
+            .last_executed_block
+            .lock()
+            .map_err(|_| ExecutionError::Backend("block sequence mutex poisoned".to_string()))?;
+
+        if let Some(previous) = *guard {
+            let expected = previous.checked_add(1).ok_or_else(|| {
+                ExecutionError::Backend(format!("block sequence overflow after block {previous}"))
+            })?;
+            if block_number != expected {
+                return Err(ExecutionError::Backend(format!(
+                    "non-sequential block execution: expected {expected}, got {block_number}"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn record_executed_block(&self, block_number: u64) -> Result<(), ExecutionError> {
+        let mut guard = self
+            .last_executed_block
+            .lock()
+            .map_err(|_| ExecutionError::Backend("block sequence mutex poisoned".to_string()))?;
+        *guard = Some(block_number);
+        Ok(())
+    }
 }
 
 #[cfg(feature = "blockifier-adapter")]
@@ -628,6 +711,7 @@ impl ExecutionBackend for BlockifierVmBackend {
         block: &StarknetBlock,
         state: &mut dyn MutableState,
     ) -> Result<ExecutionOutput, ExecutionError> {
+        self.validate_sequential_block(block.number)?;
         let started_at = Instant::now();
         let block_context = self.build_block_context(block)?;
         let txs = self.map_block_transactions(block)?;
@@ -723,12 +807,14 @@ impl ExecutionBackend for BlockifierVmBackend {
             state.set_nonce(contract.clone(), *nonce);
         }
 
-        Ok(ExecutionOutput {
+        let output = ExecutionOutput {
             receipts,
             state_diff,
             builtin_stats: starknet_node_types::BuiltinStats::default(),
             execution_time: started_at.elapsed(),
-        })
+        };
+        self.record_executed_block(block.number)?;
+        Ok(output)
     }
 
     fn simulate_tx(
@@ -752,9 +838,9 @@ mod tests {
 
     use semver::Version;
     use starknet_node_types::{
-        BuiltinStats, ExecutionOutput, InMemoryState, MutableState, SimulationResult,
-        StarknetBlock, StarknetFelt, StarknetReceipt, StarknetStateDiff, StarknetTransaction,
-        StateReader,
+        BlockGasPrices, BuiltinStats, ExecutionOutput, GasPricePerToken, InMemoryState,
+        MutableState, SimulationResult, StarknetBlock, StarknetFelt, StarknetReceipt,
+        StarknetStateDiff, StarknetTransaction, StateReader,
     };
 
     use super::*;
@@ -843,10 +929,29 @@ mod tests {
         }
     }
 
+    fn sample_gas_prices() -> BlockGasPrices {
+        BlockGasPrices {
+            l1_gas: GasPricePerToken {
+                price_in_fri: 2,
+                price_in_wei: 3,
+            },
+            l1_data_gas: GasPricePerToken {
+                price_in_fri: 4,
+                price_in_wei: 5,
+            },
+            l2_gas: GasPricePerToken {
+                price_in_fri: 6,
+                price_in_wei: 7,
+            },
+        }
+    }
+
     fn block(number: u64, version: &str) -> StarknetBlock {
         StarknetBlock {
             number,
             timestamp: 1_700_000_000 + number,
+            sequencer_address: "0x1".to_string(),
+            gas_prices: sample_gas_prices(),
             protocol_version: Version::parse(version).expect("valid version"),
             transactions: vec![StarknetTransaction::new(format!("0x{number:x}"))],
         }
@@ -857,6 +962,8 @@ mod tests {
         StarknetBlock {
             number,
             timestamp: 1_700_000_000 + number,
+            sequencer_address: "0x1".to_string(),
+            gas_prices: sample_gas_prices(),
             protocol_version: Version::parse(version).expect("valid version"),
             transactions: Vec::new(),
         }
@@ -1002,6 +1109,35 @@ mod tests {
         let mut state = InMemoryState::default();
         let result = backend.execute_verified(&block(1, "0.14.2"), &mut state);
         assert_eq!(result.expect("fallback").receipts[0].gas_consumed, 7);
+    }
+
+    #[test]
+    fn semantic_match_ignores_execution_time_differences() {
+        let mut fast_output = output(7);
+        let mut canonical_output = output(7);
+        fast_output.execution_time = Duration::from_millis(1);
+        canonical_output.execution_time = Duration::from_millis(25);
+
+        let fast = ScriptedBackend::new("fast", BTreeMap::from([(1, fast_output)]), output(1));
+        let canonical = ScriptedBackend::new(
+            "canonical",
+            BTreeMap::from([(1, canonical_output)]),
+            output(7),
+        );
+        let backend = DualExecutionBackend::new(
+            Some(Box::new(fast)),
+            Box::new(canonical),
+            ExecutionMode::DualWithVerification {
+                verification_depth: 10,
+            },
+            MismatchPolicy::Halt,
+        );
+
+        let mut state = InMemoryState::default();
+        let result = backend
+            .execute_verified(&block(1, "0.14.2"), &mut state)
+            .expect("semantic equality should pass");
+        assert_eq!(result.receipts[0].gas_consumed, 7);
     }
 
     #[test]
@@ -1291,6 +1427,8 @@ mod tests {
         let block = StarknetBlock {
             number: 12,
             timestamp: 1_700_000_012,
+            sequencer_address: "0x1".to_string(),
+            gas_prices: sample_gas_prices(),
             protocol_version: Version::parse("0.14.2").expect("valid version"),
             transactions: vec![executable_l1_handler_tx("0xabc")],
         };

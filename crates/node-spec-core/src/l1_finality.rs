@@ -7,6 +7,12 @@ pub struct PostedStateRoot {
     pub eth_block_number: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FinalityError {
+    #[error("duplicate L2 block {l2_block_number} in posted state-root tracker")]
+    DuplicatePostedRoot { l2_block_number: u64 },
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct L1FinalityTracker {
     finalized_eth_block: Option<u64>,
@@ -19,8 +25,17 @@ impl L1FinalityTracker {
         self.finalized_eth_block
     }
 
-    pub fn record_state_root_posted(&mut self, entry: PostedStateRoot) {
+    pub fn record_state_root_posted(
+        &mut self,
+        entry: PostedStateRoot,
+    ) -> Result<(), FinalityError> {
+        if self.posted_by_l2_block.contains_key(&entry.l2_block_number) {
+            return Err(FinalityError::DuplicatePostedRoot {
+                l2_block_number: entry.l2_block_number,
+            });
+        }
         self.posted_by_l2_block.insert(entry.l2_block_number, entry);
+        Ok(())
     }
 
     pub fn update_finalized_eth_block(&mut self, block_number: u64) {
@@ -72,7 +87,9 @@ mod tests {
     #[test]
     fn does_not_confirm_until_eth_finalized() {
         let mut tracker = L1FinalityTracker::default();
-        tracker.record_state_root_posted(root(120, 10_000));
+        tracker
+            .record_state_root_posted(root(120, 10_000))
+            .expect("record root");
         assert_eq!(tracker.latest_verified_block(), None);
 
         tracker.update_finalized_eth_block(9_999);
@@ -85,8 +102,12 @@ mod tests {
     #[test]
     fn only_confirms_roots_up_to_finalized_checkpoint() {
         let mut tracker = L1FinalityTracker::default();
-        tracker.record_state_root_posted(root(120, 10_000));
-        tracker.record_state_root_posted(root(121, 10_008));
+        tracker
+            .record_state_root_posted(root(120, 10_000))
+            .expect("record root 120");
+        tracker
+            .record_state_root_posted(root(121, 10_008))
+            .expect("record root 121");
         tracker.update_finalized_eth_block(10_003);
 
         assert_eq!(tracker.latest_verified_block(), Some(120));
@@ -95,8 +116,12 @@ mod tests {
     #[test]
     fn drops_unfinalized_roots_on_reorg() {
         let mut tracker = L1FinalityTracker::default();
-        tracker.record_state_root_posted(root(120, 10_000));
-        tracker.record_state_root_posted(root(121, 10_008));
+        tracker
+            .record_state_root_posted(root(120, 10_000))
+            .expect("record root 120");
+        tracker
+            .record_state_root_posted(root(121, 10_008))
+            .expect("record root 121");
         tracker.update_finalized_eth_block(10_001);
         assert_eq!(tracker.latest_verified_block(), Some(120));
 
@@ -118,5 +143,23 @@ mod tests {
 
         tracker.update_finalized_eth_block(250);
         assert_eq!(tracker.finalized_eth_block(), Some(250));
+    }
+
+    #[test]
+    fn rejects_duplicate_l2_block_posts() {
+        let mut tracker = L1FinalityTracker::default();
+        tracker
+            .record_state_root_posted(root(120, 10_000))
+            .expect("first insert");
+
+        let err = tracker
+            .record_state_root_posted(root(120, 10_050))
+            .expect_err("duplicate should fail");
+        assert_eq!(
+            err,
+            FinalityError::DuplicatePostedRoot {
+                l2_block_number: 120
+            }
+        );
     }
 }

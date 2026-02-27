@@ -1,11 +1,15 @@
 use std::collections::{HashMap, VecDeque};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
 use std::thread;
 
 use node_spec_core::exex_delivery::{DeliveryPlanError, ExExHandleMeta, build_delivery_tiers};
 use node_spec_core::notification::{
     NotificationDecodeError, NotificationV1, StarknetExExNotification, decode_wal_entry,
 };
+use rayon::ThreadPool;
+use rayon::prelude::*;
 
 pub trait NotificationSink: Send {
     fn on_notification(&mut self, notification: StarknetExExNotification) -> Result<(), String>;
@@ -13,21 +17,27 @@ pub trait NotificationSink: Send {
 
 #[derive(Debug, Default, Clone)]
 pub struct InMemoryWal {
-    entries: Vec<Vec<u8>>,
+    entries: VecDeque<Vec<u8>>,
 }
 
 impl InMemoryWal {
     pub fn append(&mut self, entry: Vec<u8>) {
-        self.entries.push(entry);
+        self.entries.push_back(entry);
     }
 
-    pub fn append_raw_legacy_v1(&mut self, v1: NotificationV1) {
-        let encoded = bincode::serialize(&v1).expect("serialize v1");
-        self.entries.push(encoded);
+    pub fn append_raw_legacy_v1(&mut self, v1: NotificationV1) -> Result<(), String> {
+        let encoded = bincode::serialize(&v1)
+            .map_err(|error| format!("bincode serialize v1 failed: {error}"))?;
+        self.entries.push_back(encoded);
+        Ok(())
     }
 
-    pub fn entries(&self) -> &[Vec<u8>] {
+    pub fn entries(&self) -> &VecDeque<Vec<u8>> {
         &self.entries
+    }
+
+    pub fn acknowledge_one(&mut self) {
+        self.entries.pop_front();
     }
 }
 
@@ -52,6 +62,8 @@ pub enum ManagerError {
     WalEncode(String),
     #[error("failed to decode notification from WAL: {0}")]
     WalDecode(#[from] NotificationDecodeError),
+    #[error("WAL contains {entries} entries, exceeding replay safety limit {max}")]
+    WalTooManyEntries { entries: usize, max: usize },
     #[error("notification id counter overflowed")]
     NotificationIdOverflow,
 }
@@ -63,9 +75,11 @@ pub struct ExExManager {
     next_id: u64,
     max_capacity: usize,
     wal: InMemoryWal,
+    delivery_pool: Option<ThreadPool>,
 }
 
 const MAX_PARALLEL_DELIVERY_WORKERS: usize = 32;
+const MAX_WAL_REPLAY_ENTRIES: usize = 100_000;
 
 impl ExExManager {
     pub fn new(max_capacity: usize) -> Self {
@@ -76,6 +90,10 @@ impl ExExManager {
             next_id: 1,
             max_capacity,
             wal: InMemoryWal::default(),
+            delivery_pool: rayon::ThreadPoolBuilder::new()
+                .num_threads(MAX_PARALLEL_DELIVERY_WORKERS.max(1))
+                .build()
+                .ok(),
         }
     }
 
@@ -135,6 +153,7 @@ impl ExExManager {
             names.sort();
             self.deliver_tier(&names, &notification)?;
             self.buffer.pop_front();
+            self.wal.acknowledge_one();
             return Ok(Some(notification_id));
         }
 
@@ -144,10 +163,17 @@ impl ExExManager {
         }
 
         self.buffer.pop_front();
+        self.wal.acknowledge_one();
         Ok(Some(notification_id))
     }
 
     pub fn replay_wal(&self) -> Result<Vec<StarknetExExNotification>, ManagerError> {
+        if self.wal.entries().len() > MAX_WAL_REPLAY_ENTRIES {
+            return Err(ManagerError::WalTooManyEntries {
+                entries: self.wal.entries().len(),
+                max: MAX_WAL_REPLAY_ENTRIES,
+            });
+        }
         let mut notifications = Vec::with_capacity(self.wal.entries().len());
         for raw in self.wal.entries() {
             notifications.push(decode_wal_entry(raw)?);
@@ -162,41 +188,46 @@ impl ExExManager {
     ) -> Result<(), ManagerError> {
         let mut first_error = None;
 
-        for chunk in tier.chunks(MAX_PARALLEL_DELIVERY_WORKERS.max(1)) {
-            let mut workers = Vec::with_capacity(chunk.len());
-            for name in chunk {
-                let sink = self
-                    .sinks
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| ManagerError::MissingSink(name.clone()))?;
-                let sink_name = name.clone();
-                let cloned_notification = notification.clone();
-                let worker = thread::spawn(move || -> Result<(), ManagerError> {
-                    let mut sink_guard = sink.lock().map_err(|_| ManagerError::SinkFailure {
-                        name: sink_name.clone(),
-                        message: "sink mutex poisoned".to_string(),
-                    })?;
-                    sink_guard
-                        .on_notification(cloned_notification)
-                        .map_err(|message| ManagerError::SinkFailure {
-                            name: sink_name,
-                            message,
+        let dispatch_batch = |names: &[String]| -> Vec<(String, Result<(), ManagerError>)> {
+            if let Some(pool) = &self.delivery_pool {
+                pool.install(|| {
+                    names
+                        .par_iter()
+                        .map(|name| {
+                            let result = catch_unwind(AssertUnwindSafe(|| {
+                                self.deliver_to_sink(name, notification)
+                            }))
+                            .unwrap_or_else(|_| {
+                                Err(ManagerError::SinkFailure {
+                                    name: name.clone(),
+                                    message: "sink thread panicked".to_string(),
+                                })
+                            });
+                            (name.clone(), result)
                         })
-                });
-                workers.push((name.clone(), worker));
+                        .collect()
+                })
+            } else {
+                names
+                    .iter()
+                    .map(|name| {
+                        let result = catch_unwind(AssertUnwindSafe(|| {
+                            self.deliver_to_sink(name, notification)
+                        }))
+                        .unwrap_or_else(|_| {
+                            Err(ManagerError::SinkFailure {
+                                name: name.clone(),
+                                message: "sink thread panicked".to_string(),
+                            })
+                        });
+                        (name.clone(), result)
+                    })
+                    .collect()
             }
+        };
 
-            // Deterministic failure ordering: capture first error in planned order while
-            // guaranteeing every worker is joined before returning.
-            for (name, worker) in workers {
-                let result = match worker.join() {
-                    Ok(result) => result,
-                    Err(_) => Err(ManagerError::SinkFailure {
-                        name,
-                        message: "sink thread panicked".to_string(),
-                    }),
-                };
+        for chunk in tier.chunks(MAX_PARALLEL_DELIVERY_WORKERS.max(1)) {
+            for (_, result) in dispatch_batch(chunk) {
                 if first_error.is_none()
                     && let Err(err) = result
                 {
@@ -210,6 +241,28 @@ impl ExExManager {
         }
 
         Ok(())
+    }
+
+    fn deliver_to_sink(
+        &self,
+        name: &str,
+        notification: &StarknetExExNotification,
+    ) -> Result<(), ManagerError> {
+        let sink = self
+            .sinks
+            .get(name)
+            .cloned()
+            .ok_or_else(|| ManagerError::MissingSink(name.to_string()))?;
+        let mut sink_guard = sink.lock().map_err(|_| ManagerError::SinkFailure {
+            name: name.to_string(),
+            message: "sink mutex poisoned".to_string(),
+        })?;
+        sink_guard
+            .on_notification(notification.clone())
+            .map_err(|message| ManagerError::SinkFailure {
+                name: name.to_string(),
+                message,
+            })
     }
 }
 
@@ -388,10 +441,13 @@ mod tests {
     fn replays_wal_with_legacy_payloads() {
         let mut manager = ExExManager::new(4);
         manager.enqueue(sample_notification()).expect("enqueue v2");
-        manager.wal_mut().append_raw_legacy_v1(NotificationV1 {
-            block_number: 5,
-            tx_count: 1,
-        });
+        manager
+            .wal_mut()
+            .append_raw_legacy_v1(NotificationV1 {
+                block_number: 5,
+                tx_count: 1,
+            })
+            .expect("append legacy");
 
         let replayed = manager.replay_wal().expect("replay");
         assert_eq!(replayed.len(), 2);
@@ -528,6 +584,20 @@ mod tests {
             if name == "failing" && message == "boom"
         ));
         assert_eq!(manager.buffer.len(), 1);
+    }
+
+    #[test]
+    fn compacts_wal_after_successful_delivery() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut manager = ExExManager::new(8);
+        manager
+            .register(vec![reg("otel", &[], log)])
+            .expect("register");
+        manager.enqueue(sample_notification()).expect("enqueue");
+        assert_eq!(manager.wal().entries().len(), 1);
+
+        manager.drain_one().expect("drain");
+        assert!(manager.wal().entries().is_empty());
     }
 
     #[test]

@@ -15,7 +15,11 @@ pub enum DeliveryPlanError {
     UnknownDependency { exex: String, dependency: String },
     #[error("dependency cycle detected among exex registrations")]
     DependencyCycle,
+    #[error("dependency depth {depth} exceeds maximum supported depth {max}")]
+    DependencyDepthExceeded { depth: usize, max: usize },
 }
+
+const MAX_DEPENDENCY_DEPTH: usize = 128;
 
 pub fn build_delivery_tiers(
     handles: &[ExExHandleMeta],
@@ -72,13 +76,24 @@ pub fn build_delivery_tiers(
             unscheduled.remove(name);
             if let Some(children) = outgoing.get(name) {
                 for child in children {
-                    let entry = indegree.get_mut(child).expect("child exists in indegree");
+                    let Some(entry) = indegree.get_mut(child) else {
+                        return Err(DeliveryPlanError::UnknownDependency {
+                            exex: child.clone(),
+                            dependency: name.clone(),
+                        });
+                    };
                     *entry = entry.saturating_sub(1);
                 }
             }
         }
 
         tiers.push(ready);
+        if tiers.len() > MAX_DEPENDENCY_DEPTH {
+            return Err(DeliveryPlanError::DependencyDepthExceeded {
+                depth: tiers.len(),
+                max: MAX_DEPENDENCY_DEPTH,
+            });
+        }
     }
 
     Ok(tiers)
@@ -159,5 +174,36 @@ mod tests {
 
         let err = build_delivery_tiers(&handles).expect_err("must fail");
         assert_eq!(err, DeliveryPlanError::DependencyCycle);
+    }
+
+    #[test]
+    fn fails_on_excessive_dependency_depth() {
+        let depth = MAX_DEPENDENCY_DEPTH + 1;
+        let mut handles = Vec::with_capacity(depth);
+        for idx in 0..depth {
+            let name = format!("exex-{idx}");
+            if idx == 0 {
+                handles.push(ExExHandleMeta {
+                    name,
+                    depends_on: Vec::new(),
+                    priority: 1,
+                });
+            } else {
+                handles.push(ExExHandleMeta {
+                    name,
+                    depends_on: vec![format!("exex-{}", idx - 1)],
+                    priority: 1,
+                });
+            }
+        }
+
+        let err = build_delivery_tiers(&handles).expect_err("must fail");
+        assert_eq!(
+            err,
+            DeliveryPlanError::DependencyDepthExceeded {
+                depth: MAX_DEPENDENCY_DEPTH + 1,
+                max: MAX_DEPENDENCY_DEPTH,
+            }
+        );
     }
 }

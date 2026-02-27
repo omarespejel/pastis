@@ -22,6 +22,8 @@ use starknet_api::state::ThinStateDiff as PapyrusThinStateDiff;
 use starknet_api::state::{StateNumber as PapyrusStateNumber, StorageKey as PapyrusStorageKey};
 
 use starknet_crypto::poseidon_hash_many;
+#[cfg(feature = "papyrus-adapter")]
+use starknet_node_types::{BlockGasPrices, GasPricePerToken};
 use starknet_node_types::{
     BlockId, BlockNumber, ComponentHealth, HealthCheck, HealthStatus, InMemoryState, StarknetBlock,
     StarknetFelt, StarknetStateDiff, StateReader,
@@ -148,11 +150,10 @@ impl StorageBackend for InMemoryStorage {
             return Err(StorageError::NonSequentialBlock(block.number));
         }
 
-        let mut next_state = self
-            .states
-            .get(&(expected - 1))
-            .cloned()
-            .unwrap_or_default();
+        let parent = expected
+            .checked_sub(1)
+            .ok_or(StorageError::BlockNumberOverflow { tip })?;
+        let mut next_state = self.states.get(&parent).cloned().unwrap_or_default();
         next_state.apply_state_diff(&state_diff);
 
         self.blocks.insert(block.number, block);
@@ -492,9 +493,24 @@ impl StorageBackend for PapyrusStorageAdapter {
 
         let protocol_version =
             parse_starknet_version_to_semver(&header.starknet_version.to_string())?;
+        let l1_gas = GasPricePerToken {
+            price_in_fri: header.l1_gas_price.price_in_fri.0,
+            price_in_wei: header.l1_gas_price.price_in_wei.0,
+        };
+        let l1_data_gas = GasPricePerToken {
+            price_in_fri: header.l1_data_gas_price.price_in_fri.0,
+            price_in_wei: header.l1_data_gas_price.price_in_wei.0,
+        };
         Ok(Some(StarknetBlock {
             number: number.0,
             timestamp: header.timestamp.0,
+            sequencer_address: format!("{:#x}", header.sequencer.0.0.key()),
+            gas_prices: BlockGasPrices {
+                l1_gas,
+                l1_data_gas,
+                // Starknet v0.13 headers do not carry L2 gas prices.
+                l2_gas: l1_gas,
+            },
             protocol_version,
             transactions: Vec::new(),
         }))
@@ -526,15 +542,22 @@ impl StorageBackend for PapyrusStorageAdapter {
     }
 
     fn current_state_root(&self) -> String {
-        self.read_current_state_root()
-            .unwrap_or_else(|_| "0x0".to_string())
+        match self.read_current_state_root() {
+            Ok(root) => root,
+            Err(error) => {
+                eprintln!("papyrus-storage-adapter: failed to read current state root: {error}");
+                "0x0".to_string()
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use semver::Version;
-    use starknet_node_types::{ContractAddress, StarknetFelt, StarknetTransaction};
+    use starknet_node_types::{
+        BlockGasPrices, ContractAddress, GasPricePerToken, StarknetFelt, StarknetTransaction,
+    };
 
     use super::*;
 
@@ -542,6 +565,21 @@ mod tests {
         StarknetBlock {
             number,
             timestamp: 1_700_000_000 + number,
+            sequencer_address: "0x1".to_string(),
+            gas_prices: BlockGasPrices {
+                l1_gas: GasPricePerToken {
+                    price_in_fri: 2,
+                    price_in_wei: 3,
+                },
+                l1_data_gas: GasPricePerToken {
+                    price_in_fri: 4,
+                    price_in_wei: 5,
+                },
+                l2_gas: GasPricePerToken {
+                    price_in_fri: 6,
+                    price_in_wei: 7,
+                },
+            },
             protocol_version: Version::parse("0.14.2").expect("valid semver"),
             transactions: vec![StarknetTransaction::new(format!("0x{number:x}"))],
         }

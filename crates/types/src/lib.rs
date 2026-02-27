@@ -70,10 +70,25 @@ pub struct StarknetStateDiff {
     pub declared_classes: Vec<ClassHash>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GasPricePerToken {
+    pub price_in_fri: u128,
+    pub price_in_wei: u128,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockGasPrices {
+    pub l1_gas: GasPricePerToken,
+    pub l1_data_gas: GasPricePerToken,
+    pub l2_gas: GasPricePerToken,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StarknetBlock {
     pub number: BlockNumber,
     pub timestamp: u64,
+    pub sequencer_address: ContractAddress,
+    pub gas_prices: BlockGasPrices,
     pub protocol_version: Version,
     pub transactions: Vec<StarknetTransaction>,
 }

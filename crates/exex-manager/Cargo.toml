@@ -7,4 +7,5 @@ publish = false
 [dependencies]
 bincode = { workspace = true }
 node-spec-core = { path = "../node-spec-core" }
+rayon = "1.11"
 thiserror = { workspace = true }
