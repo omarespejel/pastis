@@ -48,9 +48,16 @@ impl L1FinalityTracker {
     /// Removes state roots that are not finalized and were posted at or after the given
     /// Ethereum block number.
     ///
-    /// Callers must synchronize concurrent mutation externally if multiple threads update
-    /// finality and reorg state.
-    pub fn invalidate_unfinalized_from_eth_block(&mut self, from_eth_block: u64) {
+    /// `observed_finalized_eth_block` lets callers atomically advance finality and apply
+    /// reorg invalidation using one mutable operation on this tracker.
+    pub fn invalidate_unfinalized_from_eth_block(
+        &mut self,
+        from_eth_block: u64,
+        observed_finalized_eth_block: Option<u64>,
+    ) {
+        if let Some(observed_finalized) = observed_finalized_eth_block {
+            self.update_finalized_eth_block(observed_finalized);
+        }
         let finalized = self.finalized_eth_block.unwrap_or_default();
         self.posted_by_l2_block.retain(|_, entry| {
             !(entry.eth_block_number >= from_eth_block && entry.eth_block_number > finalized)
@@ -125,9 +132,29 @@ mod tests {
         tracker.update_finalized_eth_block(10_001);
         assert_eq!(tracker.latest_verified_block(), Some(120));
 
-        tracker.invalidate_unfinalized_from_eth_block(10_005);
+        tracker.invalidate_unfinalized_from_eth_block(10_005, None);
         tracker.update_finalized_eth_block(10_100);
         assert_eq!(tracker.latest_verified_block(), Some(120));
+    }
+
+    #[test]
+    fn reorg_invalidation_can_apply_finalized_hint_atomically() {
+        let mut tracker = L1FinalityTracker::default();
+        tracker
+            .record_state_root_posted(root(120, 10_000))
+            .expect("record root 120");
+        tracker
+            .record_state_root_posted(root(121, 10_008))
+            .expect("record root 121");
+        tracker
+            .record_state_root_posted(root(122, 10_012))
+            .expect("record root 122");
+        tracker.update_finalized_eth_block(10_001);
+
+        tracker.invalidate_unfinalized_from_eth_block(10_005, Some(10_010));
+
+        tracker.update_finalized_eth_block(10_100);
+        assert_eq!(tracker.latest_verified_block(), Some(121));
     }
 
     #[test]

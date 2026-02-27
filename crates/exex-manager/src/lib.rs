@@ -129,16 +129,16 @@ impl ExExManager {
             return Err(ManagerError::CapacityExceeded);
         }
 
+        let notification_id = self.next_id;
+        let next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or(ManagerError::NotificationIdOverflow)?;
         let encoded = bincode::serialize(&notification).map_err(|error| {
             ManagerError::WalEncode(format!("bincode serialize failed: {error}"))
         })?;
         self.wal.append(encoded);
-
-        let notification_id = self.next_id;
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .ok_or(ManagerError::NotificationIdOverflow)?;
+        self.next_id = next_id;
         self.buffer.push_back((notification_id, notification));
         Ok(notification_id)
     }
@@ -686,5 +686,7 @@ mod tests {
             .enqueue(sample_notification())
             .expect_err("must fail");
         assert!(matches!(err, ManagerError::NotificationIdOverflow));
+        assert!(manager.buffer.is_empty());
+        assert!(manager.wal().entries().is_empty());
     }
 }

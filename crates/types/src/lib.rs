@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use starknet_types_core::felt::Felt;
 
 pub type BlockNumber = u64;
+pub type BlockHash = String;
+pub type StateRoot = String;
 pub type TxHash = String;
 pub type ClassHash = String;
 pub type ContractAddress = String;
@@ -86,6 +88,8 @@ pub struct BlockGasPrices {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StarknetBlock {
     pub number: BlockNumber,
+    pub parent_hash: BlockHash,
+    pub state_root: StateRoot,
     pub timestamp: u64,
     pub sequencer_address: ContractAddress,
     pub gas_prices: BlockGasPrices,

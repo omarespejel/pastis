@@ -29,19 +29,8 @@ impl VersionedConstantsResolver {
         &self,
         requested: &Version,
     ) -> Result<&VersionedConstants, VersionResolutionError> {
-        if let Some(exact) = self.bundled.get(requested) {
-            return Ok(exact);
-        }
-
         self.bundled
-            .iter()
-            .filter(|(version, _)| {
-                version.major == requested.major
-                    && version.minor == requested.minor
-                    && version.patch <= requested.patch
-            })
-            .max_by(|(left, _), (right, _)| left.cmp(right))
-            .map(|(_, constants)| constants)
+            .get(requested)
             .ok_or_else(|| VersionResolutionError::Missing {
                 requested: requested.clone(),
             })
@@ -86,7 +75,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_newer_patch_to_latest_known_patch_of_same_minor() {
+    fn rejects_unknown_patch_even_with_same_minor() {
         let resolver = VersionedConstantsResolver::new([
             (
                 v("0.14.0"),
@@ -102,10 +91,15 @@ mod tests {
             ),
         ]);
 
-        let selected = resolver
+        let err = resolver
             .resolve_for_protocol(&v("0.14.3"))
-            .expect("resolve");
-        assert_eq!(selected.id, "v14_2");
+            .expect_err("must fail closed");
+        assert_eq!(
+            err,
+            VersionResolutionError::Missing {
+                requested: v("0.14.3"),
+            }
+        );
     }
 
     #[test]
@@ -154,7 +148,7 @@ mod tests {
         ]);
 
         let selected = resolver
-            .resolve_for_protocol(&v("0.14.3"))
+            .resolve_for_protocol(&v("0.14.2"))
             .expect("resolve");
         assert_eq!(selected.id, "v14_2_release");
     }

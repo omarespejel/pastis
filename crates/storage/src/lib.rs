@@ -60,6 +60,14 @@ pub enum StorageError {
 pub enum CheckpointError {
     #[error("state root mismatch: expected {expected}, actual {actual}")]
     StateRootMismatch { expected: String, actual: String },
+    #[error("checkpoint verification requires canonical state roots from backend '{backend}'")]
+    UnsupportedStateRootSemantics { backend: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateRootSemantics {
+    Canonical,
+    Approximate,
 }
 
 pub trait StorageBackend: Send + Sync + HealthCheck {
@@ -80,6 +88,9 @@ pub trait StorageBackend: Send + Sync + HealthCheck {
     ) -> Result<Option<StarknetStateDiff>, StorageError>;
     fn latest_block_number(&self) -> Result<BlockNumber, StorageError>;
     fn current_state_root(&self) -> String;
+    fn state_root_semantics(&self) -> StateRootSemantics {
+        StateRootSemantics::Canonical
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +133,13 @@ impl StorageBackend for InMemoryStorage {
         &self,
         block_number: BlockNumber,
     ) -> Result<Box<dyn StateReader>, StorageError> {
+        let latest = self.states.keys().next_back().copied().unwrap_or(0);
+        if block_number > latest {
+            return Err(StorageError::BlockOutOfRange {
+                requested: block_number,
+                latest,
+            });
+        }
         let snapshot = self
             .states
             .range(..=block_number)
@@ -210,6 +228,10 @@ impl StorageBackend for InMemoryStorage {
             format!("{:#x}", poseidon_hash_many(&elements))
         }
     }
+
+    fn state_root_semantics(&self) -> StateRootSemantics {
+        StateRootSemantics::Approximate
+    }
 }
 
 pub struct CheckpointSyncVerifier;
@@ -219,6 +241,11 @@ impl CheckpointSyncVerifier {
         storage: &dyn StorageBackend,
         expected_root: &str,
     ) -> Result<(), CheckpointError> {
+        if storage.state_root_semantics() != StateRootSemantics::Canonical {
+            return Err(CheckpointError::UnsupportedStateRootSemantics {
+                backend: storage.detailed_status().name,
+            });
+        }
         let actual = storage.current_state_root();
         if actual == expected_root {
             return Ok(());
@@ -503,6 +530,8 @@ impl StorageBackend for PapyrusStorageAdapter {
         };
         Ok(Some(StarknetBlock {
             number: number.0,
+            parent_hash: format!("{:#x}", header.parent_hash.0),
+            state_root: format!("{:#x}", header.state_root.0),
             timestamp: header.timestamp.0,
             sequencer_address: format!("{:#x}", header.sequencer.0.0.key()),
             gas_prices: BlockGasPrices {
@@ -564,6 +593,8 @@ mod tests {
     fn block(number: BlockNumber) -> StarknetBlock {
         StarknetBlock {
             number,
+            parent_hash: format!("0x{:x}", number.saturating_sub(1)),
+            state_root: format!("0x{:x}", number),
             timestamp: 1_700_000_000 + number,
             sequencer_address: "0x1".to_string(),
             gas_prices: BlockGasPrices {
@@ -623,12 +654,12 @@ mod tests {
     fn checkpoint_verifier_detects_mismatch() {
         let storage = InMemoryStorage::new(InMemoryState::default());
         let err = CheckpointSyncVerifier::verify(&storage, "0xdeadbeef").expect_err("must fail");
-        match err {
-            CheckpointError::StateRootMismatch { expected, actual } => {
-                assert_eq!(expected, "0xdeadbeef".to_string());
-                assert_ne!(expected, actual);
+        assert_eq!(
+            err,
+            CheckpointError::UnsupportedStateRootSemantics {
+                backend: "in-memory-storage".to_string(),
             }
-        }
+        );
     }
 
     #[test]
@@ -646,6 +677,26 @@ mod tests {
             .expect("get latest")
             .expect("must exist");
         assert_eq!(latest.number, 2);
+    }
+
+    #[test]
+    fn in_memory_state_reader_rejects_future_block_requests() {
+        let mut storage = InMemoryStorage::new(InMemoryState::default());
+        storage
+            .insert_block(block(1), diff_with_balance("0xabc", 11))
+            .expect("insert");
+
+        let err = match storage.get_state_reader(2) {
+            Ok(_) => panic!("must fail"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err,
+            StorageError::BlockOutOfRange {
+                requested: 2,
+                latest: 1,
+            }
+        );
     }
 }
 

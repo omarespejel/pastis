@@ -16,4 +16,6 @@ serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
 
 [patch.crates-io]
+# `size-of` is used transitively by upstream Starknet/Papyrus dependencies.
+# Pin to a reviewed vendored copy with CI integrity checks.
 size-of = { path = "vendor/size-of" }

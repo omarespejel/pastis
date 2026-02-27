@@ -157,7 +157,7 @@ where
 //
 // Technically this is incorrect, `Once` points to a `Waiter` which is part of a
 // linked list of `Waiter`s, but we have no way to figure out how long that
-// linked list is. In leu of that, we just assume there's only ever one `Waiter`
+// linked list is. In lieu of that, we just assume there's only ever one `Waiter`
 // in the list. The waiter also potentially holds a `Thread` which itself can
 // have heap allocations, but we have no way to access it so there's not much we
 // can do there
@@ -170,10 +170,9 @@ impl SizeOf for Once {
             next: *const FakeWaiter,
         }
 
-        // We assume the `Once` only points to a single `Waiter`
-        context
-            .add(size_of::<FakeWaiter>())
-            .add_distinct_allocation();
+        // Waiter nodes are stack-allocated in std; account for a single waiter-sized
+        // footprint without attributing a heap allocation.
+        context.add(size_of::<FakeWaiter>());
     }
 }
 

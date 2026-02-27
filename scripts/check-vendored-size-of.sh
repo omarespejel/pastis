@@ -14,7 +14,7 @@ fi
 if git -C "${ROOT_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   FILES=$(
     git -C "${ROOT_DIR}" ls-files vendor/size-of \
-      | grep -v '^vendor/size-of/VENDOR_SHA256$' \
+      | awk '$0 != "vendor/size-of/VENDOR_SHA256"' \
       | LC_ALL=C sort
   )
 else

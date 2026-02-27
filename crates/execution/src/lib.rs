@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 #[cfg(feature = "blockifier-adapter")]
 use std::str::FromStr;
 #[cfg(feature = "blockifier-adapter")]
-use std::time::Instant;
+use std::time::{Duration as StdDuration, Instant};
 
 #[cfg(feature = "blockifier-adapter")]
 use blockifier::blockifier::config::TransactionExecutorConfig;
@@ -132,6 +132,7 @@ pub struct DualExecutionBackend {
     metrics: Mutex<DualExecutionMetrics>,
     cooldown_remaining: Mutex<u64>,
     verification_tip: Mutex<Option<u64>>,
+    verification_shadow_state: Mutex<Option<Box<dyn MutableState>>>,
 }
 
 impl DualExecutionBackend {
@@ -149,6 +150,7 @@ impl DualExecutionBackend {
             metrics: Mutex::new(DualExecutionMetrics::default()),
             cooldown_remaining: Mutex::new(0),
             verification_tip: Mutex::new(None),
+            verification_shadow_state: Mutex::new(None),
         }
     }
 
@@ -216,6 +218,55 @@ impl DualExecutionBackend {
         Ok(block_number >= window_start)
     }
 
+    fn apply_state_diff(
+        state: &mut dyn MutableState,
+        diff: &starknet_node_types::StarknetStateDiff,
+    ) {
+        for (contract, writes) in &diff.storage_diffs {
+            for (key, value) in writes {
+                state.set_storage(contract.clone(), key.clone(), *value);
+            }
+        }
+        for (contract, nonce) in &diff.nonces {
+            state.set_nonce(contract.clone(), *nonce);
+        }
+    }
+
+    fn update_shadow_with_diff(
+        &self,
+        diff: &starknet_node_types::StarknetStateDiff,
+    ) -> Result<(), ExecutionError> {
+        let mut guard = self.verification_shadow_state.lock().map_err(|_| {
+            ExecutionError::Backend("verification shadow state mutex poisoned".to_string())
+        })?;
+        if let Some(shadow) = guard.as_mut() {
+            Self::apply_state_diff(shadow.as_mut(), diff);
+        }
+        Ok(())
+    }
+
+    fn take_or_seed_shadow(
+        &self,
+        state: &dyn MutableState,
+    ) -> Result<Box<dyn MutableState>, ExecutionError> {
+        let mut guard = self.verification_shadow_state.lock().map_err(|_| {
+            ExecutionError::Backend("verification shadow state mutex poisoned".to_string())
+        })?;
+        Ok(guard.take().unwrap_or_else(|| state.boxed_clone()))
+    }
+
+    fn store_shadow(&self, shadow: Box<dyn MutableState>) -> Result<(), ExecutionError> {
+        let mut guard = self.verification_shadow_state.lock().map_err(|_| {
+            ExecutionError::Backend("verification shadow state mutex poisoned".to_string())
+        })?;
+        *guard = Some(shadow);
+        Ok(())
+    }
+
+    fn reset_shadow_from_state(&self, state: &dyn MutableState) -> Result<(), ExecutionError> {
+        self.store_shadow(state.boxed_clone())
+    }
+
     pub fn execute_verified(
         &self,
         block: &StarknetBlock,
@@ -242,16 +293,19 @@ impl DualExecutionBackend {
         match effective_mode {
             ExecutionMode::CanonicalOnly => {
                 let out = self.canonical.execute_block(block, state)?;
+                self.update_shadow_with_diff(&out.state_diff)?;
                 self.with_metrics(|metrics| metrics.canonical_executions += 1)?;
                 Ok(out)
             }
             ExecutionMode::FastOnly => {
                 if let Some(fast) = &self.fast {
                     let out = fast.execute_block(block, state)?;
+                    self.update_shadow_with_diff(&out.state_diff)?;
                     self.with_metrics(|metrics| metrics.fast_executions += 1)?;
                     Ok(out)
                 } else {
                     let out = self.canonical.execute_block(block, state)?;
+                    self.update_shadow_with_diff(&out.state_diff)?;
                     self.with_metrics(|metrics| metrics.canonical_executions += 1)?;
                     Ok(out)
                 }
@@ -259,18 +313,20 @@ impl DualExecutionBackend {
             ExecutionMode::DualWithVerification { verification_depth } => {
                 let Some(fast) = &self.fast else {
                     let out = self.canonical.execute_block(block, state)?;
+                    self.update_shadow_with_diff(&out.state_diff)?;
                     self.with_metrics(|metrics| metrics.canonical_executions += 1)?;
                     return Ok(out);
                 };
 
                 if !self.should_verify_block(block.number, verification_depth)? {
                     let out = fast.execute_block(block, state)?;
+                    self.update_shadow_with_diff(&out.state_diff)?;
                     self.with_metrics(|metrics| metrics.fast_executions += 1)?;
                     return Ok(out);
                 }
 
-                // Canonical mutates the authoritative state; fast runs on a cloned state.
-                let mut fast_state = state.boxed_clone();
+                // Reuse a long-lived verification shadow to avoid cloning full state per block.
+                let mut fast_state = self.take_or_seed_shadow(state)?;
                 let fast_output = fast.execute_block(block, fast_state.as_mut())?;
                 let canonical_output = self.canonical.execute_block(block, state)?;
 
@@ -283,10 +339,12 @@ impl DualExecutionBackend {
                     && fast_output.state_diff == canonical_output.state_diff
                     && fast_output.builtin_stats == canonical_output.builtin_stats;
                 if outputs_match {
+                    self.store_shadow(fast_state)?;
                     return Ok(canonical_output);
                 }
 
                 self.with_metrics(|metrics| metrics.mismatches += 1)?;
+                self.reset_shadow_from_state(state)?;
 
                 match self.mismatch_policy {
                     MismatchPolicy::WarnAndFallback => Ok(canonical_output),
@@ -457,16 +515,17 @@ fn map_block_gas_prices(prices: &BlockGasPrices) -> Result<BlockifierGasPrices, 
 }
 
 #[cfg(feature = "blockifier-adapter")]
+type SharedStateSnapshot = Arc<Mutex<Box<dyn MutableState>>>;
+
+#[cfg(feature = "blockifier-adapter")]
 struct BlockifierStateReaderAdapter {
-    state: Box<dyn MutableState>,
+    state: SharedStateSnapshot,
 }
 
 #[cfg(feature = "blockifier-adapter")]
 impl BlockifierStateReaderAdapter {
-    fn new(state: &dyn MutableState) -> Self {
-        Self {
-            state: state.boxed_clone(),
-        }
+    fn new(state: SharedStateSnapshot) -> Self {
+        Self { state }
     }
 }
 
@@ -477,10 +536,13 @@ impl BlockifierStateReader for BlockifierStateReaderAdapter {
         contract_address: BlockifierContractAddress,
         key: BlockifierStorageKey,
     ) -> Result<BlockifierFelt, StateError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| StateError::StateReadError("state snapshot mutex poisoned".to_string()))?;
         let contract_felt: BlockifierFelt = contract_address.into();
         let key_felt: BlockifierFelt = key.into();
-        let value = self
-            .state
+        let value = state
             .get_storage(
                 &format!("{:#x}", contract_felt),
                 &format!("{:#x}", key_felt),
@@ -493,9 +555,12 @@ impl BlockifierStateReader for BlockifierStateReaderAdapter {
         &self,
         contract_address: BlockifierContractAddress,
     ) -> Result<BlockifierNonce, StateError> {
-        let contract_felt: BlockifierFelt = contract_address.into();
-        let nonce = self
+        let state = self
             .state
+            .lock()
+            .map_err(|_| StateError::StateReadError("state snapshot mutex poisoned".to_string()))?;
+        let contract_felt: BlockifierFelt = contract_address.into();
+        let nonce = state
             .nonce_of(&format!("{:#x}", contract_felt))
             .unwrap_or_default();
         Ok(BlockifierNonce(node_felt_to_blockifier(
@@ -567,7 +632,9 @@ pub struct BlockifierVmBackend {
     chain_info: BlockifierChainInfo,
     executor_config: TransactionExecutorConfig,
     tx_resolver: Arc<dyn ExecutableTransactionResolver>,
+    execution_timeout: StdDuration,
     last_executed_block: Mutex<Option<u64>>,
+    state_snapshot: Mutex<Option<SharedStateSnapshot>>,
 }
 
 #[cfg(feature = "blockifier-adapter")]
@@ -582,12 +649,19 @@ impl BlockifierVmBackend {
             chain_info,
             executor_config,
             tx_resolver: Arc::new(EmbeddedExecutablePayloadResolver),
+            execution_timeout: StdDuration::from_secs(30),
             last_executed_block: Mutex::new(None),
+            state_snapshot: Mutex::new(None),
         }
     }
 
     pub fn with_tx_resolver(mut self, tx_resolver: Arc<dyn ExecutableTransactionResolver>) -> Self {
         self.tx_resolver = tx_resolver;
+        self
+    }
+
+    pub fn with_execution_timeout(mut self, timeout: StdDuration) -> Self {
+        self.execution_timeout = timeout;
         self
     }
 
@@ -685,6 +759,8 @@ impl BlockifierVmBackend {
                 ExecutionError::Backend(format!("block sequence overflow after block {previous}"))
             })?;
             if block_number != expected {
+                drop(guard);
+                self.clear_state_snapshot()?;
                 return Err(ExecutionError::Backend(format!(
                     "non-sequential block execution: expected {expected}, got {block_number}"
                 )));
@@ -702,6 +778,50 @@ impl BlockifierVmBackend {
         *guard = Some(block_number);
         Ok(())
     }
+
+    fn clear_state_snapshot(&self) -> Result<(), ExecutionError> {
+        let mut guard = self
+            .state_snapshot
+            .lock()
+            .map_err(|_| ExecutionError::Backend("state snapshot mutex poisoned".to_string()))?;
+        *guard = None;
+        Ok(())
+    }
+
+    fn snapshot_for_execution(
+        &self,
+        state: &dyn MutableState,
+    ) -> Result<SharedStateSnapshot, ExecutionError> {
+        let mut guard = self
+            .state_snapshot
+            .lock()
+            .map_err(|_| ExecutionError::Backend("state snapshot mutex poisoned".to_string()))?;
+        if let Some(snapshot) = guard.as_ref() {
+            return Ok(Arc::clone(snapshot));
+        }
+
+        let snapshot: SharedStateSnapshot = Arc::new(Mutex::new(state.boxed_clone()));
+        *guard = Some(Arc::clone(&snapshot));
+        Ok(snapshot)
+    }
+
+    fn apply_state_diff_to_snapshot(
+        snapshot: &SharedStateSnapshot,
+        diff: &starknet_node_types::StarknetStateDiff,
+    ) -> Result<(), ExecutionError> {
+        let mut guard = snapshot
+            .lock()
+            .map_err(|_| ExecutionError::Backend("state snapshot mutex poisoned".to_string()))?;
+        for (contract, writes) in &diff.storage_diffs {
+            for (key, value) in writes {
+                guard.set_storage(contract.clone(), key.clone(), *value);
+            }
+        }
+        for (contract, nonce) in &diff.nonces {
+            guard.set_nonce(contract.clone(), *nonce);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "blockifier-adapter")]
@@ -715,9 +835,10 @@ impl ExecutionBackend for BlockifierVmBackend {
         let started_at = Instant::now();
         let block_context = self.build_block_context(block)?;
         let txs = self.map_block_transactions(block)?;
+        let snapshot = self.snapshot_for_execution(state)?;
 
         let mut executor = TransactionExecutor::pre_process_and_create(
-            BlockifierStateReaderAdapter::new(state),
+            BlockifierStateReaderAdapter::new(Arc::clone(&snapshot)),
             block_context,
             (block.number >= 10).then_some(BlockifierBlockHashAndNumber {
                 hash: BlockifierBlockHash::default(),
@@ -727,10 +848,8 @@ impl ExecutionBackend for BlockifierVmBackend {
         )
         .map_err(|error| ExecutionError::Backend(error.to_string()))?;
 
-        let execution_results = executor.execute_txs(
-            &txs,
-            Some(Instant::now() + std::time::Duration::from_secs(1)),
-        );
+        let execution_results =
+            executor.execute_txs(&txs, Some(Instant::now() + self.execution_timeout));
         if execution_results.len() != txs.len() {
             return Err(ExecutionError::Backend(format!(
                 "blockifier returned {} execution results for {} transactions in block {}",
@@ -806,6 +925,7 @@ impl ExecutionBackend for BlockifierVmBackend {
         for (contract, nonce) in &state_diff.nonces {
             state.set_nonce(contract.clone(), *nonce);
         }
+        Self::apply_state_diff_to_snapshot(&snapshot, &state_diff)?;
 
         let output = ExecutionOutput {
             receipts,
@@ -832,8 +952,8 @@ impl ExecutionBackend for BlockifierVmBackend {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    #[cfg(feature = "blockifier-adapter")]
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use semver::Version;
@@ -929,6 +1049,46 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct CountingCloneState {
+        inner: InMemoryState,
+        clone_count: Arc<AtomicUsize>,
+    }
+
+    impl CountingCloneState {
+        fn new(clone_count: Arc<AtomicUsize>) -> Self {
+            Self {
+                inner: InMemoryState::default(),
+                clone_count,
+            }
+        }
+    }
+
+    impl StateReader for CountingCloneState {
+        fn get_storage(&self, contract: &String, key: &str) -> Option<StarknetFelt> {
+            self.inner.get_storage(contract, key)
+        }
+
+        fn nonce_of(&self, contract: &String) -> Option<StarknetFelt> {
+            self.inner.nonce_of(contract)
+        }
+    }
+
+    impl MutableState for CountingCloneState {
+        fn set_storage(&mut self, contract: String, key: String, value: StarknetFelt) {
+            self.inner.set_storage(contract, key, value);
+        }
+
+        fn set_nonce(&mut self, contract: String, nonce: StarknetFelt) {
+            self.inner.set_nonce(contract, nonce);
+        }
+
+        fn boxed_clone(&self) -> Box<dyn MutableState> {
+            self.clone_count.fetch_add(1, Ordering::SeqCst);
+            Box::new(self.clone())
+        }
+    }
+
     fn sample_gas_prices() -> BlockGasPrices {
         BlockGasPrices {
             l1_gas: GasPricePerToken {
@@ -949,6 +1109,8 @@ mod tests {
     fn block(number: u64, version: &str) -> StarknetBlock {
         StarknetBlock {
             number,
+            parent_hash: format!("0x{:x}", number.saturating_sub(1)),
+            state_root: format!("0x{number:x}"),
             timestamp: 1_700_000_000 + number,
             sequencer_address: "0x1".to_string(),
             gas_prices: sample_gas_prices(),
@@ -961,6 +1123,8 @@ mod tests {
     fn empty_block(number: u64, version: &str) -> StarknetBlock {
         StarknetBlock {
             number,
+            parent_hash: format!("0x{:x}", number.saturating_sub(1)),
+            state_root: format!("0x{number:x}"),
             timestamp: 1_700_000_000 + number,
             sequencer_address: "0x1".to_string(),
             gas_prices: sample_gas_prices(),
@@ -1281,6 +1445,39 @@ mod tests {
     }
 
     #[test]
+    fn dual_verification_reuses_shadow_state_across_blocks() {
+        let fast = ScriptedBackend::new(
+            "fast",
+            BTreeMap::from([(1, output(7)), (2, output(8))]),
+            output(1),
+        );
+        let canonical = ScriptedBackend::new(
+            "canonical",
+            BTreeMap::from([(1, output(7)), (2, output(8))]),
+            output(1),
+        );
+        let backend = DualExecutionBackend::new(
+            Some(Box::new(fast)),
+            Box::new(canonical),
+            ExecutionMode::DualWithVerification {
+                verification_depth: 10,
+            },
+            MismatchPolicy::WarnAndFallback,
+        );
+        let clone_count = Arc::new(AtomicUsize::new(0));
+        let mut state = CountingCloneState::new(Arc::clone(&clone_count));
+
+        backend
+            .execute_verified(&block(1, "0.14.2"), &mut state)
+            .expect("first block");
+        backend
+            .execute_verified(&block(2, "0.14.2"), &mut state)
+            .expect("second block");
+
+        assert_eq!(clone_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn selects_constants_by_protocol_version() {
         let selector = ProtocolVersionSelector::new([
             (
@@ -1298,8 +1495,8 @@ mod tests {
         ]);
 
         let selected = selector
-            .constants_for_block(&block(100, "0.14.3"))
-            .expect("same minor fallback");
+            .constants_for_block(&block(100, "0.14.2"))
+            .expect("exact version");
         assert_eq!(selected.id, "v14_2");
     }
 
@@ -1426,6 +1623,8 @@ mod tests {
         let mut state = InMemoryState::default();
         let block = StarknetBlock {
             number: 12,
+            parent_hash: "0xb".to_string(),
+            state_root: "0xc".to_string(),
             timestamp: 1_700_000_012,
             sequencer_address: "0x1".to_string(),
             gas_prices: sample_gas_prices(),
@@ -1439,5 +1638,22 @@ mod tests {
         assert_eq!(output.receipts.len(), 1);
         assert_eq!(output.receipts[0].tx_hash, "0xabc");
         assert!(!output.receipts[0].execution_status);
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    #[test]
+    fn blockifier_backend_reuses_state_snapshot_between_blocks() {
+        let backend = BlockifierVmBackend::starknet_mainnet();
+        let clone_count = Arc::new(AtomicUsize::new(0));
+        let mut state = CountingCloneState::new(Arc::clone(&clone_count));
+
+        backend
+            .execute_block(&empty_block(11, "0.14.2"), &mut state)
+            .expect("first block");
+        backend
+            .execute_block(&empty_block(12, "0.14.2"), &mut state)
+            .expect("second block");
+
+        assert_eq!(clone_count.load(Ordering::SeqCst), 1);
     }
 }
