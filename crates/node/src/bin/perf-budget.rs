@@ -1,5 +1,6 @@
 use std::env;
 use std::hint::black_box;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use bincode::Options;
@@ -59,6 +60,53 @@ struct MetricResult {
     p95_us: u64,
     p99_us: u64,
     ops_per_sec: f64,
+}
+
+#[derive(Debug, Clone)]
+struct BenchmarkMetadata {
+    commit: String,
+    dataset_range: String,
+    network_profile: String,
+    os: &'static str,
+    arch: &'static str,
+    kernel: String,
+    cpu_model: String,
+    mem_total_kib: Option<u64>,
+}
+
+impl BenchmarkMetadata {
+    fn collect(iterations: usize) -> Self {
+        Self {
+            commit: env::var("PASTIS_COMMIT_SHA")
+                .or_else(|_| env::var("GITHUB_SHA"))
+                .unwrap_or_else(|_| "unknown".to_string()),
+            dataset_range: env::var("PASTIS_PERF_DATASET_RANGE")
+                .unwrap_or_else(|_| format!("synthetic:noop-blocks:1..{iterations}")),
+            network_profile: env::var("PASTIS_PERF_NETWORK_PROFILE")
+                .unwrap_or_else(|_| "local-loopback".to_string()),
+            os: env::consts::OS,
+            arch: env::consts::ARCH,
+            kernel: detect_kernel_release(),
+            cpu_model: detect_cpu_model(),
+            mem_total_kib: detect_mem_total_kib(),
+        }
+    }
+
+    fn print(&self) {
+        println!(
+            "perf metadata: commit={} dataset={} network={} os={} arch={} kernel={} cpu={} mem_kib={}",
+            self.commit,
+            self.dataset_range,
+            self.network_profile,
+            self.os,
+            self.arch,
+            self.kernel,
+            self.cpu_model,
+            self.mem_total_kib
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+    }
 }
 
 #[derive(Default)]
@@ -264,6 +312,68 @@ fn env_f64(key: &str, default: f64) -> Result<f64, String> {
     }
 }
 
+fn detect_kernel_release() -> String {
+    if let Ok(value) = env::var("PASTIS_PERF_KERNEL") {
+        return value;
+    }
+    let output = Command::new("uname").arg("-sr").output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let parsed = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if parsed.is_empty() {
+                "unknown".to_string()
+            } else {
+                parsed
+            }
+        }
+        _ => "unknown".to_string(),
+    }
+}
+
+fn detect_cpu_model() -> String {
+    if let Ok(value) = env::var("PASTIS_PERF_CPU_MODEL") {
+        return value;
+    }
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").ok();
+    let Some(cpuinfo) = cpuinfo else {
+        return "unknown".to_string();
+    };
+    parse_cpu_model(&cpuinfo).unwrap_or_else(|| "unknown".to_string())
+}
+
+fn detect_mem_total_kib() -> Option<u64> {
+    if let Ok(value) = env::var("PASTIS_PERF_MEM_KIB") {
+        return value.parse::<u64>().ok();
+    }
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    parse_mem_total_kib(&meminfo)
+}
+
+fn parse_cpu_model(cpuinfo: &str) -> Option<String> {
+    for line in cpuinfo.lines() {
+        let (key, value) = line.split_once(':')?;
+        if key.trim() == "model name" {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn parse_mem_total_kib(meminfo: &str) -> Option<u64> {
+    for line in meminfo.lines() {
+        let (key, value) = line.split_once(':')?;
+        if key.trim() != "MemTotal" {
+            continue;
+        }
+        let amount = value.split_whitespace().next()?;
+        return amount.parse::<u64>().ok();
+    }
+    None
+}
+
 fn print_metric(metric: &MetricResult) {
     println!(
         "{:<26} p50={}us p95={}us p99={}us ops/s={:.1}",
@@ -275,8 +385,10 @@ fn main() {
     let run = || -> Result<(), String> {
         let iterations = env_usize("PASTIS_PERF_ITERATIONS", DEFAULT_ITERATIONS)?;
         let budgets = PerfBudgets::from_env()?;
+        let metadata = BenchmarkMetadata::collect(iterations);
 
         println!("pastis perf budget run (iterations={iterations})");
+        metadata.print();
         let dual = run_dual_execution_benchmark(iterations)?;
         let decode = run_notification_decode_benchmark(iterations)?;
         let mcp = run_mcp_validation_benchmark(iterations)?;
@@ -339,5 +451,26 @@ mod tests {
         assert_eq!(percentile(&[10], 99), 10);
         assert_eq!(percentile(&[1, 2, 3, 4, 5], 50), 3);
         assert_eq!(percentile(&[1, 2, 3, 4, 5], 99), 5);
+    }
+
+    #[test]
+    fn parses_cpu_model_from_linux_cpuinfo() {
+        let cpuinfo = "\
+processor\t: 0
+model name\t: Example CPU 9000
+";
+        assert_eq!(
+            parse_cpu_model(cpuinfo),
+            Some("Example CPU 9000".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_mem_total_from_linux_meminfo() {
+        let meminfo = "\
+MemTotal:       65843088 kB
+MemFree:        12345678 kB
+";
+        assert_eq!(parse_mem_total_kib(meminfo), Some(65_843_088));
     }
 }
