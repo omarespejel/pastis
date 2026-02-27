@@ -8,9 +8,7 @@ default = []
 papyrus-adapter = ["dep:papyrus_storage", "dep:starknet_api"]
 
 [dependencies]
-hex = "0.4"
 semver = { workspace = true }
-starknet-crypto = "0.8"
 starknet-node-types = { path = "../types" }
 thiserror = { workspace = true }
 

@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
+#[cfg(feature = "papyrus-adapter")]
 use std::str::FromStr;
+use std::sync::{Arc, RwLock};
 
 #[cfg(feature = "papyrus-adapter")]
 use papyrus_storage::body::BodyStorageReader;
@@ -23,14 +25,15 @@ use starknet_api::state::ThinStateDiff as PapyrusThinStateDiff;
 #[cfg(feature = "papyrus-adapter")]
 use starknet_api::state::{StateNumber as PapyrusStateNumber, StorageKey as PapyrusStorageKey};
 
-use starknet_crypto::poseidon_hash_many;
+#[cfg(feature = "papyrus-adapter")]
+use starknet_node_types::StarknetFelt;
 #[cfg(feature = "papyrus-adapter")]
 use starknet_node_types::StarknetTransaction;
 #[cfg(feature = "papyrus-adapter")]
 use starknet_node_types::{BlockGasPrices, GasPricePerToken};
 use starknet_node_types::{
     BlockId, BlockNumber, ComponentHealth, HealthCheck, HealthStatus, InMemoryState, StarknetBlock,
-    StarknetFelt, StarknetStateDiff, StateReader,
+    StarknetStateDiff, StateReader,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -75,8 +78,8 @@ pub enum StateRootSemantics {
 }
 
 pub trait StorageBackend: Send + Sync + HealthCheck {
-    /// Implementations expose mutable methods via `&mut self`; callers are expected to
-    /// synchronize access at the component boundary when mutating from multiple threads.
+    /// Implementations expose mutable methods via `&mut self`.
+    /// For multi-threaded access, wrap backends in `ThreadSafeStorage`.
     fn get_state_reader(
         &self,
         block_number: BlockNumber,
@@ -100,9 +103,123 @@ pub trait StorageBackend: Send + Sync + HealthCheck {
 }
 
 #[derive(Debug, Clone)]
+pub struct ThreadSafeStorage<S> {
+    inner: Arc<RwLock<S>>,
+}
+
+impl<S> ThreadSafeStorage<S> {
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(inner)),
+        }
+    }
+}
+
+impl<S: StorageBackend> HealthCheck for ThreadSafeStorage<S> {
+    fn is_healthy(&self) -> bool {
+        self.inner
+            .read()
+            .map(|guard| guard.is_healthy())
+            .unwrap_or(false)
+    }
+
+    fn detailed_status(&self) -> ComponentHealth {
+        match self.inner.read() {
+            Ok(guard) => {
+                let mut health = guard.detailed_status();
+                health.name = format!("thread-safe-{}", health.name);
+                health
+            }
+            Err(_) => ComponentHealth {
+                name: "thread-safe-storage".to_string(),
+                status: HealthStatus::Unhealthy,
+                last_block_processed: None,
+                sync_lag: None,
+                error: Some("thread-safe storage lock poisoned".to_string()),
+            },
+        }
+    }
+}
+
+impl<S: StorageBackend> StorageBackend for ThreadSafeStorage<S> {
+    fn get_state_reader(
+        &self,
+        block_number: BlockNumber,
+    ) -> Result<Box<dyn StateReader>, StorageError> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| StorageError::UnsupportedOperation("thread-safe storage lock poisoned"))?;
+        guard.get_state_reader(block_number)
+    }
+
+    fn apply_state_diff(&mut self, diff: &StarknetStateDiff) -> Result<(), StorageError> {
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| StorageError::UnsupportedOperation("thread-safe storage lock poisoned"))?;
+        guard.apply_state_diff(diff)
+    }
+
+    fn insert_block(
+        &mut self,
+        block: StarknetBlock,
+        state_diff: StarknetStateDiff,
+    ) -> Result<(), StorageError> {
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| StorageError::UnsupportedOperation("thread-safe storage lock poisoned"))?;
+        guard.insert_block(block, state_diff)
+    }
+
+    fn get_block(&self, id: BlockId) -> Result<Option<StarknetBlock>, StorageError> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| StorageError::UnsupportedOperation("thread-safe storage lock poisoned"))?;
+        guard.get_block(id)
+    }
+
+    fn get_state_diff(
+        &self,
+        block_number: BlockNumber,
+    ) -> Result<Option<StarknetStateDiff>, StorageError> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| StorageError::UnsupportedOperation("thread-safe storage lock poisoned"))?;
+        guard.get_state_diff(block_number)
+    }
+
+    fn latest_block_number(&self) -> Result<BlockNumber, StorageError> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| StorageError::UnsupportedOperation("thread-safe storage lock poisoned"))?;
+        guard.latest_block_number()
+    }
+
+    fn current_state_root(&self) -> String {
+        self.inner
+            .read()
+            .map(|guard| guard.current_state_root())
+            .unwrap_or_else(|_| "0x0".to_string())
+    }
+
+    fn state_root_semantics(&self) -> StateRootSemantics {
+        self.inner
+            .read()
+            .map(|guard| guard.state_root_semantics())
+            .unwrap_or(StateRootSemantics::Approximate)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct InMemoryStorage {
-    // Lightweight single-process backend for tests and local development.
-    // Mutation safety is enforced by `&mut self` and external synchronization.
+    // Lightweight backend for tests and local development.
+    // This backend is not consensus-canonical for state roots. Use `PapyrusStorageAdapter`
+    // for canonical roots and wrap in `ThreadSafeStorage` for shared multi-thread access.
     blocks: BTreeMap<BlockNumber, StarknetBlock>,
     state_diffs: BTreeMap<BlockNumber, StarknetStateDiff>,
     states: BTreeMap<BlockNumber, InMemoryState>,
@@ -212,29 +329,9 @@ impl StorageBackend for InMemoryStorage {
     }
 
     fn current_state_root(&self) -> String {
-        let latest = self.latest_block_number().unwrap_or(0);
-        let Some(state) = self.states.get(&latest) else {
-            return "0x0".to_string();
-        };
-
-        let mut elements = Vec::new();
-        for (contract, writes) in state.storage.iter() {
-            elements.push(felt_from_storage_component(contract));
-            for (key, value) in writes {
-                elements.push(felt_from_storage_component(key));
-                elements.push(*value);
-            }
-        }
-        for (contract, nonce) in state.nonces.iter() {
-            elements.push(felt_from_storage_component(contract));
-            elements.push(*nonce);
-        }
-
-        if elements.is_empty() {
-            "0x0".to_string()
-        } else {
-            format!("{:#x}", poseidon_hash_many(&elements))
-        }
+        // In-memory backend does not maintain Starknet's Patricia tries. Returning a sentinel
+        // prevents accidental treatment of this value as a consensus state commitment.
+        "0x0".to_string()
     }
 
     fn state_root_semantics(&self) -> StateRootSemantics {
@@ -345,11 +442,6 @@ impl PapyrusStorageAdapter {
 #[cfg(feature = "papyrus-adapter")]
 fn latest_block_from_marker(marker: PapyrusBlockNumber) -> Option<PapyrusBlockNumber> {
     marker.0.checked_sub(1).map(PapyrusBlockNumber)
-}
-
-fn felt_from_storage_component(raw: &str) -> StarknetFelt {
-    StarknetFelt::from_str(raw)
-        .unwrap_or_else(|_| StarknetFelt::from_bytes_be_slice(raw.as_bytes()))
 }
 
 #[cfg(feature = "papyrus-adapter")]
@@ -679,6 +771,42 @@ mod tests {
                 backend: "in-memory-storage".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn thread_safe_storage_allows_shared_read_access() {
+        let mut writer = ThreadSafeStorage::new(InMemoryStorage::new(InMemoryState::default()));
+        writer
+            .insert_block(block(1), diff_with_balance("0xabc", 11))
+            .expect("insert");
+
+        let storage = writer.clone();
+        let handle = std::thread::spawn(move || {
+            let reader = storage.get_state_reader(1).expect("state reader");
+            reader.get_storage(&ContractAddress::from("0xabc"), "balance")
+        });
+
+        assert_eq!(
+            handle.join().expect("thread join"),
+            Some(StarknetFelt::from(11_u64))
+        );
+    }
+
+    #[test]
+    fn thread_safe_storage_reports_unhealthy_when_lock_is_poisoned() {
+        let storage = ThreadSafeStorage::new(InMemoryStorage::new(InMemoryState::default()));
+        let poison_handle = storage.clone();
+
+        let _ = std::thread::spawn(move || {
+            let _guard = poison_handle.inner.write().expect("lock");
+            panic!("intentional poison");
+        })
+        .join();
+
+        assert!(!storage.is_healthy());
+        let health = storage.detailed_status();
+        assert_eq!(health.status, HealthStatus::Unhealthy);
+        assert_eq!(health.name, "thread-safe-storage");
     }
 
     #[test]
