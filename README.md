@@ -30,6 +30,7 @@ This repository currently ships core, tested building blocks:
 - Dual execution orchestration with canonical fallback/mismatch handling
 - ExEx manager with bounded WAL replay and failing-sink circuit breaker
 - OTel-style ExEx sink with deterministic per-block metrics capture and regression counters
+- BTCFi/strkBTC ExEx scaffolding with structural anomaly detection primitives
 - MCP server request handler with authenticated tool execution and bounded batch support
 - JSON-RPC server request handler with strict JSON-RPC 2.0 validation and Starknet core method coverage
 - Type-state node builder that enforces composition order
@@ -44,6 +45,7 @@ Source entry points:
 - [crates/execution/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/execution/src/lib.rs)
 - [crates/exex-manager/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/exex-manager/src/lib.rs)
 - [crates/exex-otel/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/exex-otel/src/lib.rs)
+- [crates/exex-btcfi/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/exex-btcfi/src/lib.rs)
 - [crates/mcp-server/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/mcp-server/src/lib.rs)
 - [crates/rpc/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/rpc/src/lib.rs)
 - [crates/node/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/node/src/lib.rs)
@@ -135,7 +137,7 @@ Near-term implementation sequence:
 2. Continue hardening Blockifier adapter semantics across protocol versions
 3. Extend RPC method coverage and map full Starknet error taxonomy
 4. Extend MCP server surface beyond control-plane tools (state query params, simulation, submit)
-5. Add BTCFi/strkBTC monitoring ExEx implementations
+5. Wire BTCFi ExEx into ExExManager registration flow and RPC/MCP anomaly query surfaces
 
 Long-term:
 

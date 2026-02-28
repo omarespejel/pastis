@@ -4150,6 +4150,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "starknet-node-exex-btcfi"
+version = "0.1.0"
+dependencies = [
+ "starknet-node-types",
+]
+
+[[package]]
 name = "starknet-node-exex-manager"
 version = "0.1.0"
 dependencies = [
