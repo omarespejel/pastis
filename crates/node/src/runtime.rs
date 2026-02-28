@@ -114,6 +114,7 @@ pub struct NodeRuntime {
     diagnostics: RuntimeDiagnostics,
     recent_errors: VecDeque<String>,
     sync_progress: Arc<Mutex<SyncProgress>>,
+    chain_id_validated: bool,
 }
 
 impl NodeRuntime {
@@ -186,6 +187,7 @@ impl NodeRuntime {
             diagnostics: RuntimeDiagnostics::default(),
             recent_errors: VecDeque::new(),
             sync_progress: Arc::new(Mutex::new(progress)),
+            chain_id_validated: false,
         })
     }
 
@@ -210,6 +212,8 @@ impl NodeRuntime {
     }
 
     pub async fn poll_once(&mut self) -> Result<(), String> {
+        self.ensure_chain_id_validated().await?;
+
         let external_head_block = self.fetch_latest_block_number_with_retry().await?;
         self.update_sync_progress(|progress| {
             progress.highest_block = external_head_block;
@@ -371,6 +375,24 @@ impl NodeRuntime {
         }
     }
 
+    async fn ensure_chain_id_validated(&mut self) -> Result<(), String> {
+        if self.chain_id_validated {
+            return Ok(());
+        }
+        let upstream_chain_id = self.client.fetch_chain_id().await?;
+        let local_chain_id = self.chain_id().to_string();
+        if normalize_chain_id(&upstream_chain_id) != normalize_chain_id(&local_chain_id) {
+            let message = format!(
+                "chain id mismatch: local={} upstream={}",
+                local_chain_id, upstream_chain_id
+            );
+            self.record_failure(message.clone());
+            return Err(message);
+        }
+        self.chain_id_validated = true;
+        Ok(())
+    }
+
     fn retry_backoff(&self, attempt: u32) -> Duration {
         if self.retry.base_backoff.is_zero() {
             return Duration::ZERO;
@@ -455,6 +477,14 @@ impl UpstreamRpcClient {
         value_as_u64(block_head.get("block_number").unwrap_or(&Value::Null)).ok_or_else(|| {
             format!("starknet_blockHashAndNumber missing block_number: {block_head}")
         })
+    }
+
+    async fn fetch_chain_id(&self) -> Result<String, String> {
+        let chain_id_raw = self.call("starknet_chainId", json!([])).await?;
+        Ok(chain_id_raw
+            .as_str()
+            .map(std::string::ToString::to_string)
+            .unwrap_or_else(|| chain_id_raw.to_string()))
     }
 
     async fn fetch_block(&self, block_number: u64) -> Result<RuntimeFetch, String> {
@@ -759,13 +789,21 @@ fn parse_block_with_txs(
         transaction_hashes.push(tx_hash);
     }
 
-    if let Some(status_raw) = block_with_txs.get("status").and_then(Value::as_str)
-        && status_raw.eq_ignore_ascii_case("PENDING")
-    {
-        warnings.push(
-            "getBlockWithTxs returned a pending block; replay semantics may change on reorg"
-                .to_string(),
-        );
+    if let Some(status_raw) = block_with_txs.get("status").and_then(Value::as_str) {
+        if status_raw.eq_ignore_ascii_case("PENDING") {
+            return Err(
+                "getBlockWithTxs returned status=PENDING; daemon only replays finalized blocks"
+                    .to_string(),
+            );
+        }
+        if !status_raw.eq_ignore_ascii_case("ACCEPTED_ON_L2")
+            && !status_raw.eq_ignore_ascii_case("ACCEPTED_ON_L1")
+            && !status_raw.eq_ignore_ascii_case("FINALIZED")
+        {
+            warnings.push(format!(
+                "unexpected block status `{status_raw}`; replay continues but should be verified"
+            ));
+        }
     }
 
     Ok(RuntimeBlockReplay {
@@ -1061,6 +1099,42 @@ fn push_recent_error(errors: &mut VecDeque<String>, message: String) {
     errors.push_back(message);
 }
 
+fn normalize_chain_id(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        let normalized_hex = hex.trim_start_matches('0').to_ascii_lowercase();
+        if let Some(decoded) = decode_ascii_hex(hex) {
+            return decoded;
+        }
+        if normalized_hex.is_empty() {
+            return "0x0".to_string();
+        }
+        return format!("0x{normalized_hex}");
+    }
+    trimmed.to_string()
+}
+
+fn decode_ascii_hex(hex: &str) -> Option<String> {
+    if hex.is_empty() || hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let mut chars = hex.chars();
+    while let (Some(hi), Some(lo)) = (chars.next(), chars.next()) {
+        let high = hi.to_digit(16)? as u8;
+        let low = lo.to_digit(16)? as u8;
+        let value = (high << 4) | low;
+        if value == 0 || !value.is_ascii() {
+            return None;
+        }
+        bytes.push(value);
+    }
+    String::from_utf8(bytes).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1109,5 +1183,11 @@ mod tests {
         assert_eq!(diff.nonces.len(), 1);
         assert_eq!(diff.declared_classes.len(), 1);
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn normalize_chain_id_accepts_hex_encoded_ascii() {
+        assert_eq!(normalize_chain_id("SN_MAIN"), "SN_MAIN");
+        assert_eq!(normalize_chain_id("0x534e5f4d41494e"), "SN_MAIN");
     }
 }
