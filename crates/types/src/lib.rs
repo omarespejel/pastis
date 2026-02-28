@@ -87,9 +87,16 @@ pub const MAX_REASONABLE_BLOCK_TIMESTAMP: u64 = 4_000_000_000;
 pub const MAX_CONTRACTS_IN_MEMORY_STATE: usize = 100_000;
 pub const MAX_STORAGE_SLOTS_PER_CONTRACT: usize = 1_000_000;
 pub const MAX_TOTAL_STORAGE_ENTRIES: usize = 10_000_000;
+const MAX_FELT_INPUT_LEN: usize = 256;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum IdentifierValidationError {
+    #[error("invalid {field} length {actual}, max {max}")]
+    TooLong {
+        field: &'static str,
+        actual: usize,
+        max: usize,
+    },
     #[error("invalid {field} '{value}': {error}")]
     InvalidHexFelt {
         field: &'static str,
@@ -191,6 +198,13 @@ fn canonicalize_felt_hex(
     field: &'static str,
     value: &str,
 ) -> Result<String, IdentifierValidationError> {
+    if value.len() > MAX_FELT_INPUT_LEN {
+        return Err(IdentifierValidationError::TooLong {
+            field,
+            actual: value.len(),
+            max: MAX_FELT_INPUT_LEN,
+        });
+    }
     let normalized = value.trim();
     let prefixed = if normalized.starts_with("0x") || normalized.starts_with("0X") {
         normalized.to_string()
@@ -833,6 +847,15 @@ mod tests {
             err,
             IdentifierValidationError::InvalidHexFelt { .. }
         ));
+    }
+
+    #[test]
+    fn rejects_excessively_long_transaction_hash_input() {
+        let tx = StarknetTransaction::new(format!("0x{}", "a".repeat(MAX_FELT_INPUT_LEN + 1)));
+        let err = tx
+            .validate_hash()
+            .expect_err("must reject excessively long felt string");
+        assert!(matches!(err, IdentifierValidationError::TooLong { .. }));
     }
 
     #[test]

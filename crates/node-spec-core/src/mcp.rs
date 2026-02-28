@@ -85,46 +85,51 @@ pub struct AgentPolicy {
     pub max_requests_per_minute: u32,
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AgentPolicyBuildError {
+    #[error("argon2id api-key derivation failed: {0}")]
+    ApiKeyDerivation(String),
+}
+
 impl AgentPolicy {
     pub fn new(
         api_key: impl AsRef<str>,
         permissions: BTreeSet<ToolPermission>,
         max_requests_per_minute: u32,
     ) -> Self {
+        Self::try_new(api_key, permissions, max_requests_per_minute)
+            .expect("agent policy construction must derive API key with argon2id")
+    }
+
+    pub fn try_new(
+        api_key: impl AsRef<str>,
+        permissions: BTreeSet<ToolPermission>,
+        max_requests_per_minute: u32,
+    ) -> Result<Self, AgentPolicyBuildError> {
         let mut api_key_salt = [0_u8; 16];
         OsRng.fill_bytes(&mut api_key_salt);
-        let (api_key_kdf, api_key_hash) = match hash_api_key_argon2id(
-            api_key.as_ref(),
-            &api_key_salt,
-        ) {
-            Ok(hash) => (ApiKeyKdf::Argon2id, hash),
-            Err(error) => {
-                eprintln!(
-                    "warning: argon2id api-key derivation failed; using legacy PBKDF2 fallback: {error}"
-                );
-                (
-                    ApiKeyKdf::LegacyPbkdf2Sha256,
-                    hash_api_key_legacy_pbkdf2(api_key.as_ref(), &api_key_salt),
-                )
-            }
-        };
-        Self {
+        let api_key_hash =
+            hash_api_key_argon2id(api_key.as_ref(), &api_key_salt).map_err(|error| {
+                AgentPolicyBuildError::ApiKeyDerivation(error.to_string())
+            })?;
+        Ok(Self {
             api_key_salt,
             api_key_hash,
-            api_key_kdf,
+            api_key_kdf: ApiKeyKdf::Argon2id,
             permissions,
             max_requests_per_minute,
-        }
+        })
     }
 
     fn verify_api_key(&self, api_key: &str) -> bool {
         match self.api_key_kdf {
             ApiKeyKdf::Argon2id => hash_api_key_argon2id(api_key, &self.api_key_salt)
-                .map(|hash| hash == self.api_key_hash)
+                .map(|hash| constant_time_eq_32(&hash, &self.api_key_hash))
                 .unwrap_or(false),
-            ApiKeyKdf::LegacyPbkdf2Sha256 => {
-                self.api_key_hash == hash_api_key_legacy_pbkdf2(api_key, &self.api_key_salt)
-            }
+            ApiKeyKdf::LegacyPbkdf2Sha256 => constant_time_eq_32(
+                &self.api_key_hash,
+                &hash_api_key_legacy_pbkdf2(api_key, &self.api_key_salt),
+            ),
         }
     }
 }
@@ -282,6 +287,14 @@ fn hash_api_key_argon2id(api_key: &str, salt: &[u8; 16]) -> Result<[u8; 32], Str
 
 fn hash_api_key_legacy_pbkdf2(api_key: &str, salt: &[u8; 16]) -> [u8; 32] {
     pbkdf2_hmac_array::<Sha256, 32>(api_key.as_bytes(), salt, API_KEY_LEGACY_PBKDF2_ITERATIONS)
+}
+
+fn constant_time_eq_32(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    let mut diff = 0_u8;
+    for (lhs, rhs) in left.iter().zip(right.iter()) {
+        diff |= lhs ^ rhs;
+    }
+    diff == 0
 }
 
 pub fn validate_tool(tool: &McpTool, limits: ValidationLimits) -> Result<(), ValidationError> {

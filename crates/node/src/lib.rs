@@ -64,9 +64,13 @@ pub enum ChainId {
 pub enum ChainIdError {
     #[error("chain id cannot be empty")]
     Empty,
+    #[error("chain id exceeds max length {max}: got {actual}")]
+    TooLong { max: usize, actual: usize },
     #[error("invalid chain id format '{0}'")]
     InvalidFormat(String),
 }
+
+const MAX_CHAIN_ID_LEN: usize = 64;
 
 impl ChainId {
     /// Parses canonical Starknet public chain IDs and strict-format custom IDs.
@@ -75,6 +79,12 @@ impl ChainId {
         let raw = raw.into();
         if raw.is_empty() {
             return Err(ChainIdError::Empty);
+        }
+        if raw.len() > MAX_CHAIN_ID_LEN {
+            return Err(ChainIdError::TooLong {
+                max: MAX_CHAIN_ID_LEN,
+                actual: raw.len(),
+            });
         }
         match raw.as_str() {
             "SN_MAIN" => Ok(Self::Mainnet),
@@ -144,7 +154,7 @@ pub struct ProductionDualExecutionConfig {
 impl Default for ProductionDualExecutionConfig {
     fn default() -> Self {
         Self {
-            enable_shadow_verification: false,
+            enable_shadow_verification: true,
             verification_depth: 10,
             mismatch_policy: MismatchPolicy::WarnAndFallback,
         }
@@ -216,6 +226,8 @@ pub enum NodeInitError {
     StorageUnhealthy,
     #[error("storage integrity check failed: {0}")]
     StorageIntegrity(String),
+    #[error("invalid production dual-execution config: {0}")]
+    InvalidDualConfig(String),
 }
 
 #[cfg(feature = "production-adapters")]
@@ -283,6 +295,23 @@ fn validate_bootstrap_storage<S: StorageBackend>(
     }
     if !storage.is_healthy() {
         return Err(NodeInitError::StorageUnhealthy);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "production-adapters")]
+fn validate_production_dual_config(
+    config: &ProductionDualExecutionConfig,
+) -> Result<(), NodeInitError> {
+    if !config.enable_shadow_verification {
+        return Err(NodeInitError::InvalidDualConfig(
+            "shadow verification must be enabled for mainnet production nodes".to_string(),
+        ));
+    }
+    if config.verification_depth == 0 {
+        return Err(NodeInitError::InvalidDualConfig(
+            "verification_depth must be >= 1 when shadow verification is enabled".to_string(),
+        ));
     }
     Ok(())
 }
@@ -402,12 +431,19 @@ impl ApolloBlockifierClassProvider {
         Self::pre_execution_state_number(block_number)
     }
 
-    fn read_state_number(&self) -> StarknetApiStateNumber {
+    fn read_state_number(&self) -> Result<StarknetApiStateNumber, StateError> {
         Self::with_thread_local_state(|state| {
             state
                 .get(&self.instance_id)
                 .copied()
-                .unwrap_or_else(|| Self::pre_execution_state_number(0))
+                .ok_or_else(|| {
+                    StateError::StateReadError(format!(
+                        "apollo class provider state is uninitialized on this thread; \
+                         call prepare_for_block_execution/prepare_for_simulation before reads \
+                         (provider_id={})",
+                        self.instance_id
+                    ))
+                })
         })
     }
 
@@ -442,7 +478,7 @@ impl BlockifierClassProvider for ApolloBlockifierClassProvider {
         &self,
         contract_address: StarknetApiContractAddress,
     ) -> Result<StarknetApiClassHash, StateError> {
-        let state_number = self.read_state_number();
+        let state_number = self.read_state_number()?;
         let txn = self.reader.begin_ro_txn().map_err(|error| {
             Self::map_storage_error("open apollo read txn for class hash", error)
         })?;
@@ -513,7 +549,7 @@ impl BlockifierClassProvider for ApolloBlockifierClassProvider {
         &self,
         class_hash: StarknetApiClassHash,
     ) -> Result<StarknetApiCompiledClassHash, StateError> {
-        let state_number = self.read_state_number();
+        let state_number = self.read_state_number()?;
         let txn = self.reader.begin_ro_txn().map_err(|error| {
             Self::map_storage_error("open apollo read txn for compiled class hash", error)
         })?;
@@ -550,6 +586,7 @@ pub fn build_mainnet_production_node_with_dual_config(
             config.chain_id.as_str().to_string(),
         ));
     }
+    validate_production_dual_config(&dual_config)?;
     validate_bootstrap_storage(&storage, &config)?;
     let class_provider: Arc<dyn BlockifierClassProvider> =
         Arc::new(ApolloBlockifierClassProvider::new(storage.reader_handle()));
@@ -867,6 +904,13 @@ mod tests {
         assert!(matches!(err, ChainIdError::InvalidFormat(_)));
     }
 
+    #[test]
+    fn rejects_chain_id_that_exceeds_max_length() {
+        let oversized = format!("SN_{}", "A".repeat(128));
+        let err = ChainId::parse(oversized).expect_err("must reject oversized chain id");
+        assert!(matches!(err, ChainIdError::TooLong { .. }));
+    }
+
     #[cfg(feature = "production-adapters")]
     fn apollo_config(path: &Path) -> ApolloStorageConfig {
         ApolloStorageConfig {
@@ -1104,6 +1148,22 @@ mod tests {
 
     #[cfg(feature = "production-adapters")]
     #[test]
+    fn apollo_class_provider_fails_closed_when_thread_state_is_uninitialized() {
+        let dir = tempdir().expect("temp dir");
+        let (reader, mut writer) =
+            open_apollo_storage(apollo_config(dir.path())).expect("open apollo storage");
+        let (contract, _, _) = seed_header_and_state_with_class_hash(&mut writer);
+        let adapter = ApolloStorageAdapter::from_parts(reader, writer);
+        let provider = ApolloBlockifierClassProvider::new(adapter.reader_handle());
+
+        let err = provider
+            .get_class_hash_at(contract)
+            .expect_err("must fail when prepare_* was not called on this thread");
+        assert!(matches!(err, StateError::StateReadError(message) if message.contains("uninitialized")));
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
     fn apollo_class_provider_state_binding_is_thread_local() {
         let dir = tempdir().expect("temp dir");
         let (reader, mut writer) =
@@ -1301,6 +1361,52 @@ mod tests {
         .err()
         .expect("mainnet production builder must reject non-mainnet chain config");
         assert!(matches!(err, NodeInitError::ChainIdMismatch(_)));
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn production_node_rejects_dual_config_without_shadow_verification() {
+        let dir = tempdir().expect("temp dir");
+        let (reader, mut writer) =
+            open_apollo_storage(apollo_config(dir.path())).expect("open apollo storage");
+        seed_mainnet_genesis_header(&mut writer);
+        let adapter = ApolloStorageAdapter::from_parts(reader, writer);
+
+        let err = build_mainnet_production_node_with_dual_config(
+            NodeConfig::default(),
+            adapter,
+            ProductionDualExecutionConfig {
+                enable_shadow_verification: false,
+                verification_depth: 10,
+                mismatch_policy: MismatchPolicy::WarnAndFallback,
+            },
+        )
+        .err()
+        .expect("must reject unsafe production dual config");
+        assert!(matches!(err, NodeInitError::InvalidDualConfig(message) if message.contains("shadow verification")));
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn production_node_rejects_zero_verification_depth() {
+        let dir = tempdir().expect("temp dir");
+        let (reader, mut writer) =
+            open_apollo_storage(apollo_config(dir.path())).expect("open apollo storage");
+        seed_mainnet_genesis_header(&mut writer);
+        let adapter = ApolloStorageAdapter::from_parts(reader, writer);
+
+        let err = build_mainnet_production_node_with_dual_config(
+            NodeConfig::default(),
+            adapter,
+            ProductionDualExecutionConfig {
+                enable_shadow_verification: true,
+                verification_depth: 0,
+                mismatch_policy: MismatchPolicy::WarnAndFallback,
+            },
+        )
+        .err()
+        .expect("must reject zero verification depth for production");
+        assert!(matches!(err, NodeInitError::InvalidDualConfig(message) if message.contains("verification_depth")));
     }
 
     #[cfg(feature = "production-adapters")]

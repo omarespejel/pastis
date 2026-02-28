@@ -13,6 +13,13 @@ pub enum StandardWrapper {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BtcfiAnomaly {
+    DataDecodeError {
+        block_number: BlockNumber,
+        component: String,
+        field: String,
+        value_hex: String,
+        target_type: String,
+    },
     SupplyMismatch {
         wrapper: StandardWrapper,
         block_number: BlockNumber,
@@ -84,11 +91,20 @@ impl StandardWrapperMonitor {
         let Some(writes) = diff.storage_diffs.get(&self.config.token_contract) else {
             return Vec::new();
         };
-        let Some(total_supply) = writes
-            .get(&self.config.total_supply_key)
-            .and_then(felt_to_u128)
-        else {
+        let Some(total_supply_raw) = writes.get(&self.config.total_supply_key) else {
             return Vec::new();
+        };
+        let total_supply = match felt_to_u128(total_supply_raw) {
+            Ok(value) => value,
+            Err(value_hex) => {
+                return vec![BtcfiAnomaly::DataDecodeError {
+                    block_number,
+                    component: format!("{:?}", self.config.wrapper),
+                    field: "total_supply".to_string(),
+                    value_hex,
+                    target_type: "u128".to_string(),
+                }];
+            }
         };
         let expected = self.config.expected_supply_sats;
         if expected == 0 {
@@ -193,12 +209,38 @@ impl StrkBtcMonitor {
         }
 
         let next_merkle_root = writes.get(&self.config.merkle_root_key).map(felt_to_hex);
-        let next_commitment_count = writes
-            .get(&self.config.commitment_count_key)
-            .and_then(felt_to_u64);
-        let next_nullifier_count = writes
-            .get(&self.config.nullifier_count_key)
-            .and_then(felt_to_u64);
+        let next_commitment_count = match writes.get(&self.config.commitment_count_key) {
+            Some(value) => match felt_to_u64(value) {
+                Ok(parsed) => Some(parsed),
+                Err(value_hex) => {
+                    anomalies.push(BtcfiAnomaly::DataDecodeError {
+                        block_number,
+                        component: "strkbtc".to_string(),
+                        field: "commitment_count".to_string(),
+                        value_hex,
+                        target_type: "u64".to_string(),
+                    });
+                    None
+                }
+            },
+            None => None,
+        };
+        let next_nullifier_count = match writes.get(&self.config.nullifier_count_key) {
+            Some(value) => match felt_to_u64(value) {
+                Ok(parsed) => Some(parsed),
+                Err(value_hex) => {
+                    anomalies.push(BtcfiAnomaly::DataDecodeError {
+                        block_number,
+                        component: "strkbtc".to_string(),
+                        field: "nullifier_count".to_string(),
+                        value_hex,
+                        target_type: "u64".to_string(),
+                    });
+                    None
+                }
+            },
+            None => None,
+        };
 
         if let (Some(previous), Some(current)) = (self.last_commitment_count, next_commitment_count)
         {
@@ -372,14 +414,14 @@ fn felt_to_hex(value: &StarknetFelt) -> String {
     format!("{:#x}", value)
 }
 
-fn felt_to_u64(value: &StarknetFelt) -> Option<u64> {
+fn felt_to_u64(value: &StarknetFelt) -> Result<u64, String> {
     let hex = felt_to_hex(value);
-    u64::from_str_radix(hex.trim_start_matches("0x"), 16).ok()
+    u64::from_str_radix(hex.trim_start_matches("0x"), 16).map_err(|_| hex)
 }
 
-fn felt_to_u128(value: &StarknetFelt) -> Option<u128> {
+fn felt_to_u128(value: &StarknetFelt) -> Result<u128, String> {
     let hex = felt_to_hex(value);
-    u128::from_str_radix(hex.trim_start_matches("0x"), 16).ok()
+    u128::from_str_radix(hex.trim_start_matches("0x"), 16).map_err(|_| hex)
 }
 
 fn felt_is_zero(value: &StarknetFelt) -> bool {
