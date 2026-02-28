@@ -37,6 +37,7 @@ struct DaemonConfig {
     rpc_max_retries: u32,
     rpc_retry_backoff_ms: u64,
     bootnodes: Vec<String>,
+    require_peers: bool,
     p2p_heartbeat_ms: u64,
 }
 
@@ -53,6 +54,7 @@ struct StatusPayload {
     starting_block: u64,
     current_block: u64,
     highest_block: u64,
+    peer_count: u64,
     reorg_events: u64,
     consecutive_failures: u64,
     last_error: Option<String>,
@@ -74,6 +76,8 @@ async fn main() -> Result<(), String> {
             max_retries: config.rpc_max_retries,
             base_backoff: Duration::from_millis(config.rpc_retry_backoff_ms),
         },
+        peer_count_hint: config.bootnodes.len(),
+        require_peers: config.require_peers,
     };
 
     let mut runtime = NodeRuntime::new(runtime_config)?;
@@ -119,6 +123,7 @@ async fn main() -> Result<(), String> {
     );
     println!("rpc_bind: {}", config.rpc_bind);
     println!("poll_ms: {}", config.poll_ms);
+    println!("require_peers: {}", config.require_peers);
 
     let rpc_handle = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -213,6 +218,7 @@ async fn status(
         starting_block: progress.starting_block,
         current_block: progress.current_block,
         highest_block: progress.highest_block,
+        peer_count: progress.peer_count,
         reorg_events: progress.reorg_events,
         consecutive_failures: progress.consecutive_failures,
         last_error: progress.last_error,
@@ -231,6 +237,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
     let mut cli_rpc_max_retries: Option<u32> = None;
     let mut cli_rpc_retry_backoff_ms: Option<u64> = None;
     let mut cli_bootnodes: Vec<String> = Vec::new();
+    let mut cli_require_peers = false;
     let mut cli_p2p_heartbeat_ms: Option<u64> = None;
 
     let mut args = env::args().skip(1);
@@ -305,6 +312,9 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
                         .ok_or_else(|| "--bootnode requires a value".to_string())?,
                 );
             }
+            "--require-peers" => {
+                cli_require_peers = true;
+            }
             "--p2p-heartbeat-ms" => {
                 let raw = args
                     .next()
@@ -374,6 +384,11 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         Some(value) => value,
         None => parse_env_u64("PASTIS_P2P_HEARTBEAT_MS")?.unwrap_or(DEFAULT_P2P_HEARTBEAT_MS),
     };
+    let require_peers = if cli_require_peers {
+        true
+    } else {
+        parse_env_bool("PASTIS_REQUIRE_PEERS")?.unwrap_or(false)
+    };
 
     Ok(DaemonConfig {
         upstream_rpc_url,
@@ -391,6 +406,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         rpc_max_retries,
         rpc_retry_backoff_ms,
         bootnodes,
+        require_peers,
         p2p_heartbeat_ms,
     })
 }
@@ -405,6 +421,22 @@ fn parse_env_u64(name: &str) -> Result<Option<u64>, String> {
 fn parse_env_u32(name: &str) -> Result<Option<u32>, String> {
     match env::var(name) {
         Ok(raw) => Ok(Some(parse_non_negative_u32(&raw, name)?)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn parse_env_bool(name: &str) -> Result<Option<bool>, String> {
+    match env::var(name) {
+        Ok(raw) => {
+            let normalized = raw.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "1" | "true" | "yes" | "on" => Ok(Some(true)),
+                "0" | "false" | "no" | "off" => Ok(Some(false)),
+                _ => Err(format!(
+                    "invalid {name} value `{raw}`: expected one of true/false/1/0/yes/no/on/off"
+                )),
+            }
+        }
         Err(_) => Ok(None),
     }
 }
@@ -452,6 +484,7 @@ options:\n\
   --rpc-max-retries <n>              Upstream RPC max retries\n\
   --rpc-retry-backoff-ms <ms>        Retry backoff base\n\
   --bootnode <multiaddr>             Configure bootnode (repeatable)\n\
+  --require-peers                    Fail closed when no peers are configured/available\n\
   --p2p-heartbeat-ms <ms>            P2P heartbeat logging interval\n\
 environment:\n\
   STARKNET_RPC_URL                   Upstream Starknet RPC URL\n\
@@ -465,6 +498,7 @@ environment:\n\
   PASTIS_RPC_MAX_RETRIES             Upstream RPC max retries\n\
   PASTIS_RPC_RETRY_BACKOFF_MS        Upstream RPC retry backoff ms\n\
   PASTIS_BOOTNODES                   Comma-separated bootnodes\n\
+  PASTIS_REQUIRE_PEERS               Require peers for sync loop health (true/false)\n\
   PASTIS_P2P_HEARTBEAT_MS            P2P heartbeat interval"
     )
 }

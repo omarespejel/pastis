@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -55,6 +57,8 @@ pub struct RuntimeConfig {
     pub poll_interval: Duration,
     pub rpc_timeout: Duration,
     pub retry: RpcRetryConfig,
+    pub peer_count_hint: usize,
+    pub require_peers: bool,
 }
 
 impl RuntimeConfig {
@@ -83,6 +87,7 @@ pub struct SyncProgress {
     pub starting_block: u64,
     pub current_block: u64,
     pub highest_block: u64,
+    pub peer_count: u64,
     pub reorg_events: u64,
     pub consecutive_failures: u64,
     pub last_error: Option<String>,
@@ -95,6 +100,8 @@ pub struct RuntimeDiagnostics {
     pub consecutive_failures: u64,
     pub replayed_tx_count: u64,
     pub replay_failures: u64,
+    pub consensus_rejections: u64,
+    pub network_failures: u64,
     pub execution_failures: u64,
     pub commit_failures: u64,
     pub reorg_events: u64,
@@ -104,8 +111,105 @@ pub struct RuntimeDiagnostics {
 
 type RuntimeNode = StarknetNode<ThreadSafeStorage<InMemoryStorage>, DualExecutionBackend>;
 
+#[derive(Debug, Clone)]
+struct RuntimeBlockReplay {
+    external_block_number: u64,
+    block_hash: String,
+    parent_hash: String,
+    sequencer_address: String,
+    timestamp: u64,
+    transaction_hashes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeFetch {
+    replay: RuntimeBlockReplay,
+    state_diff: StarknetStateDiff,
+    state_root: String,
+}
+
+type SyncSourceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
+
+trait SyncSource: Send + Sync {
+    fn fetch_latest_block_number(&self) -> SyncSourceFuture<'_, u64>;
+    fn fetch_chain_id(&self) -> SyncSourceFuture<'_, String>;
+    fn fetch_block(&self, block_number: u64) -> SyncSourceFuture<'_, RuntimeFetch>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConsensusInput {
+    external_block_number: u64,
+    block_hash: String,
+    parent_hash: String,
+    timestamp: u64,
+    tx_count: usize,
+}
+
+impl From<&RuntimeBlockReplay> for ConsensusInput {
+    fn from(value: &RuntimeBlockReplay) -> Self {
+        Self {
+            external_block_number: value.external_block_number,
+            block_hash: value.block_hash.clone(),
+            parent_hash: value.parent_hash.clone(),
+            timestamp: value.timestamp,
+            tx_count: value.transaction_hashes.len(),
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsensusVerdict {
+    Accept,
+    Reject,
+}
+
+trait ConsensusBackend: Send + Sync {
+    fn validate_block(&self, input: &ConsensusInput) -> Result<ConsensusVerdict, String>;
+}
+
+struct AllowAllConsensusBackend;
+
+impl ConsensusBackend for AllowAllConsensusBackend {
+    fn validate_block(&self, _input: &ConsensusInput) -> Result<ConsensusVerdict, String> {
+        Ok(ConsensusVerdict::Accept)
+    }
+}
+
+trait NetworkBackend: Send + Sync {
+    fn is_healthy(&self) -> bool;
+    fn peer_count(&self) -> usize;
+}
+
+struct StaticNetworkBackend {
+    peer_count: usize,
+    healthy: bool,
+}
+
+impl StaticNetworkBackend {
+    fn from_config(peer_count: usize, require_peers: bool) -> Self {
+        let healthy = !require_peers || peer_count > 0;
+        Self {
+            peer_count,
+            healthy,
+        }
+    }
+}
+
+impl NetworkBackend for StaticNetworkBackend {
+    fn is_healthy(&self) -> bool {
+        self.healthy
+    }
+
+    fn peer_count(&self) -> usize {
+        self.peer_count
+    }
+}
+
 pub struct NodeRuntime {
-    client: UpstreamRpcClient,
+    sync_source: Arc<dyn SyncSource>,
+    consensus: Arc<dyn ConsensusBackend>,
+    network: Arc<dyn NetworkBackend>,
     node: RuntimeNode,
     execution_state: InMemoryState,
     replay: ReplayPipeline,
@@ -120,8 +224,25 @@ pub struct NodeRuntime {
 impl NodeRuntime {
     pub fn new(config: RuntimeConfig) -> Result<Self, String> {
         config.validate()?;
+        let sync_source = Arc::new(UpstreamRpcClient::new(
+            config.upstream_rpc_url.clone(),
+            config.rpc_timeout,
+        )?);
+        let consensus = Arc::new(AllowAllConsensusBackend);
+        let network = Arc::new(StaticNetworkBackend::from_config(
+            config.peer_count_hint,
+            config.require_peers,
+        ));
+        Self::new_with_backends(config, sync_source, consensus, network)
+    }
 
-        let client = UpstreamRpcClient::new(config.upstream_rpc_url.clone(), config.rpc_timeout)?;
+    fn new_with_backends(
+        config: RuntimeConfig,
+        sync_source: Arc<dyn SyncSource>,
+        consensus: Arc<dyn ConsensusBackend>,
+        network: Arc<dyn NetworkBackend>,
+    ) -> Result<Self, String> {
+        config.validate()?;
         let node = build_runtime_node(config.chain_id.clone());
 
         let mut replay = new_replay_pipeline(
@@ -178,7 +299,9 @@ impl NodeRuntime {
         progress.reorg_events = replay.reorg_events();
 
         Ok(Self {
-            client,
+            sync_source,
+            consensus,
+            network,
             node,
             execution_state: InMemoryState::default(),
             replay,
@@ -214,6 +337,17 @@ impl NodeRuntime {
     pub async fn poll_once(&mut self) -> Result<(), String> {
         self.ensure_chain_id_validated().await?;
 
+        let peer_count = self.network.peer_count() as u64;
+        self.update_sync_progress(|progress| {
+            progress.peer_count = peer_count;
+        })?;
+        if !self.network.is_healthy() {
+            self.diagnostics.network_failures = self.diagnostics.network_failures.saturating_add(1);
+            let message = format!("network backend unhealthy (peer_count={peer_count})");
+            self.record_failure(message.clone());
+            return Err(message);
+        }
+
         let external_head_block = self.fetch_latest_block_number_with_retry().await?;
         self.update_sync_progress(|progress| {
             progress.highest_block = external_head_block;
@@ -235,6 +369,26 @@ impl NodeRuntime {
 
         for external_block in replay_plan {
             let fetch = self.fetch_block_with_retry(external_block).await?;
+            let consensus_input = ConsensusInput::from(&fetch.replay);
+            let consensus_verdict = self.consensus.validate_block(&consensus_input).map_err(
+                |error| {
+                    let message = format!(
+                        "consensus validation failed at external block {external_block}: {error}"
+                    );
+                    self.record_failure(message.clone());
+                    message
+                },
+            )?;
+            if matches!(consensus_verdict, ConsensusVerdict::Reject) {
+                self.diagnostics.consensus_rejections =
+                    self.diagnostics.consensus_rejections.saturating_add(1);
+                let message = format!(
+                    "consensus rejected external block {}",
+                    consensus_input.external_block_number
+                );
+                self.record_failure(message.clone());
+                return Err(message);
+            }
             let local_block_number = match self
                 .replay
                 .evaluate_block(external_block, &fetch.replay.parent_hash)
@@ -334,7 +488,7 @@ impl NodeRuntime {
     async fn fetch_latest_block_number_with_retry(&self) -> Result<u64, String> {
         let mut attempt = 0_u32;
         loop {
-            match self.client.fetch_latest_block_number().await {
+            match self.sync_source.fetch_latest_block_number().await {
                 Ok(head) => return Ok(head),
                 Err(error) => {
                     if attempt >= self.retry.max_retries {
@@ -356,7 +510,7 @@ impl NodeRuntime {
     async fn fetch_block_with_retry(&self, block_number: u64) -> Result<RuntimeFetch, String> {
         let mut attempt = 0_u32;
         loop {
-            match self.client.fetch_block(block_number).await {
+            match self.sync_source.fetch_block(block_number).await {
                 Ok(fetch) => return Ok(fetch),
                 Err(error) => {
                     if attempt >= self.retry.max_retries {
@@ -379,7 +533,7 @@ impl NodeRuntime {
         if self.chain_id_validated {
             return Ok(());
         }
-        let upstream_chain_id = self.client.fetch_chain_id().await?;
+        let upstream_chain_id = self.sync_source.fetch_chain_id().await?;
         let local_chain_id = self.chain_id().to_string();
         if normalize_chain_id(&upstream_chain_id) != normalize_chain_id(&local_chain_id) {
             let message = format!(
@@ -438,23 +592,6 @@ impl NodeRuntime {
         update(&mut guard);
         Ok(())
     }
-}
-
-#[derive(Debug, Clone)]
-struct RuntimeBlockReplay {
-    external_block_number: u64,
-    block_hash: String,
-    parent_hash: String,
-    sequencer_address: String,
-    timestamp: u64,
-    transaction_hashes: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct RuntimeFetch {
-    replay: RuntimeBlockReplay,
-    state_diff: StarknetStateDiff,
-    state_root: String,
 }
 
 #[derive(Clone)]
@@ -571,6 +708,20 @@ impl UpstreamRpcClient {
         body.get("result")
             .cloned()
             .ok_or_else(|| format!("RPC {method} response missing `result`: {body}"))
+    }
+}
+
+impl SyncSource for UpstreamRpcClient {
+    fn fetch_latest_block_number(&self) -> SyncSourceFuture<'_, u64> {
+        Box::pin(UpstreamRpcClient::fetch_latest_block_number(self))
+    }
+
+    fn fetch_chain_id(&self) -> SyncSourceFuture<'_, String> {
+        Box::pin(UpstreamRpcClient::fetch_chain_id(self))
+    }
+
+    fn fetch_block(&self, block_number: u64) -> SyncSourceFuture<'_, RuntimeFetch> {
+        Box::pin(UpstreamRpcClient::fetch_block(self, block_number))
     }
 }
 
@@ -1137,7 +1288,120 @@ fn decode_ascii_hex(hex: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
     use super::*;
+
+    #[derive(Clone)]
+    struct MockSyncSource {
+        chain_id: String,
+        head: u64,
+        blocks: Arc<Mutex<BTreeMap<u64, RuntimeFetch>>>,
+    }
+
+    impl MockSyncSource {
+        fn with_blocks(chain_id: &str, head: u64, blocks: Vec<RuntimeFetch>) -> Self {
+            let mut mapped = BTreeMap::new();
+            for block in blocks {
+                mapped.insert(block.replay.external_block_number, block);
+            }
+            Self {
+                chain_id: chain_id.to_string(),
+                head,
+                blocks: Arc::new(Mutex::new(mapped)),
+            }
+        }
+    }
+
+    impl SyncSource for MockSyncSource {
+        fn fetch_latest_block_number(&self) -> SyncSourceFuture<'_, u64> {
+            let head = self.head;
+            Box::pin(async move { Ok(head) })
+        }
+
+        fn fetch_chain_id(&self) -> SyncSourceFuture<'_, String> {
+            let chain_id = self.chain_id.clone();
+            Box::pin(async move { Ok(chain_id) })
+        }
+
+        fn fetch_block(&self, block_number: u64) -> SyncSourceFuture<'_, RuntimeFetch> {
+            let blocks = Arc::clone(&self.blocks);
+            Box::pin(async move {
+                blocks
+                    .lock()
+                    .map_err(|_| "mock block map lock poisoned".to_string())?
+                    .get(&block_number)
+                    .cloned()
+                    .ok_or_else(|| format!("mock block {block_number} missing"))
+            })
+        }
+    }
+
+    struct RejectingConsensus;
+
+    impl ConsensusBackend for RejectingConsensus {
+        fn validate_block(&self, _input: &ConsensusInput) -> Result<ConsensusVerdict, String> {
+            Ok(ConsensusVerdict::Reject)
+        }
+    }
+
+    struct HealthyConsensus;
+
+    impl ConsensusBackend for HealthyConsensus {
+        fn validate_block(&self, _input: &ConsensusInput) -> Result<ConsensusVerdict, String> {
+            Ok(ConsensusVerdict::Accept)
+        }
+    }
+
+    struct MockNetwork {
+        healthy: bool,
+        peers: usize,
+    }
+
+    impl NetworkBackend for MockNetwork {
+        fn is_healthy(&self) -> bool {
+            self.healthy
+        }
+
+        fn peer_count(&self) -> usize {
+            self.peers
+        }
+    }
+
+    fn runtime_config() -> RuntimeConfig {
+        RuntimeConfig {
+            chain_id: ChainId::Mainnet,
+            upstream_rpc_url: "http://localhost:9545".to_string(),
+            replay_window: 1,
+            max_replay_per_poll: 16,
+            replay_checkpoint_path: None,
+            poll_interval: Duration::from_millis(500),
+            rpc_timeout: Duration::from_secs(3),
+            retry: RpcRetryConfig::default(),
+            peer_count_hint: 0,
+            require_peers: false,
+        }
+    }
+
+    fn sample_fetch(
+        external_block_number: u64,
+        parent_hash: &str,
+        block_hash: &str,
+    ) -> RuntimeFetch {
+        RuntimeFetch {
+            replay: RuntimeBlockReplay {
+                external_block_number,
+                block_hash: block_hash.to_string(),
+                parent_hash: parent_hash.to_string(),
+                sequencer_address: "0x1".to_string(),
+                timestamp: 1_700_000_000 + external_block_number,
+                transaction_hashes: vec!["0x111".to_string()],
+            },
+            state_diff: StarknetStateDiff::default(),
+            state_root: "0x10".to_string(),
+        }
+    }
 
     #[test]
     fn parses_block_with_txs_hashes_from_objects() {
@@ -1189,5 +1453,58 @@ mod tests {
     fn normalize_chain_id_accepts_hex_encoded_ascii() {
         assert_eq!(normalize_chain_id("SN_MAIN"), "SN_MAIN");
         assert_eq!(normalize_chain_id("0x534e5f4d41494e"), "SN_MAIN");
+    }
+
+    #[tokio::test]
+    async fn poll_once_fails_closed_when_network_is_unhealthy() {
+        let sync_source = Arc::new(MockSyncSource::with_blocks("SN_MAIN", 0, Vec::new()));
+        let consensus = Arc::new(HealthyConsensus);
+        let network = Arc::new(MockNetwork {
+            healthy: false,
+            peers: 0,
+        });
+
+        let mut runtime =
+            NodeRuntime::new_with_backends(runtime_config(), sync_source, consensus, network)
+                .expect("runtime should initialize");
+
+        let error = runtime
+            .poll_once()
+            .await
+            .expect_err("unhealthy network must fail closed");
+        assert!(error.contains("network backend unhealthy"));
+        assert_eq!(runtime.diagnostics().network_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn poll_once_rejects_blocks_when_consensus_rejects() {
+        let sync_source = Arc::new(MockSyncSource::with_blocks(
+            "SN_MAIN",
+            1,
+            vec![sample_fetch(1, "0x0", "0x1")],
+        ));
+        let consensus = Arc::new(RejectingConsensus);
+        let network = Arc::new(MockNetwork {
+            healthy: true,
+            peers: 5,
+        });
+
+        let mut runtime =
+            NodeRuntime::new_with_backends(runtime_config(), sync_source, consensus, network)
+                .expect("runtime should initialize");
+
+        let error = runtime
+            .poll_once()
+            .await
+            .expect_err("consensus rejection must fail closed");
+        assert!(error.contains("consensus rejected external block 1"));
+        assert_eq!(runtime.diagnostics().consensus_rejections, 1);
+        assert_eq!(
+            runtime
+                .storage()
+                .latest_block_number()
+                .expect("storage read should work"),
+            0
+        );
     }
 }
