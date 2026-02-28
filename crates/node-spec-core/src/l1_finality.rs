@@ -35,7 +35,7 @@ impl L1FinalityTracker {
         &mut self,
         entry: PostedStateRoot,
     ) -> Result<(), FinalityError> {
-        if let Some(existing) = self.posted_by_l2_block.get(&entry.l2_block_number) {
+        if let Some(existing) = self.posted_by_l2_block.get_mut(&entry.l2_block_number) {
             if existing.state_root != entry.state_root {
                 return Err(FinalityError::ConflictingPostedRoot {
                     l2_block_number: entry.l2_block_number,
@@ -43,7 +43,10 @@ impl L1FinalityTracker {
                     new_root: entry.state_root.clone(),
                 });
             }
-            // Preserve the earliest observed posting metadata for idempotent reposts.
+            // Preserve the earliest known Ethereum posting height for idempotent reposts.
+            if entry.eth_block_number < existing.eth_block_number {
+                existing.eth_block_number = entry.eth_block_number;
+            }
             return Ok(());
         }
         self.posted_by_l2_block.insert(entry.l2_block_number, entry);
@@ -198,10 +201,10 @@ mod tests {
     fn allows_idempotent_reposts_for_same_l2_state_root() {
         let mut tracker = L1FinalityTracker::default();
         tracker
-            .record_state_root_posted(root(120, 10_000))
+            .record_state_root_posted(root(120, 10_010))
             .expect("first post");
         tracker
-            .record_state_root_posted(root(120, 10_010))
+            .record_state_root_posted(root(120, 10_000))
             .expect("idempotent repost");
 
         tracker.update_finalized_eth_block(10_005);

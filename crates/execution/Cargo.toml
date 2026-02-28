@@ -13,6 +13,7 @@ blockifier-adapter = [
 ]
 
 [dependencies]
+log = { workspace = true }
 node-spec-core = { path = "../node-spec-core" }
 semver = { workspace = true }
 starknet-node-types = { path = "../types" }

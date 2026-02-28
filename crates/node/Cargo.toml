@@ -37,4 +37,5 @@ blockifier = { git = "https://github.com/starkware-libs/sequencer", rev = "69b4c
 starknet_api = { git = "https://github.com/starkware-libs/sequencer", rev = "69b4c8d378580a1aec345f23dadd4766e036fe3b", package = "starknet_api", optional = true }
 
 [dev-dependencies]
+cairo-lang-starknet-classes = "2.14.1-dev.3"
 tempfile = "3.10"

@@ -85,46 +85,49 @@ pub struct AgentPolicy {
     pub max_requests_per_minute: u32,
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AgentPolicyBuildError {
+    #[error("argon2id api-key derivation failed: {0}")]
+    ApiKeyDerivation(String),
+}
+
 impl AgentPolicy {
     pub fn new(
         api_key: impl AsRef<str>,
         permissions: BTreeSet<ToolPermission>,
         max_requests_per_minute: u32,
     ) -> Self {
+        Self::try_new(api_key, permissions, max_requests_per_minute)
+            .expect("agent policy construction must derive API key with argon2id")
+    }
+
+    pub fn try_new(
+        api_key: impl AsRef<str>,
+        permissions: BTreeSet<ToolPermission>,
+        max_requests_per_minute: u32,
+    ) -> Result<Self, AgentPolicyBuildError> {
         let mut api_key_salt = [0_u8; 16];
         OsRng.fill_bytes(&mut api_key_salt);
-        let (api_key_kdf, api_key_hash) = match hash_api_key_argon2id(
-            api_key.as_ref(),
-            &api_key_salt,
-        ) {
-            Ok(hash) => (ApiKeyKdf::Argon2id, hash),
-            Err(error) => {
-                eprintln!(
-                    "warning: argon2id api-key derivation failed; using legacy PBKDF2 fallback: {error}"
-                );
-                (
-                    ApiKeyKdf::LegacyPbkdf2Sha256,
-                    hash_api_key_legacy_pbkdf2(api_key.as_ref(), &api_key_salt),
-                )
-            }
-        };
-        Self {
+        let api_key_hash = hash_api_key_argon2id(api_key.as_ref(), &api_key_salt)
+            .map_err(|error| AgentPolicyBuildError::ApiKeyDerivation(error.to_string()))?;
+        Ok(Self {
             api_key_salt,
             api_key_hash,
-            api_key_kdf,
+            api_key_kdf: ApiKeyKdf::Argon2id,
             permissions,
             max_requests_per_minute,
-        }
+        })
     }
 
     fn verify_api_key(&self, api_key: &str) -> bool {
         match self.api_key_kdf {
             ApiKeyKdf::Argon2id => hash_api_key_argon2id(api_key, &self.api_key_salt)
-                .map(|hash| hash == self.api_key_hash)
+                .map(|hash| constant_time_eq_32(&hash, &self.api_key_hash))
                 .unwrap_or(false),
-            ApiKeyKdf::LegacyPbkdf2Sha256 => {
-                self.api_key_hash == hash_api_key_legacy_pbkdf2(api_key, &self.api_key_salt)
-            }
+            ApiKeyKdf::LegacyPbkdf2Sha256 => constant_time_eq_32(
+                &self.api_key_hash,
+                &hash_api_key_legacy_pbkdf2(api_key, &self.api_key_salt),
+            ),
         }
     }
 }
@@ -167,7 +170,22 @@ pub struct McpAccessController {
 
 impl McpAccessController {
     pub fn new(policies: impl IntoIterator<Item = (String, AgentPolicy)>) -> Self {
-        Self::try_new(policies).expect("mcp policy construction must reject duplicate api salts")
+        let mut salts: BTreeMap<[u8; 16], String> = BTreeMap::new();
+        let mut policy_map = BTreeMap::new();
+        for (agent_id, policy) in policies {
+            if salts.contains_key(&policy.api_key_salt) {
+                // Keep the first policy bound to a salt and drop duplicates to avoid
+                // ambiguous API-key resolution or constructor panics.
+                continue;
+            }
+            salts.insert(policy.api_key_salt, agent_id.clone());
+            policy_map.insert(agent_id, policy);
+        }
+        Self {
+            policies: policy_map,
+            requests: BTreeMap::new(),
+            latest_request_time: BTreeMap::new(),
+        }
     }
 
     pub fn try_new(
@@ -242,8 +260,6 @@ impl McpAccessController {
                 agent_id: agent_id.clone(),
             });
         }
-        self.latest_request_time
-            .insert(agent_id.clone(), now_unix_seconds);
 
         let requests = self.requests.entry(agent_id.clone()).or_default();
         while let Some(ts) = requests.front() {
@@ -260,6 +276,8 @@ impl McpAccessController {
             });
         }
         requests.push_back(now_unix_seconds);
+        self.latest_request_time
+            .insert(agent_id.clone(), now_unix_seconds);
         Ok(agent_id)
     }
 }
@@ -282,6 +300,14 @@ fn hash_api_key_argon2id(api_key: &str, salt: &[u8; 16]) -> Result<[u8; 32], Str
 
 fn hash_api_key_legacy_pbkdf2(api_key: &str, salt: &[u8; 16]) -> [u8; 32] {
     pbkdf2_hmac_array::<Sha256, 32>(api_key.as_bytes(), salt, API_KEY_LEGACY_PBKDF2_ITERATIONS)
+}
+
+fn constant_time_eq_32(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    let mut diff = 0_u8;
+    for (lhs, rhs) in left.iter().zip(right.iter()) {
+        diff |= lhs ^ rhs;
+    }
+    diff == 0
 }
 
 pub fn validate_tool(tool: &McpTool, limits: ValidationLimits) -> Result<(), ValidationError> {
@@ -516,6 +542,28 @@ mod tests {
                 second_agent: "agent-b".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn infallible_controller_constructor_drops_duplicate_policy_salts() {
+        let first = read_only_policy(1);
+        let duplicate = AgentPolicy {
+            api_key_salt: first.api_key_salt,
+            api_key_hash: first.api_key_hash,
+            api_key_kdf: first.api_key_kdf,
+            permissions: first.permissions.clone(),
+            max_requests_per_minute: first.max_requests_per_minute,
+        };
+
+        let mut access = McpAccessController::new([
+            ("agent-a".to_string(), first),
+            ("agent-b".to_string(), duplicate),
+        ]);
+
+        let resolved = access
+            .authorize("secret", &McpTool::QueryState, 1_000)
+            .expect("first policy should remain active");
+        assert_eq!(resolved, "agent-a");
     }
 
     #[test]

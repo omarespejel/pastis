@@ -234,6 +234,11 @@ impl ExExManager {
         let notification = Arc::clone(notification);
 
         if self.tiers.is_empty() {
+            if self.sinks.is_empty() {
+                return Err(ManagerError::MissingSink(
+                    "no sinks registered for delivery".to_string(),
+                ));
+            }
             let mut names: Vec<String> = self.sinks.keys().cloned().collect();
             names.sort();
             self.deliver_tier(&names, &notification)?;
@@ -304,7 +309,9 @@ impl ExExManager {
             .cloned()
             .collect();
         if active_tier.is_empty() {
-            return Ok(());
+            return Err(ManagerError::MissingSink(
+                "no active sinks available for delivery".to_string(),
+            ));
         }
 
         let mut tier_failures: Vec<(String, String)> = Vec::new();
@@ -981,18 +988,18 @@ mod tests {
         assert!(manager.is_sink_disabled("flaky"));
 
         manager.enqueue(sample_notification()).expect("enqueue 2");
-        let fourth = manager
+        let err = manager
             .drain_one()
-            .expect("disabled sink should allow progress");
-        assert_eq!(fourth, Some(2));
+            .expect_err("disabled sink must keep notification queued");
+        assert!(matches!(err, ManagerError::MissingSink(_)));
         assert!(manager.is_sink_disabled("flaky"));
+        assert_eq!(manager.buffer.len(), 1);
 
         std::thread::sleep(Duration::from_millis(10));
-        manager.enqueue(sample_notification()).expect("enqueue 3");
-        let fifth = manager
+        let fourth = manager
             .drain_one()
             .expect("sink should recover after cooldown");
-        assert_eq!(fifth, Some(3));
+        assert_eq!(fourth, Some(2));
         assert!(!manager.is_sink_disabled("flaky"));
         assert_eq!(*success_count.lock().expect("lock success count"), 1);
     }

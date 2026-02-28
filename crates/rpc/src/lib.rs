@@ -20,7 +20,7 @@ pub struct JsonRpcRequest {
     #[serde(default)]
     pub params: Value,
     #[serde(default)]
-    pub id: Value,
+    pub id: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,52 +96,76 @@ impl<'a> StarknetRpcServer<'a> {
                 }
                 let mut responses = Vec::with_capacity(items.len());
                 for item in items {
-                    let response = match serde_json::from_value::<JsonRpcRequest>(item) {
-                        Ok(request) => self.handle_request(request),
-                        Err(error) => error_response(
+                    match serde_json::from_value::<JsonRpcRequest>(item) {
+                        Ok(request) => {
+                            if let Some(response) = self.handle_request(request) {
+                                responses.push(response);
+                            }
+                        }
+                        Err(error) => responses.push(error_response(
                             Value::Null,
                             ERR_INVALID_REQUEST,
                             format!("invalid request object: {error}"),
-                        ),
+                        )),
                     };
-                    responses.push(response);
+                }
+                if responses.is_empty() {
+                    return String::new();
                 }
                 serde_json::to_string(&responses).expect("serialize batch response")
             }
             other => {
                 let response = match serde_json::from_value::<JsonRpcRequest>(other) {
                     Ok(request) => self.handle_request(request),
-                    Err(error) => error_response(
+                    Err(error) => Some(error_response(
                         Value::Null,
                         ERR_INVALID_REQUEST,
                         format!("invalid request object: {error}"),
-                    ),
+                    )),
                 };
-                serialize_response(response)
+                match response {
+                    Some(response) => serialize_response(response),
+                    None => String::new(),
+                }
             }
         }
     }
 
-    pub fn handle_request(&self, request: JsonRpcRequest) -> JsonRpcResponse {
+    pub fn handle_request(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
+        let is_notification = request.id.is_none();
+        let request_id = request.id.unwrap_or(Value::Null);
         if request.jsonrpc != JSONRPC_VERSION {
-            return error_response(
-                request.id,
+            if is_notification {
+                return None;
+            }
+            return Some(error_response(
+                request_id,
                 ERR_INVALID_REQUEST,
                 format!(
                     "unsupported jsonrpc version '{}', expected '{}'",
                     request.jsonrpc, JSONRPC_VERSION
                 ),
-            );
+            ));
         }
 
         match self.execute(request.method.as_str(), &request.params) {
-            Ok(result) => JsonRpcResponse {
-                jsonrpc: JSONRPC_VERSION.to_string(),
-                result: Some(result),
-                error: None,
-                id: request.id,
-            },
-            Err(error) => map_error_to_response(request.id, error),
+            Ok(result) => {
+                if is_notification {
+                    return None;
+                }
+                Some(JsonRpcResponse {
+                    jsonrpc: JSONRPC_VERSION.to_string(),
+                    result: Some(result),
+                    error: None,
+                    id: request_id,
+                })
+            }
+            Err(error) => {
+                if is_notification {
+                    return None;
+                }
+                Some(map_error_to_response(request_id, error))
+            }
         }
     }
 
@@ -298,7 +322,7 @@ mod tests {
             },
             state_root: format!("0x{:x}", number + 100),
             timestamp: 1_700_000_000 + number,
-            sequencer_address: ContractAddress::from("0x1"),
+            sequencer_address: ContractAddress::parse("0x1").expect("valid contract address"),
             gas_prices: BlockGasPrices {
                 l1_gas: GasPricePerToken {
                     price_in_fri: 1,
@@ -314,7 +338,10 @@ mod tests {
                 },
             },
             protocol_version: Version::parse("0.14.2").expect("version"),
-            transactions: vec![StarknetTransaction::new(format!("0x{:x}", number + 500))],
+            transactions: vec![StarknetTransaction::new(
+                starknet_node_types::TxHash::parse(format!("0x{:x}", number + 500))
+                    .expect("valid tx hash"),
+            )],
         }
     }
 
@@ -420,5 +447,38 @@ mod tests {
         assert_eq!(arr[0]["result"], json!(2));
         assert_eq!(arr[1]["id"], json!(2));
         assert_eq!(arr[1]["result"], json!("SN_MAIN"));
+    }
+
+    #[test]
+    fn notifications_do_not_emit_responses() {
+        let server = seeded_server();
+        let raw = r#"{"jsonrpc":"2.0","method":"starknet_blockNumber","params":[]}"#;
+        let response = server.handle_raw(raw);
+        assert!(response.is_empty());
+    }
+
+    #[test]
+    fn notification_batch_with_only_notifications_returns_empty_payload() {
+        let server = seeded_server();
+        let raw = r#"[
+          {"jsonrpc":"2.0","method":"starknet_blockNumber","params":[]},
+          {"jsonrpc":"2.0","method":"starknet_chainId","params":[]}
+        ]"#;
+        let response = server.handle_raw(raw);
+        assert!(response.is_empty());
+    }
+
+    #[test]
+    fn mixed_batch_responds_only_to_requests_with_ids() {
+        let server = seeded_server();
+        let raw = r#"[
+          {"jsonrpc":"2.0","method":"starknet_blockNumber","params":[]},
+          {"jsonrpc":"2.0","id":9,"method":"starknet_chainId","params":[]}
+        ]"#;
+        let values: Value = serde_json::from_str(&server.handle_raw(raw)).expect("batch json");
+        let arr = values.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], json!(9));
+        assert_eq!(arr[0]["result"], json!("SN_MAIN"));
     }
 }

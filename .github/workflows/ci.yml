@@ -13,6 +13,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -27,6 +28,9 @@ jobs:
 
       - name: Verify storage adapter dependencies
         run: ./scripts/check-storage-adapter-deps.sh
+
+      - name: Verify replay fixture lock
+        run: ./scripts/check-replay-fixture-lock.sh
 
       - name: Format check
         run: cargo fmt --all --check

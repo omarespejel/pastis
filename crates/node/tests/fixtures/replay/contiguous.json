@@ -1,0 +1,52 @@
+{
+  "replay_window": 4,
+  "max_replay_per_poll": 3,
+  "polls": [
+    {
+      "external_head": 10,
+      "expected_plan": [7, 8, 9],
+      "blocks": [
+        {
+          "number": 7,
+          "parent_hash": "0x0",
+          "block_hash": "0x7",
+          "expected": "apply",
+          "expected_local": 1
+        },
+        {
+          "number": 8,
+          "parent_hash": "0x7",
+          "block_hash": "0x8",
+          "expected": "apply",
+          "expected_local": 2
+        },
+        {
+          "number": 9,
+          "parent_hash": "0x8",
+          "block_hash": "0x9",
+          "expected": "apply",
+          "expected_local": 3
+        }
+      ]
+    },
+    {
+      "external_head": 10,
+      "expected_plan": [10],
+      "blocks": [
+        {
+          "number": 10,
+          "parent_hash": "0x9",
+          "block_hash": "0xa",
+          "expected": "apply",
+          "expected_local": 4
+        }
+      ]
+    }
+  ],
+  "expected": {
+    "reorg_events": 0,
+    "next_local_block": 5,
+    "next_external_block": 11,
+    "replay_lag_blocks_at_final_head": 0
+  }
+}

@@ -16,6 +16,7 @@ use starknet_node_types::{
     BlockContext, BlockGasPrices, BuiltinStats, ContractAddress, ExecutionOutput, GasPricePerToken,
     InMemoryState, MutableState, SimulationResult, StarknetBlock, StarknetReceipt,
     StarknetStateDiff, StarknetTransaction, StateReader,
+    TxHash,
 };
 
 const DEFAULT_ITERATIONS: usize = 5_000;
@@ -126,7 +127,7 @@ impl ExecutionBackend for NoopBackend {
                     .transactions
                     .first()
                     .map(|tx| tx.hash.clone())
-                    .unwrap_or_else(|| "0x0".into()),
+                    .unwrap_or_else(|| TxHash::parse("0x0").expect("valid tx hash")),
                 execution_status: true,
                 events: 0,
                 gas_consumed: 1,
@@ -161,7 +162,7 @@ fn sample_block(number: u64) -> StarknetBlock {
         parent_hash: format!("0x{:x}", number.saturating_sub(1)),
         state_root: format!("0x{number:x}"),
         timestamp: 1_700_000_000 + number,
-        sequencer_address: ContractAddress::from("0x1"),
+        sequencer_address: ContractAddress::parse("0x1").expect("valid contract address"),
         gas_prices: BlockGasPrices {
             l1_gas: GasPricePerToken {
                 price_in_fri: 2,
@@ -177,7 +178,11 @@ fn sample_block(number: u64) -> StarknetBlock {
             },
         },
         protocol_version: Version::new(0, 14, 2),
-        transactions: vec![StarknetTransaction::new(format!("0x{number:x}"))],
+        transactions: vec![
+            StarknetTransaction::new(
+                TxHash::parse(format!("0x{number:x}")).expect("valid benchmark tx hash"),
+            ),
+        ],
     }
 }
 
@@ -191,27 +196,25 @@ fn run_dual_execution_benchmark(iterations: usize) -> Result<MetricResult, Strin
         MismatchPolicy::Halt,
     );
     backend
-        .set_verification_tip(iterations as u64 + 1)
-        .map_err(|error| error.to_string())?;
+        .with_verification_tip(iterations as u64 + 1, |backend| {
+            let mut state = InMemoryState::default();
+            let mut samples_us = Vec::with_capacity(iterations);
+            let started = Instant::now();
+            for idx in 0..iterations {
+                let block = sample_block(idx as u64 + 1);
+                let t0 = Instant::now();
+                let out = backend.execute_verified(&block, &mut state)?;
+                black_box(out);
+                samples_us.push(t0.elapsed().as_micros() as u64);
+            }
 
-    let mut state = InMemoryState::default();
-    let mut samples_us = Vec::with_capacity(iterations);
-    let started = Instant::now();
-    for idx in 0..iterations {
-        let block = sample_block(idx as u64 + 1);
-        let t0 = Instant::now();
-        let out = backend
-            .execute_verified(&block, &mut state)
-            .map_err(|error| error.to_string())?;
-        black_box(out);
-        samples_us.push(t0.elapsed().as_micros() as u64);
-    }
-
-    Ok(build_metric(
-        "dual_execute_verified",
-        samples_us,
-        started.elapsed(),
-    ))
+            Ok(build_metric(
+                "dual_execute_verified",
+                samples_us,
+                started.elapsed(),
+            ))
+        })
+        .map_err(|error| error.to_string())
 }
 
 fn run_notification_decode_benchmark(iterations: usize) -> Result<MetricResult, String> {
@@ -265,11 +268,16 @@ fn run_mcp_validation_benchmark(iterations: usize) -> Result<MetricResult, Strin
 
 fn build_metric(name: &'static str, mut samples_us: Vec<u64>, elapsed: Duration) -> MetricResult {
     samples_us.sort_unstable();
-    let len = samples_us.len().max(1);
+    let len = samples_us.len();
     let p50_us = percentile(&samples_us, 50);
     let p95_us = percentile(&samples_us, 95);
     let p99_us = percentile(&samples_us, 99);
-    let ops_per_sec = len as f64 / elapsed.as_secs_f64().max(1e-9);
+    let safe_elapsed = elapsed.as_secs_f64().max(1e-9);
+    let ops_per_sec = if len == 0 {
+        0.0
+    } else {
+        (len as f64 / safe_elapsed).min(1e9)
+    };
     MetricResult {
         name,
         p50_us,
@@ -308,11 +316,23 @@ fn env_u64(key: &str, default: u64) -> Result<u64, String> {
 
 fn env_f64(key: &str, default: f64) -> Result<f64, String> {
     match env::var(key) {
-        Ok(value) => value
-            .parse::<f64>()
-            .map_err(|error| format!("invalid {key}='{value}': {error}")),
+        Ok(value) => {
+            let parsed = value
+                .parse::<f64>()
+                .map_err(|error| format!("invalid {key}='{value}': {error}"))?;
+            validate_budget_f64(key, &value, parsed)
+        }
         Err(_) => Ok(default),
     }
+}
+
+fn validate_budget_f64(key: &str, raw: &str, value: f64) -> Result<f64, String> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!(
+            "invalid {key}='{raw}': must be a finite, non-negative number"
+        ));
+    }
+    Ok(value)
 }
 
 fn detect_kernel_release() -> String {
@@ -354,7 +374,9 @@ fn detect_mem_total_kib() -> Option<u64> {
 
 fn parse_cpu_model(cpuinfo: &str) -> Option<String> {
     for line in cpuinfo.lines() {
-        let (key, value) = line.split_once(':')?;
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
         if key.trim() == "model name" {
             let value = value.trim();
             if !value.is_empty() {
@@ -367,12 +389,16 @@ fn parse_cpu_model(cpuinfo: &str) -> Option<String> {
 
 fn parse_mem_total_kib(meminfo: &str) -> Option<u64> {
     for line in meminfo.lines() {
-        let (key, value) = line.split_once(':')?;
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
         if key.trim() != "MemTotal" {
             continue;
         }
-        let amount = value.split_whitespace().next()?;
-        return amount.parse::<u64>().ok();
+        let amount = value.split_whitespace().next();
+        if let Some(amount) = amount {
+            return amount.parse::<u64>().ok();
+        }
     }
     None
 }
@@ -384,9 +410,17 @@ fn print_metric(metric: &MetricResult) {
     );
 }
 
+fn validate_iterations(iterations: usize) -> Result<(), String> {
+    if iterations == 0 {
+        return Err("PASTIS_PERF_ITERATIONS must be greater than 0".to_string());
+    }
+    Ok(())
+}
+
 fn main() {
     let run = || -> Result<(), String> {
         let iterations = env_usize("PASTIS_PERF_ITERATIONS", DEFAULT_ITERATIONS)?;
+        validate_iterations(iterations)?;
         let budgets = PerfBudgets::from_env()?;
         let metadata = BenchmarkMetadata::collect(iterations);
 
@@ -469,11 +503,80 @@ model name\t: Example CPU 9000
     }
 
     #[test]
+    fn parses_cpu_model_ignores_malformed_lines() {
+        let cpuinfo = "\
+this line is malformed
+processor\t: 0
+model name\t: Example CPU 9001
+";
+        assert_eq!(
+            parse_cpu_model(cpuinfo),
+            Some("Example CPU 9001".to_string())
+        );
+    }
+
+    #[test]
     fn parses_mem_total_from_linux_meminfo() {
         let meminfo = "\
 MemTotal:       65843088 kB
 MemFree:        12345678 kB
 ";
         assert_eq!(parse_mem_total_kib(meminfo), Some(65_843_088));
+    }
+
+    #[test]
+    fn parses_mem_total_ignores_malformed_lines() {
+        let meminfo = "\
+This line is malformed
+MemTotal:       1024 kB
+";
+        assert_eq!(parse_mem_total_kib(meminfo), Some(1_024));
+    }
+
+    #[test]
+    fn build_metric_caps_unrealistic_ops_per_second() {
+        let metric = build_metric("demo", vec![1, 2, 3], Duration::from_nanos(1));
+        assert_eq!(metric.ops_per_sec, 1e9);
+    }
+
+    #[test]
+    fn build_metric_with_empty_samples_has_zero_throughput() {
+        let metric = build_metric("demo", Vec::new(), Duration::from_secs(1));
+        assert_eq!(metric.ops_per_sec, 0.0);
+        assert_eq!(metric.p50_us, 0);
+        assert_eq!(metric.p95_us, 0);
+        assert_eq!(metric.p99_us, 0);
+    }
+
+    #[test]
+    fn rejects_zero_iterations() {
+        let err = validate_iterations(0).expect_err("zero iterations must fail");
+        assert!(err.contains("PASTIS_PERF_ITERATIONS"));
+        assert!(validate_iterations(1).is_ok());
+    }
+
+    #[test]
+    fn validate_budget_f64_rejects_non_finite_and_negative_values() {
+        for (raw, parsed) in [
+            ("NaN", f64::NAN),
+            ("inf", f64::INFINITY),
+            ("-inf", f64::NEG_INFINITY),
+            ("-1", -1.0),
+        ] {
+            let err = validate_budget_f64("BUDGET", raw, parsed).expect_err("must reject");
+            assert!(err.contains("finite, non-negative"));
+        }
+    }
+
+    #[test]
+    fn validate_budget_f64_accepts_finite_non_negative_values() {
+        assert_eq!(
+            validate_budget_f64("BUDGET", "0", 0.0).expect("zero is valid"),
+            0.0
+        );
+        assert_eq!(
+            validate_budget_f64("BUDGET", "1.5", 1.5).expect("positive value is valid"),
+            1.5
+        );
     }
 }
