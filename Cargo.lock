@@ -4409,6 +4409,7 @@ dependencies = [
 name = "starknet-node-exex-btcfi"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "starknet-node-types",
 ]
 

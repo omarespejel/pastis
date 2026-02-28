@@ -7,3 +7,5 @@ publish = false
 [dependencies]
 starknet-node-types = { path = "../types" }
 
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -55,15 +55,27 @@ macro_rules! felt_identifier {
             }
         }
 
-        impl From<&str> for $name {
-            fn from(value: &str) -> Self {
-                Self(value.to_string())
+        impl FromStr for $name {
+            type Err = IdentifierValidationError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::parse(value)
             }
         }
 
-        impl From<String> for $name {
-            fn from(value: String) -> Self {
-                Self(value)
+        impl TryFrom<&str> for $name {
+            type Error = IdentifierValidationError;
+
+            fn try_from(value: &str) -> Result<Self, Self::Error> {
+                Self::parse(value)
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = IdentifierValidationError;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::parse(value)
             }
         }
 
@@ -251,9 +263,8 @@ impl StarknetTransaction {
     pub fn with_executable(
         hash: impl Into<TxHash>,
         executable: ExecutableStarknetTransaction,
-    ) -> Self {
+    ) -> Result<Self, TransactionValidationError> {
         Self::try_with_executable(hash, executable)
-            .expect("hash in StarknetTransaction::with_executable must match executable payload")
     }
 
     #[cfg(feature = "blockifier-adapter")]
@@ -559,14 +570,20 @@ impl InMemoryState {
         let mut staged_nonces = (*self.nonces).clone();
 
         for (contract, writes) in &diff.storage_diffs {
-            let normalized_contract = ContractAddress::from(
+            let normalized_contract = ContractAddress::parse(
                 canonicalize_felt_hex("contract_address", contract.as_ref()).map_err(|source| {
                     StateLimitError::InvalidStateDiff(StateDiffValidationError::InvalidIdentifier {
                         field: "contract_address",
                         source,
                     })
                 })?,
-            );
+            )
+            .map_err(|source| {
+                StateLimitError::InvalidStateDiff(StateDiffValidationError::InvalidIdentifier {
+                    field: "contract_address",
+                    source,
+                })
+            })?;
             let slots = staged_storage.entry(normalized_contract).or_default();
             for (key, value) in writes {
                 let normalized_key =
@@ -582,14 +599,20 @@ impl InMemoryState {
             }
         }
         for (contract, nonce) in &diff.nonces {
-            let normalized_contract = ContractAddress::from(
+            let normalized_contract = ContractAddress::parse(
                 canonicalize_felt_hex("contract_address", contract.as_ref()).map_err(|source| {
                     StateLimitError::InvalidStateDiff(StateDiffValidationError::InvalidIdentifier {
                         field: "contract_address",
                         source,
                     })
                 })?,
-            );
+            )
+            .map_err(|source| {
+                StateLimitError::InvalidStateDiff(StateDiffValidationError::InvalidIdentifier {
+                    field: "contract_address",
+                    source,
+                })
+            })?;
             staged_nonces.insert(normalized_contract, *nonce);
         }
 
@@ -631,10 +654,11 @@ impl StateReader for InMemoryState {
         contract: &ContractAddress,
         key: &str,
     ) -> Result<Option<StarknetFelt>, StateReadError> {
-        let contract = ContractAddress::from(
+        let contract = ContractAddress::parse(
             canonicalize_felt_hex("contract_address", contract.as_ref())
                 .map_err(|error| StateReadError::Backend(error.to_string()))?,
-        );
+        )
+        .map_err(|error| StateReadError::Backend(error.to_string()))?;
         let key = canonicalize_felt_hex("storage_key", key)
             .map_err(|error| StateReadError::Backend(error.to_string()))?;
         Ok(self
@@ -644,10 +668,11 @@ impl StateReader for InMemoryState {
     }
 
     fn nonce_of(&self, contract: &ContractAddress) -> Result<Option<StarknetFelt>, StateReadError> {
-        let contract = ContractAddress::from(
+        let contract = ContractAddress::parse(
             canonicalize_felt_hex("contract_address", contract.as_ref())
                 .map_err(|error| StateReadError::Backend(error.to_string()))?,
-        );
+        )
+        .map_err(|error| StateReadError::Backend(error.to_string()))?;
         Ok(self.nonces.get(&contract).copied())
     }
 }
@@ -655,7 +680,13 @@ impl StateReader for InMemoryState {
 impl MutableState for InMemoryState {
     fn set_storage(&mut self, contract: ContractAddress, key: String, value: StarknetFelt) {
         let contract = match canonicalize_felt_hex("contract_address", contract.as_ref()) {
-            Ok(value) => ContractAddress::from(value),
+            Ok(value) => match ContractAddress::parse(value) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    debug_assert!(false, "set_storage rejected canonical contract address: {error}");
+                    return;
+                }
+            },
             Err(error) => {
                 debug_assert!(
                     false,
@@ -679,7 +710,13 @@ impl MutableState for InMemoryState {
 
     fn set_nonce(&mut self, contract: ContractAddress, nonce: StarknetFelt) {
         let contract = match canonicalize_felt_hex("contract_address", contract.as_ref()) {
-            Ok(value) => ContractAddress::from(value),
+            Ok(value) => match ContractAddress::parse(value) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    debug_assert!(false, "set_nonce rejected canonical contract address: {error}");
+                    return;
+                }
+            },
             Err(error) => {
                 debug_assert!(
                     false,
@@ -729,25 +766,37 @@ mod tests {
     #[cfg(feature = "blockifier-adapter")]
     use starknet_api::transaction::TransactionHash;
 
+    fn parsed_tx_hash(raw: &str) -> TxHash {
+        TxHash::parse(raw).expect("valid tx hash")
+    }
+
+    fn raw_tx_hash(raw: &str) -> TxHash {
+        TxHash(raw.to_string())
+    }
+
+    fn raw_contract_address(raw: &str) -> ContractAddress {
+        ContractAddress(raw.to_string())
+    }
+
     #[test]
     fn applies_state_diff_into_state() {
         let mut state = InMemoryState::default();
         let mut diff = StarknetStateDiff::default();
         diff.storage_diffs
-            .entry(ContractAddress::from("0xabc"))
+            .entry(ContractAddress::parse("0xabc").expect("valid contract address"))
             .or_default()
             .insert("0x2".to_string(), StarknetFelt::from(7_u64));
         diff.nonces
-            .insert(ContractAddress::from("0xabc"), StarknetFelt::from(2_u64));
+            .insert(ContractAddress::parse("0xabc").expect("valid contract address"), StarknetFelt::from(2_u64));
 
         state.apply_state_diff(&diff).expect("valid state diff");
 
         assert_eq!(
-            state.get_storage(&ContractAddress::from("0xabc"), "0x2"),
+            state.get_storage(&ContractAddress::parse("0xabc").expect("valid contract address"), "0x2"),
             Ok(Some(StarknetFelt::from(7_u64)))
         );
         assert_eq!(
-            state.nonce_of(&ContractAddress::from("0xabc")),
+            state.nonce_of(&ContractAddress::parse("0xabc").expect("valid contract address")),
             Ok(Some(StarknetFelt::from(2_u64)))
         );
     }
@@ -756,18 +805,18 @@ mod tests {
     fn normalizes_equivalent_hex_encodings_for_state_keys() {
         let mut state = InMemoryState::default();
         state.set_storage(
-            ContractAddress::from("0x01"),
+            ContractAddress::parse("0x01").expect("valid contract address"),
             "0x0002".to_string(),
             StarknetFelt::from(9_u64),
         );
-        state.set_nonce(ContractAddress::from("0x0001"), StarknetFelt::from(3_u64));
+        state.set_nonce(ContractAddress::parse("0x0001").expect("valid contract address"), StarknetFelt::from(3_u64));
 
         assert_eq!(
-            state.get_storage(&ContractAddress::from("0x1"), "0x2"),
+            state.get_storage(&ContractAddress::parse("0x1").expect("valid contract address"), "0x2"),
             Ok(Some(StarknetFelt::from(9_u64)))
         );
         assert_eq!(
-            state.nonce_of(&ContractAddress::from("0x1")),
+            state.nonce_of(&ContractAddress::parse("0x1").expect("valid contract address")),
             Ok(Some(StarknetFelt::from(3_u64)))
         );
     }
@@ -776,18 +825,18 @@ mod tests {
     fn clone_shares_maps_until_first_mutation() {
         let mut state = InMemoryState::default();
         state.set_storage(
-            ContractAddress::from("0x1"),
+            ContractAddress::parse("0x1").expect("valid contract address"),
             "0x2".to_string(),
             StarknetFelt::from(9_u64),
         );
-        state.set_nonce(ContractAddress::from("0x1"), StarknetFelt::from(3_u64));
+        state.set_nonce(ContractAddress::parse("0x1").expect("valid contract address"), StarknetFelt::from(3_u64));
 
         let snapshot = state.clone();
         assert_eq!(Arc::as_ptr(&state.storage), Arc::as_ptr(&snapshot.storage));
         assert_eq!(Arc::as_ptr(&state.nonces), Arc::as_ptr(&snapshot.nonces));
 
         state.set_storage(
-            ContractAddress::from("0x1"),
+            ContractAddress::parse("0x1").expect("valid contract address"),
             "0x3".to_string(),
             StarknetFelt::from(11_u64),
         );
@@ -799,14 +848,14 @@ mod tests {
     fn rejects_blocks_with_too_many_transactions() {
         let mut txs = Vec::with_capacity(MAX_TRANSACTIONS_PER_BLOCK + 1);
         for i in 0..(MAX_TRANSACTIONS_PER_BLOCK + 1) {
-            txs.push(StarknetTransaction::new(format!("0x{i:x}")));
+            txs.push(StarknetTransaction::new(parsed_tx_hash(&format!("0x{i:x}"))));
         }
         let block = StarknetBlock {
             number: 1,
             parent_hash: "0x0".to_string(),
             state_root: "0x1".to_string(),
             timestamp: 1_700_000_001,
-            sequencer_address: ContractAddress::from("0x1"),
+            sequencer_address: ContractAddress::parse("0x1").expect("valid contract address"),
             gas_prices: BlockGasPrices {
                 l1_gas: GasPricePerToken {
                     price_in_fri: 1,
@@ -840,7 +889,7 @@ mod tests {
             writes.insert(format!("0x{:x}", i + 1), StarknetFelt::from(i as u64));
         }
         diff.storage_diffs
-            .insert(ContractAddress::from("0x1"), writes);
+            .insert(ContractAddress::parse("0x1").expect("valid contract address"), writes);
 
         let err = diff
             .validate()
@@ -855,7 +904,7 @@ mod tests {
     fn rejects_state_diffs_with_invalid_storage_keys() {
         let mut diff = StarknetStateDiff::default();
         diff.storage_diffs
-            .entry(ContractAddress::from("0x1"))
+            .entry(ContractAddress::parse("0x1").expect("valid contract address"))
             .or_default()
             .insert("not-a-felt".to_string(), StarknetFelt::from(1_u64));
 
@@ -873,7 +922,11 @@ mod tests {
 
     #[test]
     fn rejects_invalid_transaction_hashes() {
-        let tx = StarknetTransaction::new("not-a-hash");
+        let tx = StarknetTransaction {
+            hash: raw_tx_hash("not-a-hash"),
+            #[cfg(feature = "blockifier-adapter")]
+            executable: None,
+        };
         let err = tx.validate_hash().expect_err("must reject invalid felt");
         assert!(matches!(
             err,
@@ -884,7 +937,11 @@ mod tests {
     #[test]
     fn truncates_invalid_identifier_value_in_error_message() {
         let invalid = format!("0x{}", "g".repeat(120));
-        let tx = StarknetTransaction::new(invalid);
+        let tx = StarknetTransaction {
+            hash: raw_tx_hash(&invalid),
+            #[cfg(feature = "blockifier-adapter")]
+            executable: None,
+        };
         let err = tx.validate_hash().expect_err("must reject invalid felt");
         match err {
             IdentifierValidationError::InvalidHexFelt { value, .. } => {
@@ -898,7 +955,11 @@ mod tests {
 
     #[test]
     fn rejects_excessively_long_transaction_hash_input() {
-        let tx = StarknetTransaction::new(format!("0x{}", "a".repeat(MAX_FELT_INPUT_LEN + 1)));
+        let tx = StarknetTransaction {
+            hash: raw_tx_hash(&format!("0x{}", "a".repeat(MAX_FELT_INPUT_LEN + 1))),
+            #[cfg(feature = "blockifier-adapter")]
+            executable: None,
+        };
         let err = tx
             .validate_hash()
             .expect_err("must reject excessively long felt string");
@@ -909,14 +970,14 @@ mod tests {
     fn state_reader_rejects_invalid_lookup_identifiers() {
         let state = InMemoryState::default();
         let err = state
-            .get_storage(&ContractAddress::from("not-a-felt"), "0x1")
+            .get_storage(&raw_contract_address("not-a-felt"), "0x1")
             .expect_err("invalid contract identifier must fail");
         assert!(
             matches!(err, StateReadError::Backend(message) if message.contains("contract_address"))
         );
 
         let err = state
-            .get_storage(&ContractAddress::from("0x1"), "not-a-key")
+            .get_storage(&ContractAddress::parse("0x1").expect("valid contract address"), "not-a-key")
             .expect_err("invalid storage key must fail");
         assert!(matches!(err, StateReadError::Backend(message) if message.contains("storage_key")));
     }
@@ -928,7 +989,7 @@ mod tests {
             parent_hash: "0x0".to_string(),
             state_root: "0x1".to_string(),
             timestamp: 1_700_000_001,
-            sequencer_address: ContractAddress::from("0x1"),
+            sequencer_address: ContractAddress::parse("0x1").expect("valid contract address"),
             gas_prices: BlockGasPrices {
                 l1_gas: GasPricePerToken {
                     price_in_fri: 0,
@@ -944,7 +1005,7 @@ mod tests {
                 },
             },
             protocol_version: Version::parse("0.14.2").expect("valid version"),
-            transactions: vec![StarknetTransaction::new("0x1")],
+            transactions: vec![StarknetTransaction::new(parsed_tx_hash("0x1"))],
         };
 
         let err = block.validate().expect_err("must reject zero gas prices");
@@ -973,10 +1034,10 @@ mod tests {
             parent_hash: "0x0".to_string(),
             state_root: "0x1".to_string(),
             timestamp: 0,
-            sequencer_address: ContractAddress::from("0x1"),
+            sequencer_address: ContractAddress::parse("0x1").expect("valid contract address"),
             gas_prices,
             protocol_version: Version::parse("0.14.2").expect("valid version"),
-            transactions: vec![StarknetTransaction::new("0x1")],
+            transactions: vec![StarknetTransaction::new(parsed_tx_hash("0x1"))],
         };
         assert!(matches!(
             zero.validate().expect_err("zero timestamp must fail"),
@@ -1009,7 +1070,7 @@ mod tests {
         let tx =
             StarknetTransaction::try_with_executable("0xabc", ExecutableTx::L1Handler(executable))
                 .expect("matching hashes");
-        assert_eq!(tx.hash, "0xabc".into());
+        assert_eq!(tx.hash, parsed_tx_hash("0xabc"));
     }
 
     #[cfg(feature = "blockifier-adapter")]

@@ -34,9 +34,9 @@ use starknet_node_exex_btcfi::{
 use starknet_node_mcp_server::{McpRequest, McpResponse};
 use starknet_node_storage::{InMemoryStorage, StorageBackend};
 use starknet_node_types::{
-    BlockContext, BlockGasPrices, BuiltinStats, ContractAddress, ExecutionOutput, GasPricePerToken,
-    InMemoryState, MutableState, SimulationResult, StarknetBlock, StarknetFelt, StarknetReceipt,
-    StarknetStateDiff, StarknetTransaction, StateReader,
+    BlockContext, BlockGasPrices, BuiltinStats, ClassHash, ContractAddress, ExecutionOutput,
+    GasPricePerToken, InMemoryState, MutableState, SimulationResult, StarknetBlock, StarknetFelt,
+    StarknetReceipt, StarknetStateDiff, StarknetTransaction, StateReader, TxHash,
 };
 use tokio::net::TcpListener;
 use tokio::time::interval;
@@ -192,14 +192,14 @@ impl DemoRuntime {
 
         let wrapper = StandardWrapperMonitor::new(StandardWrapperConfig {
             wrapper: StandardWrapper::Wbtc,
-            token_contract: ContractAddress::from(WBTC_CONTRACT),
+            token_contract: ContractAddress::parse(WBTC_CONTRACT).expect("valid contract address"),
             total_supply_key: "0x1".to_string(),
             expected_supply_sats: 1_000_000,
             allowed_deviation_bps: 50,
         });
 
         let strkbtc = StrkBtcMonitor::new(StrkBtcMonitorConfig {
-            shielded_pool_contract: ContractAddress::from(STRKBTC_SHIELDED_POOL),
+            shielded_pool_contract: ContractAddress::parse(STRKBTC_SHIELDED_POOL).expect("valid contract address"),
             merkle_root_key: STRKBTC_MERKLE_ROOT_KEY.to_string(),
             commitment_count_key: STRKBTC_COMMITMENT_COUNT_KEY.to_string(),
             nullifier_count_key: STRKBTC_NULLIFIER_COUNT_KEY.to_string(),
@@ -291,7 +291,7 @@ impl DemoRuntime {
             1_000_000_u64 + (block_number % 2_000)
         };
         storage_diffs.insert(
-            ContractAddress::from(WBTC_CONTRACT),
+            ContractAddress::parse(WBTC_CONTRACT).expect("valid contract address"),
             BTreeMap::from([(
                 "0x1".to_string(),
                 starknet_node_types::StarknetFelt::from(wbtc_supply),
@@ -323,7 +323,7 @@ impl DemoRuntime {
         };
 
         storage_diffs.insert(
-            ContractAddress::from(STRKBTC_SHIELDED_POOL),
+            ContractAddress::parse(STRKBTC_SHIELDED_POOL).expect("valid contract address"),
             BTreeMap::from([
                 (
                     STRKBTC_MERKLE_ROOT_KEY.to_string(),
@@ -998,7 +998,7 @@ impl RealRuntime {
         let diagnostics = self.diagnostics()?;
         let mut notes = vec![format!(
             "Real mode connected to {}. BTCFi monitor is not configured; set PASTIS_MONITOR_STRKBTC_SHIELDED_POOL to enable it.",
-            self.client.rpc_url()
+            redact_rpc_url(self.client.rpc_url())
         )];
         if let Some(last_error) = diagnostics.last_error {
             notes.push(format!("Latest RPC error: {last_error}"));
@@ -1317,7 +1317,7 @@ async fn main() -> Result<(), String> {
         println!("demo mcp api key: {DEMO_API_KEY}");
     }
     if let Some(rpc_url) = &config.rpc_url {
-        println!("rpc url: {rpc_url}");
+        println!("rpc url: {}", redact_rpc_url(rpc_url));
     }
     println!("anomaly source: {anomaly_source}");
     axum::serve(listener, app)
@@ -1328,6 +1328,17 @@ async fn main() -> Result<(), String> {
 
 async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
+}
+
+fn redact_rpc_url(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
+        Ok(url) => {
+            let host = url.host_str().unwrap_or("unknown-host");
+            let port = url.port().map(|value| format!(":{value}")).unwrap_or_default();
+            format!("{}://{}{port}", url.scheme(), host)
+        }
+        Err(_) => "<invalid-rpc-url>".to_string(),
+    }
 }
 
 async fn status(
@@ -1573,7 +1584,7 @@ fn demo_block(number: u64) -> StarknetBlock {
         parent_hash: format!("0x{:x}", number.saturating_sub(1)),
         state_root: format!("0x{:x}", number.saturating_mul(17)),
         timestamp: 1_700_000_000 + number,
-        sequencer_address: ContractAddress::from("0x1234"),
+        sequencer_address: ContractAddress::parse("0x1234").expect("valid contract address"),
         gas_prices: BlockGasPrices {
             l1_gas: GasPricePerToken {
                 price_in_fri: 1,
@@ -1589,7 +1600,9 @@ fn demo_block(number: u64) -> StarknetBlock {
             },
         },
         protocol_version: Version::parse("0.14.2").expect("demo protocol version must be valid"),
-        transactions: vec![StarknetTransaction::new(format!("0x{number:x}"))],
+        transactions: vec![StarknetTransaction::new(
+            TxHash::parse(format!("0x{number:x}")).expect("valid demo tx hash"),
+        )],
     }
 }
 
@@ -1623,14 +1636,18 @@ fn ingest_block_from_fetch(local_number: u64, fetch: &RealFetch) -> Result<Stark
         .transaction_hashes
         .iter()
         .cloned()
-        .map(StarknetTransaction::new)
-        .collect();
+        .map(|hash| {
+            TxHash::parse(hash)
+                .map(StarknetTransaction::new)
+                .map_err(|error| format!("invalid replay tx hash: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let block = StarknetBlock {
         number: local_number,
         parent_hash,
         state_root,
         timestamp: replay.timestamp,
-        sequencer_address: ContractAddress::from(sequencer_address),
+        sequencer_address: ContractAddress::parse(sequencer_address).expect("valid contract address"),
         gas_prices: BlockGasPrices {
             l1_gas: GasPricePerToken {
                 price_in_fri: 1,
@@ -1822,7 +1839,7 @@ fn parse_real_btcfi_config_from_env() -> Result<Option<RealBtcfiConfig>, String>
     if let Ok(wbtc_contract) = env::var("PASTIS_MONITOR_WBTC_CONTRACT") {
         wrappers.push(StandardWrapperConfig {
             wrapper: StandardWrapper::Wbtc,
-            token_contract: ContractAddress::from(wbtc_contract),
+            token_contract: ContractAddress::parse(wbtc_contract).expect("valid contract address"),
             total_supply_key: env::var("PASTIS_MONITOR_WBTC_TOTAL_SUPPLY_KEY")
                 .unwrap_or_else(|_| "0x1".to_string()),
             expected_supply_sats: parse_env_u128(
@@ -1834,7 +1851,7 @@ fn parse_real_btcfi_config_from_env() -> Result<Option<RealBtcfiConfig>, String>
     }
 
     let strkbtc = StrkBtcMonitorConfig {
-        shielded_pool_contract: ContractAddress::from(strkbtc_pool),
+        shielded_pool_contract: ContractAddress::parse(strkbtc_pool).expect("valid contract address"),
         merkle_root_key: env::var("PASTIS_MONITOR_STRKBTC_MERKLE_ROOT_KEY")
             .unwrap_or_else(|_| STRKBTC_MERKLE_ROOT_KEY.to_string()),
         commitment_count_key: env::var("PASTIS_MONITOR_STRKBTC_COMMITMENT_COUNT_KEY")
@@ -2159,7 +2176,12 @@ fn parse_declared_classes(raw: &Value, diff: &mut StarknetStateDiff, warnings: &
             continue;
         };
         if let Some(class_hash) = canonicalize_hex_felt(class_hash_raw, "class hash", warnings) {
-            diff.declared_classes.push(class_hash.into());
+            match ClassHash::parse(&class_hash) {
+                Ok(parsed) => diff.declared_classes.push(parsed),
+                Err(error) => warnings.push(format!(
+                    "invalid canonical class hash `{class_hash}`: {error}"
+                )),
+            }
         }
     }
 }
@@ -2183,13 +2205,26 @@ fn parse_deprecated_declared_classes(
             continue;
         };
         if let Some(class_hash) = canonicalize_hex_felt(class_hash_raw, "class hash", warnings) {
-            diff.declared_classes.push(class_hash.into());
+            match ClassHash::parse(&class_hash) {
+                Ok(parsed) => diff.declared_classes.push(parsed),
+                Err(error) => warnings.push(format!(
+                    "invalid canonical class hash `{class_hash}`: {error}"
+                )),
+            }
         }
     }
 }
 
 fn parse_contract_address(raw: &str, warnings: &mut Vec<String>) -> Option<ContractAddress> {
-    canonicalize_hex_felt(raw, "contract address", warnings).map(ContractAddress::from)
+    canonicalize_hex_felt(raw, "contract address", warnings).and_then(|value| {
+        ContractAddress::parse(value).map_or_else(
+            |error| {
+                warnings.push(format!("invalid canonical contract address `{raw}`: {error}"));
+                None
+            },
+            Some,
+        )
+    })
 }
 
 fn canonicalize_hex_felt(raw: &str, field: &str, warnings: &mut Vec<String>) -> Option<String> {
@@ -3335,28 +3370,30 @@ mod tests {
     fn state_diff_summary_fingerprint_is_order_stable() {
         let mut diff_a = StarknetStateDiff::default();
         diff_a.storage_diffs.insert(
-            ContractAddress::from("0x2"),
+            ContractAddress::parse("0x2").expect("valid contract address"),
             BTreeMap::from([
                 ("0x2".to_string(), StarknetFelt::from(2_u64)),
                 ("0x1".to_string(), StarknetFelt::from(1_u64)),
             ]),
         );
         diff_a.storage_diffs.insert(
-            ContractAddress::from("0x1"),
+            ContractAddress::parse("0x1").expect("valid contract address"),
             BTreeMap::from([("0x3".to_string(), StarknetFelt::from(3_u64))]),
         );
         diff_a
             .nonces
-            .insert(ContractAddress::from("0x1"), StarknetFelt::from(9_u64));
-        diff_a.declared_classes.push("0xa".into());
+            .insert(ContractAddress::parse("0x1").expect("valid contract address"), StarknetFelt::from(9_u64));
+        diff_a
+            .declared_classes
+            .push(ClassHash::parse("0xa").expect("valid class hash"));
 
         let mut diff_b = StarknetStateDiff::default();
         diff_b.storage_diffs.insert(
-            ContractAddress::from("0x1"),
+            ContractAddress::parse("0x1").expect("valid contract address"),
             BTreeMap::from([("0x3".to_string(), StarknetFelt::from(3_u64))]),
         );
         diff_b.storage_diffs.insert(
-            ContractAddress::from("0x2"),
+            ContractAddress::parse("0x2").expect("valid contract address"),
             BTreeMap::from([
                 ("0x1".to_string(), StarknetFelt::from(1_u64)),
                 ("0x2".to_string(), StarknetFelt::from(2_u64)),
@@ -3364,8 +3401,10 @@ mod tests {
         );
         diff_b
             .nonces
-            .insert(ContractAddress::from("0x1"), StarknetFelt::from(9_u64));
-        diff_b.declared_classes.push("0xa".into());
+            .insert(ContractAddress::parse("0x1").expect("valid contract address"), StarknetFelt::from(9_u64));
+        diff_b
+            .declared_classes
+            .push(ClassHash::parse("0xa").expect("valid class hash"));
 
         assert_eq!(summarize_state_diff(&diff_a), summarize_state_diff(&diff_b));
     }
@@ -3449,13 +3488,13 @@ mod tests {
         assert!(warnings.is_empty());
         assert_eq!(
             diff.storage_diffs
-                .get(&ContractAddress::from("0x111"))
+                .get(&ContractAddress::parse("0x111").expect("valid contract address"))
                 .and_then(|writes| writes.get("0x1"))
                 .copied(),
             Some(StarknetFelt::from(2_u64))
         );
         assert_eq!(
-            diff.nonces.get(&ContractAddress::from("0x111")).copied(),
+            diff.nonces.get(&ContractAddress::parse("0x111").expect("valid contract address")).copied(),
             Some(StarknetFelt::from(9_u64))
         );
         assert_eq!(diff.declared_classes.len(), 2);
@@ -3482,13 +3521,13 @@ mod tests {
         assert!(!warnings.is_empty());
         assert_eq!(
             diff.storage_diffs
-                .get(&ContractAddress::from("0x222"))
+                .get(&ContractAddress::parse("0x222").expect("valid contract address"))
                 .and_then(|writes| writes.get("0x10"))
                 .copied(),
             Some(StarknetFelt::from(0x20_u64))
         );
         assert_eq!(
-            diff.nonces.get(&ContractAddress::from("0x222")).copied(),
+            diff.nonces.get(&ContractAddress::parse("0x222").expect("valid contract address")).copied(),
             Some(StarknetFelt::from(5_u64))
         );
     }
@@ -3677,9 +3716,10 @@ mod tests {
         assert_eq!(state_diff.nonces.len(), 3);
         assert!(state_diff.declared_classes.is_empty());
 
-        let expected_contract = ContractAddress::from(
+        let expected_contract = ContractAddress::parse(
             "0x2dd3209b948554421cdb9bb8791c69d92154aa279e7eb52e9647335072a132d",
-        );
+        )
+        .expect("valid contract address");
         let expected_key = "0x6dfe00e4de355a406222fd8f14f4fa4a266ad915291694ae2827ed3b10b8d1";
         let expected_value = StarknetFelt::from_str("0x69a2dee7").expect("valid felt");
         assert_eq!(
@@ -3761,9 +3801,10 @@ mod tests {
         assert_eq!(state_diff.nonces.len(), 6);
         assert!(state_diff.declared_classes.is_empty());
 
-        let expected_contract = ContractAddress::from(
+        let expected_contract = ContractAddress::parse(
             "0x7229d1454093674673a530cd0d37beef3fc0f1b3116d95c62c5c032f1827d87",
-        );
+        )
+        .expect("valid contract address");
         let expected_key = "0x333aaabd0e6d8fa946806a7af3989c1138cc653163215838c0ef3a9a7f60018";
         let expected_value = StarknetFelt::from_str("0x802ddac7").expect("valid felt");
         assert_eq!(
@@ -3950,9 +3991,10 @@ mod tests {
             .storage
             .get_state_reader(3)
             .expect("state reader at block 3 should exist");
-        let contract = ContractAddress::from(
+        let contract = ContractAddress::parse(
             "0x4718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
-        );
+        )
+        .expect("valid contract address");
         let key = "0xa93b2f657f711d43133241be6c27adda9539a298e34d644a2c37106a92d49d";
         let expected = StarknetFelt::from_str("0x24188c710b6bd481c0").expect("valid fixture felt");
         assert_eq!(

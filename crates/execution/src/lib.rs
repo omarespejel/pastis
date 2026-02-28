@@ -396,7 +396,10 @@ impl DualExecutionBackend {
                 // Reuse a long-lived verification shadow to avoid cloning full state per block.
                 let mut fast_state = self.take_or_seed_shadow(state)?;
                 let fast_output = fast.execute_block(block, fast_state.as_mut())?;
-                let canonical_output = self.canonical.execute_block(block, state)?;
+                let mut canonical_state = state.boxed_clone();
+                let canonical_output = self
+                    .canonical
+                    .execute_block(block, canonical_state.as_mut())?;
 
                 self.with_metrics(|metrics| {
                     metrics.fast_executions += 1;
@@ -412,22 +415,30 @@ impl DualExecutionBackend {
                     );
                 }
                 if outputs_match {
+                    Self::apply_state_diff(state, &canonical_output.state_diff);
                     self.store_shadow(fast_state)?;
                     return Ok(canonical_output);
                 }
 
                 self.with_metrics(|metrics| metrics.mismatches += 1)?;
-                self.reset_shadow_from_state(state)?;
-
                 match self.mismatch_policy {
-                    MismatchPolicy::WarnAndFallback => Ok(canonical_output),
-                    MismatchPolicy::Halt => Err(ExecutionError::Halted),
+                    MismatchPolicy::WarnAndFallback => {
+                        Self::apply_state_diff(state, &canonical_output.state_diff);
+                        self.reset_shadow_from_state(state)?;
+                        Ok(canonical_output)
+                    }
+                    MismatchPolicy::Halt => {
+                        self.reset_shadow_from_state(state)?;
+                        Err(ExecutionError::Halted)
+                    }
                     MismatchPolicy::CooldownThenRetry { cooldown_blocks } => {
+                        Self::apply_state_diff(state, &canonical_output.state_diff);
                         let mut cooldown = self
                             .cooldown_remaining
                             .lock()
                             .map_err(|_| Self::poisoned_lock("cooldown"))?;
                         *cooldown = cooldown_blocks;
+                        self.reset_shadow_from_state(state)?;
                         Ok(canonical_output)
                     }
                 }
@@ -708,7 +719,8 @@ impl BlockifierStateReader for BlockifierStateReaderAdapter {
             .map_err(|_| StateError::StateReadError("state snapshot mutex poisoned".to_string()))?;
         let contract_felt: BlockifierFelt = contract_address.into();
         let key_felt: BlockifierFelt = key.into();
-        let contract = starknet_node_types::ContractAddress::from(format!("{:#x}", contract_felt));
+        let contract = starknet_node_types::ContractAddress::parse(format!("{:#x}", contract_felt))
+            .expect("valid contract address");
         let value = state
             .get_storage(&contract, &format!("{:#x}", key_felt))
             .map_err(|error| StateError::StateReadError(error.to_string()))?
@@ -725,7 +737,8 @@ impl BlockifierStateReader for BlockifierStateReaderAdapter {
             .lock()
             .map_err(|_| StateError::StateReadError("state snapshot mutex poisoned".to_string()))?;
         let contract_felt: BlockifierFelt = contract_address.into();
-        let contract = starknet_node_types::ContractAddress::from(format!("{:#x}", contract_felt));
+        let contract = starknet_node_types::ContractAddress::parse(format!("{:#x}", contract_felt))
+            .expect("valid contract address");
         let nonce = state
             .nonce_of(&contract)
             .map_err(|error| StateError::StateReadError(error.to_string()))?
@@ -783,7 +796,8 @@ impl BlockifierStateReader for BlockifierReadOnlyStateAdapter<'_> {
     ) -> Result<BlockifierFelt, StateError> {
         let contract_felt: BlockifierFelt = contract_address.into();
         let key_felt: BlockifierFelt = key.into();
-        let contract = starknet_node_types::ContractAddress::from(format!("{:#x}", contract_felt));
+        let contract = starknet_node_types::ContractAddress::parse(format!("{:#x}", contract_felt))
+            .expect("valid contract address");
         let value = self
             .state
             .get_storage(&contract, &format!("{:#x}", key_felt))
@@ -797,7 +811,8 @@ impl BlockifierStateReader for BlockifierReadOnlyStateAdapter<'_> {
         contract_address: BlockifierContractAddress,
     ) -> Result<BlockifierNonce, StateError> {
         let contract_felt: BlockifierFelt = contract_address.into();
-        let contract = starknet_node_types::ContractAddress::from(format!("{:#x}", contract_felt));
+        let contract = starknet_node_types::ContractAddress::parse(format!("{:#x}", contract_felt))
+            .expect("valid contract address");
         let nonce = self
             .state
             .nonce_of(&contract)
@@ -1215,8 +1230,11 @@ impl ExecutionBackend for BlockifierVmBackend {
             let mut state_diff = starknet_node_types::StarknetStateDiff::default();
             for (address, writes) in summary.state_diff.storage_updates {
                 let contract_felt: BlockifierFelt = address.into();
-                let contract =
-                    starknet_node_types::ContractAddress::from(format!("{:#x}", contract_felt));
+                let contract = starknet_node_types::ContractAddress::parse(format!(
+                    "{:#x}",
+                    contract_felt
+                ))
+                .expect("valid contract address");
                 let contract_writes = state_diff.storage_diffs.entry(contract).or_default();
                 for (key, value) in writes {
                     let key_felt: BlockifierFelt = key.into();
@@ -1229,14 +1247,18 @@ impl ExecutionBackend for BlockifierVmBackend {
             for (address, nonce) in summary.state_diff.address_to_nonce {
                 let contract_felt: BlockifierFelt = address.into();
                 state_diff.nonces.insert(
-                    format!("{:#x}", contract_felt).into(),
+                    starknet_node_types::ContractAddress::parse(format!("{:#x}", contract_felt))
+                        .expect("valid contract address"),
                     blockifier_felt_to_node_felt(nonce.0, "state_diff.nonces")?,
                 );
             }
             for class_hash in summary.state_diff.class_hash_to_compiled_class_hash.keys() {
                 state_diff
                     .declared_classes
-                    .push(format!("{:#x}", class_hash.0).into());
+                    .push(
+                        starknet_node_types::ClassHash::parse(format!("{:#x}", class_hash.0))
+                            .expect("valid class hash"),
+                    );
             }
             state_diff.validate().map_err(|error| {
                 ExecutionError::Backend(format!("invalid blockifier state diff output: {error}"))
@@ -1409,8 +1431,16 @@ mod tests {
             _block: &StarknetBlock,
             state: &mut dyn MutableState,
         ) -> Result<ExecutionOutput, ExecutionError> {
-            state.set_storage(ContractAddress::from("0x1"), "0x2".to_string(), self.value);
-            Ok(output(self.gas))
+            let contract = ContractAddress::parse("0x1").expect("valid contract address");
+            let key = "0x2".to_string();
+            state.set_storage(contract.clone(), key.clone(), self.value);
+            let mut out = output(self.gas);
+            out.state_diff
+                .storage_diffs
+                .entry(contract)
+                .or_default()
+                .insert(key, self.value);
+            Ok(out)
         }
 
         fn simulate_tx(
@@ -1501,10 +1531,13 @@ mod tests {
             parent_hash: format!("0x{:x}", number.saturating_sub(1)),
             state_root: format!("0x{number:x}"),
             timestamp: 1_700_000_000 + number,
-            sequencer_address: ContractAddress::from("0x1"),
+            sequencer_address: ContractAddress::parse("0x1").expect("valid contract address"),
             gas_prices: sample_gas_prices(),
             protocol_version: Version::parse(version).expect("valid version"),
-            transactions: vec![StarknetTransaction::new(format!("0x{number:x}"))],
+            transactions: vec![StarknetTransaction::new(
+                starknet_node_types::TxHash::parse(format!("0x{number:x}"))
+                    .expect("valid tx hash"),
+            )],
         }
     }
 
@@ -1523,7 +1556,7 @@ mod tests {
             parent_hash: format!("0x{:x}", number.saturating_sub(1)),
             state_root: format!("0x{number:x}"),
             timestamp: 1_700_000_000 + number,
-            sequencer_address: ContractAddress::from("0x1"),
+            sequencer_address: ContractAddress::parse("0x1").expect("valid contract address"),
             gas_prices: sample_gas_prices(),
             protocol_version: Version::parse(version).expect("valid version"),
             transactions: Vec::new(),
@@ -1533,7 +1566,8 @@ mod tests {
     fn output(gas: u64) -> ExecutionOutput {
         ExecutionOutput {
             receipts: vec![StarknetReceipt {
-                tx_hash: format!("0x{gas:x}").into(),
+                tx_hash: starknet_node_types::TxHash::parse(format!("0x{gas:x}"))
+                    .expect("valid tx hash"),
                 execution_status: true,
                 events: gas,
                 gas_consumed: gas,
@@ -1557,6 +1591,7 @@ mod tests {
             TransactionHash(BlockifierFelt::from_str(hash).expect("valid tx hash"));
 
         StarknetTransaction::with_executable(hash.to_string(), ExecutableTx::L1Handler(executable))
+            .expect("matching executable hash")
     }
 
     #[cfg(feature = "blockifier-adapter")]
@@ -1578,6 +1613,7 @@ mod tests {
             hash.to_string(),
             ExecutableTx::Account(ExecutableAccountTransaction::Invoke(executable)),
         )
+        .expect("matching executable hash")
     }
 
     #[cfg(feature = "blockifier-adapter")]
@@ -1974,7 +2010,7 @@ mod tests {
             .expect("fallback");
         assert_eq!(result.receipts[0].gas_consumed, 7);
         assert_eq!(
-            state.get_storage(&ContractAddress::from("0x1"), "0x2"),
+            state.get_storage(&ContractAddress::parse("0x1").expect("valid contract address"), "0x2"),
             Ok(Some(StarknetFelt::from(999_u64)))
         );
     }
@@ -2017,7 +2053,7 @@ mod tests {
     }
 
     #[test]
-    fn dual_verification_reuses_shadow_state_across_blocks() {
+    fn dual_verification_clones_state_for_halt_safety() {
         let fast = ScriptedBackend::new(
             "fast",
             BTreeMap::from([(1, output(7)), (2, output(8))]),
@@ -2046,7 +2082,9 @@ mod tests {
             .execute_verified(&block(2, "0.14.2"), &mut state)
             .expect("second block");
 
-        assert_eq!(clone_count.load(Ordering::SeqCst), 1);
+        // One clone seeds fast shadow; canonical verification clones per block so Halt can fail
+        // without mutating live state.
+        assert_eq!(clone_count.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -2064,7 +2102,9 @@ mod tests {
             MismatchPolicy::WarnAndFallback,
         );
         let state = InMemoryState::default();
-        let tx = StarknetTransaction::new("0xabc");
+        let tx = StarknetTransaction::new(
+            starknet_node_types::TxHash::parse("0xabc").expect("valid tx hash"),
+        );
         let context = BlockContext {
             block_number: 1,
             protocol_version: Version::parse("0.14.2").expect("valid version"),
@@ -2092,7 +2132,9 @@ mod tests {
             MismatchPolicy::WarnAndFallback,
         );
         let state = InMemoryState::default();
-        let tx = StarknetTransaction::new("0xabc");
+        let tx = StarknetTransaction::new(
+            starknet_node_types::TxHash::parse("0xabc").expect("valid tx hash"),
+        );
         let context = BlockContext {
             block_number: 1,
             protocol_version: Version::parse("0.14.2").expect("valid version"),
@@ -2281,7 +2323,7 @@ mod tests {
             parent_hash: "0xb".to_string(),
             state_root: "0xc".to_string(),
             timestamp: 1_700_000_012,
-            sequencer_address: ContractAddress::from("0x1"),
+            sequencer_address: ContractAddress::parse("0x1").expect("valid contract address"),
             gas_prices: sample_gas_prices(),
             protocol_version: Version::parse("0.14.2").expect("valid version"),
             transactions: vec![executable_account_invoke_tx("0x123")],
@@ -2370,7 +2412,7 @@ mod tests {
             parent_hash: "0xb".to_string(),
             state_root: "0xc".to_string(),
             timestamp: 1_700_000_012,
-            sequencer_address: ContractAddress::from("0x1"),
+            sequencer_address: ContractAddress::parse("0x1").expect("valid contract address"),
             gas_prices: sample_gas_prices(),
             protocol_version: Version::parse("0.14.2").expect("valid version"),
             transactions: vec![executable_l1_handler_tx("0xabc")],
@@ -2380,7 +2422,10 @@ mod tests {
             .execute_block(&block, &mut state)
             .expect("execute non-empty block");
         assert_eq!(output.receipts.len(), 1);
-        assert_eq!(output.receipts[0].tx_hash, "0xabc".into());
+        assert_eq!(
+            output.receipts[0].tx_hash,
+            starknet_node_types::TxHash::parse("0xabc").expect("valid tx hash")
+        );
         assert!(!output.receipts[0].execution_status);
     }
 
@@ -2411,7 +2456,10 @@ mod tests {
         let simulation = backend
             .simulate_tx(&tx, &state, &context(12, "0.14.2"))
             .expect("simulate tx");
-        assert_eq!(simulation.receipt.tx_hash, "0xabc".into());
+        assert_eq!(
+            simulation.receipt.tx_hash,
+            starknet_node_types::TxHash::parse("0xabc").expect("valid tx hash")
+        );
         assert_eq!(
             simulation.estimated_fee,
             u128::from(simulation.receipt.gas_consumed)

@@ -188,7 +188,7 @@ mod tests {
             parent_hash: format!("0x{:x}", number.saturating_sub(1)),
             state_root: format!("0x{:x}", number),
             timestamp: 1_700_000_000 + number,
-            sequencer_address: ContractAddress::from("0x1"),
+            sequencer_address: ContractAddress::parse("0x1").expect("valid contract address"),
             gas_prices: BlockGasPrices {
                 l1_gas: GasPricePerToken {
                     price_in_fri: 1,
@@ -277,7 +277,7 @@ mod tests {
         let btcfi = Mutex::new(BtcfiExEx::new(
             Vec::<StandardWrapperMonitor>::new(),
             StrkBtcMonitor::new(starknet_node_exex_btcfi::StrkBtcMonitorConfig {
-                shielded_pool_contract: ContractAddress::from("0x222"),
+                shielded_pool_contract: ContractAddress::parse("0x222").expect("valid contract address"),
                 merkle_root_key: "0x10".to_string(),
                 commitment_count_key: "0x11".to_string(),
                 nullifier_count_key: "0x12".to_string(),

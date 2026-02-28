@@ -572,7 +572,8 @@ fn apollo_felt_to_node_felt(value: ApolloFelt) -> Result<StarknetFelt, StorageEr
 fn map_thin_state_diff(diff: ApolloThinStateDiff) -> Result<StarknetStateDiff, StorageError> {
     let mut mapped = StarknetStateDiff::default();
     for (address, writes) in diff.storage_diffs {
-        let contract = ContractAddress::from(format!("{:#x}", address.0.key()));
+        let contract = ContractAddress::parse(format!("{:#x}", address.0.key()))
+            .expect("valid contract address");
         let mapped_writes = mapped.storage_diffs.entry(contract).or_default();
         for (key, value) in writes {
             mapped_writes.insert(
@@ -583,19 +584,26 @@ fn map_thin_state_diff(diff: ApolloThinStateDiff) -> Result<StarknetStateDiff, S
     }
     for (address, nonce) in diff.nonces {
         mapped.nonces.insert(
-            format!("{:#x}", address.0.key()).into(),
+            ContractAddress::parse(format!("{:#x}", address.0.key()))
+                .expect("valid contract address"),
             apollo_felt_to_node_felt(nonce.0)?,
         );
     }
     for class_hash in diff.class_hash_to_compiled_class_hash.keys() {
         mapped
             .declared_classes
-            .push(format!("{:#x}", class_hash.0).into());
+            .push(
+                starknet_node_types::ClassHash::parse(format!("{:#x}", class_hash.0))
+                    .expect("valid class hash"),
+            );
     }
     for class_hash in &diff.deprecated_declared_classes {
         mapped
             .declared_classes
-            .push(format!("{:#x}", class_hash.0).into());
+            .push(
+                starknet_node_types::ClassHash::parse(format!("{:#x}", class_hash.0))
+                    .expect("valid class hash"),
+            );
     }
     Ok(mapped)
 }
@@ -744,14 +752,23 @@ impl StorageBackend for ApolloStorageAdapter {
             .map_err(|error| StorageError::Apollo(error.to_string()))?
             .unwrap_or_default()
             .into_iter()
-            .map(|hash| StarknetTransaction::new(format!("{:#x}", hash.0)))
+            .map(|hash| {
+                StarknetTransaction::new(
+                    starknet_node_types::TxHash::parse(format!("{:#x}", hash.0))
+                        .expect("valid tx hash"),
+                )
+            })
             .collect();
         Ok(Some(StarknetBlock {
             number: number.0,
             parent_hash: format!("{:#x}", header_without_hash.parent_hash.0),
             state_root: format!("{:#x}", header_without_hash.state_root.0),
             timestamp: header_without_hash.timestamp.0,
-            sequencer_address: format!("{:#x}", header_without_hash.sequencer.0.0.key()).into(),
+            sequencer_address: ContractAddress::parse(format!(
+                "{:#x}",
+                header_without_hash.sequencer.0.0.key()
+            ))
+            .expect("valid contract address"),
             gas_prices: BlockGasPrices {
                 l1_gas,
                 l1_data_gas,
@@ -794,8 +811,6 @@ impl StorageBackend for ApolloStorageAdapter {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use semver::Version;
     use starknet_node_types::{
         BlockGasPrices, ContractAddress, GasPricePerToken, StarknetFelt, StarknetTransaction,
@@ -874,7 +889,7 @@ mod tests {
             parent_hash: format!("0x{:x}", number.saturating_sub(1)),
             state_root: format!("0x{:x}", number),
             timestamp: 1_700_000_000 + number,
-            sequencer_address: ContractAddress::from("0x1"),
+            sequencer_address: ContractAddress::parse("0x1").expect("valid contract address"),
             gas_prices: BlockGasPrices {
                 l1_gas: GasPricePerToken {
                     price_in_fri: 2,
@@ -890,14 +905,17 @@ mod tests {
                 },
             },
             protocol_version: Version::parse("0.14.2").expect("valid semver"),
-            transactions: vec![StarknetTransaction::new(format!("0x{number:x}"))],
+            transactions: vec![StarknetTransaction::new(
+                starknet_node_types::TxHash::parse(format!("0x{number:x}"))
+                    .expect("valid tx hash"),
+            )],
         }
     }
 
     fn diff_with_balance(contract: &str, value: u64) -> StarknetStateDiff {
         let mut diff = StarknetStateDiff::default();
         diff.storage_diffs
-            .entry(ContractAddress::from(contract))
+            .entry(ContractAddress::parse(contract).expect("valid contract address"))
             .or_default()
             .insert("0x2".to_string(), StarknetFelt::from(value));
         diff
@@ -914,7 +932,7 @@ mod tests {
 
         let reader = storage.get_state_reader(1).expect("state reader");
         assert_eq!(
-            reader.get_storage(&ContractAddress::from("0xabc"), "0x2"),
+            reader.get_storage(&ContractAddress::parse("0xabc").expect("valid contract address"), "0x2"),
             Ok(Some(StarknetFelt::from(11_u64)))
         );
     }
@@ -963,7 +981,9 @@ mod tests {
         let mut storage = InMemoryStorage::new(InMemoryState::default());
         let mut diff = StarknetStateDiff::default();
         diff.storage_diffs
-            .insert(ContractAddress::from("bad-contract"), BTreeMap::new());
+            .entry(ContractAddress::parse("0xabc").expect("valid contract address"))
+            .or_default()
+            .insert("not-a-felt".to_string(), StarknetFelt::from(1_u64));
 
         let err = storage
             .insert_block(block(1), diff)
@@ -1020,7 +1040,7 @@ mod tests {
         let storage = writer.clone();
         let handle = std::thread::spawn(move || {
             let reader = storage.get_state_reader(1).expect("state reader");
-            reader.get_storage(&ContractAddress::from("0xabc"), "0x2")
+            reader.get_storage(&ContractAddress::parse("0xabc").expect("valid contract address"), "0x2")
         });
 
         assert_eq!(
@@ -1211,9 +1231,11 @@ mod apollo_tests {
             .map_err(|error| StorageError::Apollo(error.to_string()))?;
 
         Ok((
-            format!("{:#x}", contract.0.key()).into(),
+            ContractAddress::parse(format!("{:#x}", contract.0.key()))
+                .expect("valid contract address"),
             format!("{:#x}", key.0.key()),
-            format!("{:#x}", class_hash.0).into(),
+            starknet_node_types::ClassHash::parse(format!("{:#x}", class_hash.0))
+                .expect("valid class hash"),
         ))
     }
 
@@ -1408,7 +1430,10 @@ mod apollo_tests {
             .expect("get block")
             .expect("block exists");
         assert_eq!(block.transactions.len(), 1);
-        assert_eq!(block.transactions[0].hash, "0xabc".into());
+        assert_eq!(
+            block.transactions[0].hash,
+            starknet_node_types::TxHash::parse("0xabc").expect("valid tx hash")
+        );
     }
 
     #[test]

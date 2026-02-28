@@ -11,5 +11,5 @@ export PASTIS_BUDGET_DUAL_EXECUTE_MIN_OPS_PER_SEC="${PASTIS_BUDGET_DUAL_EXECUTE_
 
 (
   cd "${ROOT_DIR}"
-  cargo run -p starknet-node --bin perf-budget
+  cargo run --locked --release -p starknet-node --bin perf-budget
 )

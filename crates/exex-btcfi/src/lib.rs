@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::str::FromStr;
 
 use starknet_node_types::{BlockNumber, ContractAddress, StarknetFelt, StarknetStateDiff};
 
@@ -88,7 +89,7 @@ impl StandardWrapperMonitor {
         block_number: BlockNumber,
         diff: &StarknetStateDiff,
     ) -> Vec<BtcfiAnomaly> {
-        let Some(writes) = diff.storage_diffs.get(&self.config.token_contract) else {
+        let Some(writes) = find_writes_for_contract(diff, &self.config.token_contract) else {
             return Vec::new();
         };
         let Some(total_supply_raw) = writes.get(&self.config.total_supply_key) else {
@@ -169,7 +170,8 @@ impl StrkBtcMonitor {
         block_number: BlockNumber,
         diff: &StarknetStateDiff,
     ) -> Vec<BtcfiAnomaly> {
-        let Some(writes) = diff.storage_diffs.get(&self.config.shielded_pool_contract) else {
+        let Some(writes) = find_writes_for_contract(diff, &self.config.shielded_pool_contract)
+        else {
             return Vec::new();
         };
         let mut anomalies = Vec::new();
@@ -359,6 +361,22 @@ impl StrkBtcMonitor {
     }
 }
 
+fn canonical_felt_hex(raw: &str) -> Option<String> {
+    StarknetFelt::from_str(raw)
+        .ok()
+        .map(|felt| format!("{:#x}", felt))
+}
+
+fn find_writes_for_contract<'a>(
+    diff: &'a StarknetStateDiff,
+    target: &ContractAddress,
+) -> Option<&'a BTreeMap<String, StarknetFelt>> {
+    let target = canonical_felt_hex(target.as_ref())?;
+    diff.storage_diffs.iter().find_map(|(contract, writes)| {
+        (canonical_felt_hex(contract.as_ref()).as_deref() == Some(target.as_str())).then_some(writes)
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BtcfiExEx {
     wrappers: Vec<StandardWrapperMonitor>,
@@ -439,12 +457,14 @@ fn felt_is_zero(value: &StarknetFelt) -> bool {
 mod tests {
     use std::collections::BTreeMap;
 
+    use serde_json::json;
+
     use super::*;
 
     fn wrapper_config() -> StandardWrapperConfig {
         StandardWrapperConfig {
             wrapper: StandardWrapper::Wbtc,
-            token_contract: ContractAddress::from("0x111"),
+            token_contract: ContractAddress::parse("0x111").expect("valid contract address"),
             total_supply_key: "0x1".to_string(),
             expected_supply_sats: 1_000_000,
             allowed_deviation_bps: 50,
@@ -453,7 +473,7 @@ mod tests {
 
     fn strkbtc_config() -> StrkBtcMonitorConfig {
         StrkBtcMonitorConfig {
-            shielded_pool_contract: ContractAddress::from("0x222"),
+            shielded_pool_contract: ContractAddress::parse("0x222").expect("valid contract address"),
             merkle_root_key: "0x10".to_string(),
             commitment_count_key: "0x11".to_string(),
             nullifier_count_key: "0x12".to_string(),
@@ -485,7 +505,7 @@ mod tests {
     fn standard_wrapper_monitor_emits_supply_mismatch() {
         let monitor = StandardWrapperMonitor::new(wrapper_config());
         let diff = diff_with_write(
-            ContractAddress::from("0x111"),
+            ContractAddress::parse("0x111").expect("valid contract address"),
             "0x1",
             StarknetFelt::from(1_030_000_u64),
         );
@@ -506,7 +526,7 @@ mod tests {
     fn standard_wrapper_monitor_ignores_small_supply_drift() {
         let monitor = StandardWrapperMonitor::new(wrapper_config());
         let diff = diff_with_write(
-            ContractAddress::from("0x111"),
+            ContractAddress::parse("0x111").expect("valid contract address"),
             "0x1",
             StarknetFelt::from(1_003_000_u64),
         );
@@ -515,32 +535,55 @@ mod tests {
     }
 
     #[test]
+    fn standard_wrapper_monitor_matches_equivalent_contract_hex_encodings() {
+        let monitor = StandardWrapperMonitor::new(wrapper_config());
+        let diff: StarknetStateDiff = serde_json::from_value(json!({
+            "storage_diffs": {
+                "0x0111": {
+                    "0x1": "0xfb830"
+                }
+            },
+            "nonces": {},
+            "declared_classes": []
+        }))
+        .expect("valid state diff json");
+        let anomalies = monitor.process_state_diff(12, &diff);
+        assert!(anomalies.iter().any(|anomaly| matches!(
+            anomaly,
+            BtcfiAnomaly::SupplyMismatch {
+                block_number: 12,
+                ..
+            }
+        )));
+    }
+
+    #[test]
     fn strkbtc_monitor_detects_nullifier_reuse() {
         let mut monitor = StrkBtcMonitor::new(strkbtc_config());
         let mut first = diff_with_write(
-            ContractAddress::from("0x222"),
+            ContractAddress::parse("0x222").expect("valid contract address"),
             "0xdead01",
             StarknetFelt::from(1_u64),
         );
         first
             .storage_diffs
-            .entry(ContractAddress::from("0x222"))
+            .entry(ContractAddress::parse("0x222").expect("valid contract address"))
             .or_default()
             .insert("0x11".to_string(), StarknetFelt::from(1_u64));
         first
             .storage_diffs
-            .entry(ContractAddress::from("0x222"))
+            .entry(ContractAddress::parse("0x222").expect("valid contract address"))
             .or_default()
             .insert("0x12".to_string(), StarknetFelt::from(1_u64));
         first
             .storage_diffs
-            .entry(ContractAddress::from("0x222"))
+            .entry(ContractAddress::parse("0x222").expect("valid contract address"))
             .or_default()
             .insert("0x10".to_string(), StarknetFelt::from(123_u64));
         assert!(monitor.process_state_diff(20, &first).is_empty());
 
         let second = diff_with_write(
-            ContractAddress::from("0x222"),
+            ContractAddress::parse("0x222").expect("valid contract address"),
             "0xdead01",
             StarknetFelt::from(1_u64),
         );
@@ -561,7 +604,7 @@ mod tests {
         let mut monitor = StrkBtcMonitor::new(cfg);
 
         let first = diff_with_write(
-            ContractAddress::from("0x222"),
+            ContractAddress::parse("0x222").expect("valid contract address"),
             "0xdead01",
             StarknetFelt::from(1_u64),
         );
@@ -569,7 +612,7 @@ mod tests {
         assert_eq!(monitor.seen_nullifiers.len(), 1);
 
         let second = diff_with_write(
-            ContractAddress::from("0x222"),
+            ContractAddress::parse("0x222").expect("valid contract address"),
             "0xdead02",
             StarknetFelt::from(1_u64),
         );
@@ -593,7 +636,7 @@ mod tests {
 
         let mut first = StarknetStateDiff::default();
         first.storage_diffs.insert(
-            ContractAddress::from("0x222"),
+            ContractAddress::parse("0x222").expect("valid contract address"),
             BTreeMap::from([
                 ("0xdead01".to_string(), StarknetFelt::from(1_u64)),
                 ("0xdead02".to_string(), StarknetFelt::from(1_u64)),
@@ -602,7 +645,7 @@ mod tests {
         assert!(monitor.process_state_diff(40, &first).is_empty());
 
         let second = diff_with_write(
-            ContractAddress::from("0x222"),
+            ContractAddress::parse("0x222").expect("valid contract address"),
             "0xdead03",
             StarknetFelt::from(1_u64),
         );
@@ -617,7 +660,7 @@ mod tests {
         )));
 
         let reused_tracked = diff_with_write(
-            ContractAddress::from("0x222"),
+            ContractAddress::parse("0x222").expect("valid contract address"),
             "0xdead02",
             StarknetFelt::from(1_u64),
         );
@@ -636,7 +679,7 @@ mod tests {
         let mut monitor = StrkBtcMonitor::new(strkbtc_config());
         let mut first = StarknetStateDiff::default();
         first.storage_diffs.insert(
-            ContractAddress::from("0x222"),
+            ContractAddress::parse("0x222").expect("valid contract address"),
             BTreeMap::from([
                 ("0x10".to_string(), StarknetFelt::from(7_u64)),
                 ("0x11".to_string(), StarknetFelt::from(10_u64)),
@@ -647,7 +690,7 @@ mod tests {
 
         let mut second = StarknetStateDiff::default();
         second.storage_diffs.insert(
-            ContractAddress::from("0x222"),
+            ContractAddress::parse("0x222").expect("valid contract address"),
             BTreeMap::from([
                 ("0x10".to_string(), StarknetFelt::from(7_u64)),
                 ("0x11".to_string(), StarknetFelt::from(25_u64)),
@@ -676,7 +719,7 @@ mod tests {
         let mut monitor = StrkBtcMonitor::new(strkbtc_config());
         let mut baseline = StarknetStateDiff::default();
         baseline.storage_diffs.insert(
-            ContractAddress::from("0x222"),
+            ContractAddress::parse("0x222").expect("valid contract address"),
             BTreeMap::from([
                 ("0x10".to_string(), StarknetFelt::from(1_u64)),
                 ("0x11".to_string(), StarknetFelt::from(1_u64)),
@@ -687,7 +730,7 @@ mod tests {
 
         let mut next = StarknetStateDiff::default();
         next.storage_diffs.insert(
-            ContractAddress::from("0x222"),
+            ContractAddress::parse("0x222").expect("valid contract address"),
             BTreeMap::from([
                 ("0x10".to_string(), StarknetFelt::from(2_u64)),
                 ("0x11".to_string(), StarknetFelt::from(2_u64)),
@@ -743,17 +786,17 @@ mod tests {
         let mut exex = BtcfiExEx::new(vec![wrapper], strkbtc, 2);
 
         let diff1 = diff_with_write(
-            ContractAddress::from("0x111"),
+            ContractAddress::parse("0x111").expect("valid contract address"),
             "0x1",
             StarknetFelt::from(1_030_000_u64),
         );
         let diff2 = diff_with_write(
-            ContractAddress::from("0x111"),
+            ContractAddress::parse("0x111").expect("valid contract address"),
             "0x1",
             StarknetFelt::from(1_040_000_u64),
         );
         let diff3 = diff_with_write(
-            ContractAddress::from("0x111"),
+            ContractAddress::parse("0x111").expect("valid contract address"),
             "0x1",
             StarknetFelt::from(1_050_000_u64),
         );

@@ -16,6 +16,7 @@ use starknet_node_types::{
     BlockContext, BlockGasPrices, BuiltinStats, ContractAddress, ExecutionOutput, GasPricePerToken,
     InMemoryState, MutableState, SimulationResult, StarknetBlock, StarknetReceipt,
     StarknetStateDiff, StarknetTransaction, StateReader,
+    TxHash,
 };
 
 const DEFAULT_ITERATIONS: usize = 5_000;
@@ -126,7 +127,7 @@ impl ExecutionBackend for NoopBackend {
                     .transactions
                     .first()
                     .map(|tx| tx.hash.clone())
-                    .unwrap_or_else(|| "0x0".into()),
+                    .unwrap_or_else(|| TxHash::parse("0x0").expect("valid tx hash")),
                 execution_status: true,
                 events: 0,
                 gas_consumed: 1,
@@ -161,7 +162,7 @@ fn sample_block(number: u64) -> StarknetBlock {
         parent_hash: format!("0x{:x}", number.saturating_sub(1)),
         state_root: format!("0x{number:x}"),
         timestamp: 1_700_000_000 + number,
-        sequencer_address: ContractAddress::from("0x1"),
+        sequencer_address: ContractAddress::parse("0x1").expect("valid contract address"),
         gas_prices: BlockGasPrices {
             l1_gas: GasPricePerToken {
                 price_in_fri: 2,
@@ -177,7 +178,11 @@ fn sample_block(number: u64) -> StarknetBlock {
             },
         },
         protocol_version: Version::new(0, 14, 2),
-        transactions: vec![StarknetTransaction::new(format!("0x{number:x}"))],
+        transactions: vec![
+            StarknetTransaction::new(
+                TxHash::parse(format!("0x{number:x}")).expect("valid benchmark tx hash"),
+            ),
+        ],
     }
 }
 
@@ -311,11 +316,23 @@ fn env_u64(key: &str, default: u64) -> Result<u64, String> {
 
 fn env_f64(key: &str, default: f64) -> Result<f64, String> {
     match env::var(key) {
-        Ok(value) => value
-            .parse::<f64>()
-            .map_err(|error| format!("invalid {key}='{value}': {error}")),
+        Ok(value) => {
+            let parsed = value
+                .parse::<f64>()
+                .map_err(|error| format!("invalid {key}='{value}': {error}"))?;
+            validate_budget_f64(key, &value, parsed)
+        }
         Err(_) => Ok(default),
     }
+}
+
+fn validate_budget_f64(key: &str, raw: &str, value: f64) -> Result<f64, String> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!(
+            "invalid {key}='{raw}': must be a finite, non-negative number"
+        ));
+    }
+    Ok(value)
 }
 
 fn detect_kernel_release() -> String {
@@ -536,5 +553,30 @@ MemTotal:       1024 kB
         let err = validate_iterations(0).expect_err("zero iterations must fail");
         assert!(err.contains("PASTIS_PERF_ITERATIONS"));
         assert!(validate_iterations(1).is_ok());
+    }
+
+    #[test]
+    fn validate_budget_f64_rejects_non_finite_and_negative_values() {
+        for (raw, parsed) in [
+            ("NaN", f64::NAN),
+            ("inf", f64::INFINITY),
+            ("-inf", f64::NEG_INFINITY),
+            ("-1", -1.0),
+        ] {
+            let err = validate_budget_f64("BUDGET", raw, parsed).expect_err("must reject");
+            assert!(err.contains("finite, non-negative"));
+        }
+    }
+
+    #[test]
+    fn validate_budget_f64_accepts_finite_non_negative_values() {
+        assert_eq!(
+            validate_budget_f64("BUDGET", "0", 0.0).expect("zero is valid"),
+            0.0
+        );
+        assert_eq!(
+            validate_budget_f64("BUDGET", "1.5", 1.5).expect("positive value is valid"),
+            1.5
+        );
     }
 }

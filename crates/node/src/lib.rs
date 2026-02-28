@@ -703,7 +703,8 @@ mod tests {
         ) -> Result<ExecutionOutput, ExecutionError> {
             Ok(ExecutionOutput {
                 receipts: vec![StarknetReceipt {
-                    tx_hash: format!("0x{:x}", block.number).into(),
+                    tx_hash: starknet_node_types::TxHash::parse(format!("0x{:x}", block.number))
+                        .expect("valid tx hash"),
                     execution_status: true,
                     events: 0,
                     gas_consumed: 1,
@@ -874,8 +875,9 @@ mod tests {
             jsonrpc: "2.0".to_string(),
             method: "starknet_chainId".to_string(),
             params: serde_json::json!([]),
-            id: serde_json::json!(7),
-        });
+            id: Some(serde_json::json!(7)),
+        })
+        .expect("request with id should produce response");
         assert_eq!(response.result, Some(serde_json::json!("SN_SEPOLIA")));
     }
 
@@ -1072,6 +1074,7 @@ mod tests {
                 StarknetApiExecutableAccountTransaction::DeployAccount(executable),
             ),
         )
+        .expect("matching executable hash")
     }
 
     #[cfg(feature = "production-adapters")]
@@ -1225,7 +1228,7 @@ mod tests {
             parent_hash: "0x0".to_string(),
             state_root: "0x1".to_string(),
             timestamp: 1_700_000_001,
-            sequencer_address: "0x1".into(),
+            sequencer_address: ContractAddress::parse("0x1").expect("valid contract address"),
             gas_prices: BlockGasPrices {
                 l1_gas: GasPricePerToken {
                     price_in_fri: 1,
@@ -1278,7 +1281,7 @@ mod tests {
             parent_hash: format!("0x{:x}", number.saturating_sub(1)),
             state_root: format!("0x{number:x}"),
             timestamp: 1_700_000_000 + number,
-            sequencer_address: "0x1".into(),
+            sequencer_address: ContractAddress::parse("0x1").expect("valid contract address"),
             gas_prices: BlockGasPrices {
                 l1_gas: GasPricePerToken {
                     price_in_fri: 1,
@@ -1514,7 +1517,7 @@ mod tests {
             parent_hash: "0x0".to_string(),
             state_root: state_root.to_string(),
             timestamp: 0,
-            sequencer_address: "0x1".into(),
+            sequencer_address: ContractAddress::parse("0x1").expect("valid contract address"),
             gas_prices: BlockGasPrices {
                 l1_gas: GasPricePerToken {
                     price_in_fri: 1,

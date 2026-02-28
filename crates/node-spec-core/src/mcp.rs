@@ -260,8 +260,6 @@ impl McpAccessController {
                 agent_id: agent_id.clone(),
             });
         }
-        self.latest_request_time
-            .insert(agent_id.clone(), now_unix_seconds);
 
         let requests = self.requests.entry(agent_id.clone()).or_default();
         while let Some(ts) = requests.front() {
@@ -278,6 +276,8 @@ impl McpAccessController {
             });
         }
         requests.push_back(now_unix_seconds);
+        self.latest_request_time
+            .insert(agent_id.clone(), now_unix_seconds);
         Ok(agent_id)
     }
 }
