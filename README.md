@@ -107,7 +107,14 @@ Custom IDs are intentionally supported for private networks/appchains and test e
 Run a live local dashboard that simulates block flow, drives BTCFi anomaly generation, and queries anomalies through MCP:
 
 ```bash
-cargo run -p starknet-node --bin demo-dashboard --all-features
+cargo run -p starknet-node --bin demo-dashboard --all-features -- --mode demo
+```
+
+Run against a real Starknet RPC endpoint:
+
+```bash
+STARKNET_RPC_URL="https://<your-starknet-rpc>" \
+cargo run -p starknet-node --bin demo-dashboard --all-features -- --mode real
 ```
 
 Open:
@@ -119,7 +126,8 @@ Open:
 What this demo proves on-screen:
 
 - Node builder wiring (`storage + execution + rpc + mcp`)
-- Block ingestion and committed-state progression
+- Block ingestion and committed-state progression (`demo` mode)
+- Live chain status pull from Starknet JSON-RPC (`real` mode)
 - BTCFi/strkBTC anomaly detector behavior
 - MCP tool round-trip via `GetAnomalies`
 

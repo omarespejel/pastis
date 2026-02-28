@@ -14,8 +14,10 @@ production-adapters = [
 axum = "0.7"
 bincode = { workspace = true }
 node-spec-core = { path = "../node-spec-core" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 semver = { workspace = true }
 serde = { workspace = true }
+serde_json = "1.0"
 starknet-node-exex-btcfi = { path = "../exex-btcfi" }
 starknet-node-execution = { path = "../execution" }
 starknet-node-proving = { path = "../proving" }
@@ -25,6 +27,3 @@ starknet-node-storage = { path = "../storage" }
 starknet-node-types = { path = "../types" }
 thiserror = { workspace = true }
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "time", "net"] }
-
-[dev-dependencies]
-serde_json = "1.0"
