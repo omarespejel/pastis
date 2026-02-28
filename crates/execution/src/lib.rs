@@ -373,6 +373,36 @@ impl DualExecutionBackend {
     }
 }
 
+impl ExecutionBackend for DualExecutionBackend {
+    fn execute_block(
+        &self,
+        block: &StarknetBlock,
+        state: &mut dyn MutableState,
+    ) -> Result<ExecutionOutput, ExecutionError> {
+        self.execute_verified(block, state)
+    }
+
+    fn simulate_tx(
+        &self,
+        tx: &StarknetTransaction,
+        state: &dyn StateReader,
+        block_context: &BlockContext,
+    ) -> Result<SimulationResult, ExecutionError> {
+        match self.mode {
+            ExecutionMode::FastOnly => {
+                if let Some(fast) = &self.fast {
+                    fast.simulate_tx(tx, state, block_context)
+                } else {
+                    self.canonical.simulate_tx(tx, state, block_context)
+                }
+            }
+            ExecutionMode::CanonicalOnly | ExecutionMode::DualWithVerification { .. } => {
+                self.canonical.simulate_tx(tx, state, block_context)
+            }
+        }
+    }
+}
+
 pub struct ProtocolVersionSelector {
     resolver: VersionedConstantsResolver,
 }
@@ -1931,6 +1961,60 @@ mod tests {
             .expect("second block");
 
         assert_eq!(clone_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn dual_backend_simulate_uses_fast_backend_in_fast_only_mode() {
+        let backend = DualExecutionBackend::new(
+            Some(Box::new(StateWritingBackend {
+                gas: 9,
+                value: StarknetFelt::from(1_u64),
+            })),
+            Box::new(StateWritingBackend {
+                gas: 3,
+                value: StarknetFelt::from(2_u64),
+            }),
+            ExecutionMode::FastOnly,
+            MismatchPolicy::WarnAndFallback,
+        );
+        let state = InMemoryState::default();
+        let tx = StarknetTransaction::new("0xabc");
+        let context = BlockContext {
+            block_number: 1,
+            protocol_version: Version::parse("0.14.2").expect("valid version"),
+        };
+        let simulation = backend
+            .simulate_tx(&tx, &state, &context)
+            .expect("fast-only simulation should succeed");
+        assert_eq!(simulation.estimated_fee, 9);
+    }
+
+    #[test]
+    fn dual_backend_simulate_prefers_canonical_in_dual_mode() {
+        let backend = DualExecutionBackend::new(
+            Some(Box::new(StateWritingBackend {
+                gas: 9,
+                value: StarknetFelt::from(1_u64),
+            })),
+            Box::new(StateWritingBackend {
+                gas: 3,
+                value: StarknetFelt::from(2_u64),
+            }),
+            ExecutionMode::DualWithVerification {
+                verification_depth: 3,
+            },
+            MismatchPolicy::WarnAndFallback,
+        );
+        let state = InMemoryState::default();
+        let tx = StarknetTransaction::new("0xabc");
+        let context = BlockContext {
+            block_number: 1,
+            protocol_version: Version::parse("0.14.2").expect("valid version"),
+        };
+        let simulation = backend
+            .simulate_tx(&tx, &state, &context)
+            .expect("dual-mode simulation should succeed");
+        assert_eq!(simulation.estimated_fee, 3);
     }
 
     #[test]

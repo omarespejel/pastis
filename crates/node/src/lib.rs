@@ -31,7 +31,10 @@ use starknet_api::core::{
 use starknet_api::state::StateNumber as StarknetApiStateNumber;
 use starknet_node_execution::ExecutionBackend;
 #[cfg(feature = "production-adapters")]
-use starknet_node_execution::{BlockifierClassProvider, BlockifierVmBackend};
+use starknet_node_execution::{
+    BlockifierClassProvider, BlockifierVmBackend, DualExecutionBackend, DualExecutionMetrics,
+    ExecutionError, ExecutionMode, MismatchPolicy,
+};
 use starknet_node_mcp_server::{AnomalySource, McpServer};
 use starknet_node_proving::ProvingBackend;
 use starknet_node_rpc::StarknetRpcServer;
@@ -121,6 +124,31 @@ pub struct StarknetNode<S, E> {
     proving: Option<Box<dyn ProvingBackend>>,
 }
 
+#[cfg(feature = "production-adapters")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductionDualExecutionConfig {
+    pub enable_shadow_verification: bool,
+    pub verification_depth: u64,
+    pub mismatch_policy: MismatchPolicy,
+}
+
+#[cfg(feature = "production-adapters")]
+impl Default for ProductionDualExecutionConfig {
+    fn default() -> Self {
+        Self {
+            enable_shadow_verification: false,
+            verification_depth: 10,
+            mismatch_policy: MismatchPolicy::WarnAndFallback,
+        }
+    }
+}
+
+#[cfg(feature = "production-adapters")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductionExecutionTelemetry {
+    pub metrics: DualExecutionMetrics,
+}
+
 impl<S: StorageBackend, E> StarknetNode<S, E> {
     pub fn new_rpc_server(&self) -> StarknetRpcServer<'_> {
         StarknetRpcServer::new(&self.storage, self.config.chain_id.as_str())
@@ -146,6 +174,17 @@ impl<S: StorageBackend, E> StarknetNode<S, E> {
 
     pub fn proving_backend(&self) -> Option<&dyn ProvingBackend> {
         self.proving.as_deref()
+    }
+}
+
+#[cfg(feature = "production-adapters")]
+impl<S: StorageBackend> StarknetNode<S, DualExecutionBackend> {
+    pub fn production_execution_telemetry(
+        &self,
+    ) -> Result<ProductionExecutionTelemetry, ExecutionError> {
+        Ok(ProductionExecutionTelemetry {
+            metrics: self.execution.metrics()?,
+        })
     }
 }
 
@@ -465,13 +504,43 @@ impl BlockifierClassProvider for ApolloBlockifierClassProvider {
 pub fn build_mainnet_production_node(
     config: NodeConfig,
     storage: ApolloStorageAdapter,
-) -> Result<StarknetNode<ApolloStorageAdapter, BlockifierVmBackend>, NodeInitError> {
+) -> Result<StarknetNode<ApolloStorageAdapter, DualExecutionBackend>, NodeInitError> {
+    build_mainnet_production_node_with_dual_config(
+        config,
+        storage,
+        ProductionDualExecutionConfig::default(),
+    )
+}
+
+#[cfg(feature = "production-adapters")]
+pub fn build_mainnet_production_node_with_dual_config(
+    config: NodeConfig,
+    storage: ApolloStorageAdapter,
+    dual_config: ProductionDualExecutionConfig,
+) -> Result<StarknetNode<ApolloStorageAdapter, DualExecutionBackend>, NodeInitError> {
     validate_bootstrap_storage(&storage, &config)?;
     let class_provider: Arc<dyn BlockifierClassProvider> =
         Arc::new(ApolloBlockifierClassProvider::new(storage.reader_handle()));
+    let canonical =
+        BlockifierVmBackend::starknet_mainnet().with_class_provider(Arc::clone(&class_provider));
+    let fast = dual_config.enable_shadow_verification.then(|| {
+        Box::new(
+            BlockifierVmBackend::starknet_mainnet()
+                .with_class_provider(Arc::clone(&class_provider)),
+        ) as Box<dyn ExecutionBackend>
+    });
+    let mode = if dual_config.enable_shadow_verification {
+        ExecutionMode::DualWithVerification {
+            verification_depth: dual_config.verification_depth,
+        }
+    } else {
+        ExecutionMode::CanonicalOnly
+    };
+    let dual =
+        DualExecutionBackend::new(fast, Box::new(canonical), mode, dual_config.mismatch_policy);
     Ok(StarknetNodeBuilder::new(config)
         .with_storage(storage)
-        .with_execution(BlockifierVmBackend::starknet_mainnet().with_class_provider(class_provider))
+        .with_execution(dual)
         .build())
 }
 
@@ -482,6 +551,10 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
+    #[cfg(feature = "production-adapters")]
+    use apollo_storage::class::ClassStorageWriter;
+    #[cfg(feature = "production-adapters")]
+    use apollo_storage::compiled_class::CasmStorageWriter;
     #[cfg(feature = "production-adapters")]
     use apollo_storage::db::DbConfig;
     #[cfg(feature = "production-adapters")]
@@ -495,6 +568,8 @@ mod tests {
         StorageConfig as ApolloStorageConfig, StorageScope, StorageWriter as ApolloStorageWriter,
         open_storage as open_apollo_storage,
     };
+    #[cfg(feature = "production-adapters")]
+    use cairo_lang_starknet_classes::casm_contract_class::CasmContractClass;
     use node_spec_core::mcp::{
         AgentPolicy, McpAccessController, McpTool, ToolPermission, ValidationLimits,
     };
@@ -506,16 +581,31 @@ mod tests {
         BlockTimestamp as StarknetApiBlockTimestamp, StarknetVersion as StarknetApiVersion,
     };
     #[cfg(feature = "production-adapters")]
+    use starknet_api::contract_class::compiled_class_hash::{HashVersion, HashableCompiledClass};
+    #[cfg(feature = "production-adapters")]
     use starknet_api::core::{
         ChainId as StarknetApiChainId, ClassHash as StarknetApiClassHash,
         CompiledClassHash as StarknetApiCompiledClassHash,
         ContractAddress as StarknetApiContractAddress, GlobalRoot, Nonce as StarknetApiNonce,
     };
     #[cfg(feature = "production-adapters")]
+    use starknet_api::executable_transaction::{
+        AccountTransaction as StarknetApiExecutableAccountTransaction,
+        DeployAccountTransaction as StarknetApiExecutableDeployAccountTransaction,
+        Transaction as StarknetApiExecutableTransaction,
+    };
+    #[cfg(feature = "production-adapters")]
     use starknet_api::hash::StarkHash as StarknetApiFelt;
     #[cfg(feature = "production-adapters")]
     use starknet_api::state::{
         StorageKey as StarknetApiStorageKey, ThinStateDiff as StarknetApiThinStateDiff,
+    };
+    #[cfg(feature = "production-adapters")]
+    use starknet_api::transaction::fields::Fee as StarknetApiFee;
+    #[cfg(feature = "production-adapters")]
+    use starknet_api::transaction::{
+        DeployAccountTransaction as StarknetApiDeployAccountTransaction,
+        DeployAccountTransactionV1 as StarknetApiDeployAccountTransactionV1,
     };
     use starknet_node_execution::ExecutionError;
     use starknet_node_mcp_server::{AnomalySource, BtcfiAnomaly, McpRequest, McpResponse};
@@ -817,6 +907,101 @@ mod tests {
     }
 
     #[cfg(feature = "production-adapters")]
+    fn parse_account_sierra_fixture() -> starknet_api::state::SierraContractClass {
+        let mut value: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/account_with_dummy_validate.sierra.json"
+        ))
+        .expect("valid account sierra fixture json");
+        if let Some(abi) = value.get_mut("abi")
+            && !abi.is_string()
+        {
+            *abi = serde_json::Value::String(
+                serde_json::to_string(abi).expect("serialize sierra fixture ABI"),
+            );
+        }
+        serde_json::from_value(value).expect("valid account sierra fixture")
+    }
+
+    #[cfg(feature = "production-adapters")]
+    fn parse_account_casm_fixture() -> CasmContractClass {
+        serde_json::from_str(include_str!(
+            "../tests/fixtures/account_with_dummy_validate.casm.json"
+        ))
+        .expect("valid account casm fixture")
+    }
+
+    #[cfg(feature = "production-adapters")]
+    fn seed_declared_account_class_with_casm(
+        writer: &mut ApolloStorageWriter,
+    ) -> (StarknetApiClassHash, StarknetApiCompiledClassHash) {
+        let mut header = StarknetApiBlockHeader::default();
+        header.block_header_without_hash.state_root = GlobalRoot(StarknetApiFelt::from(1_u64));
+        header.block_header_without_hash.starknet_version =
+            StarknetApiVersion::try_from("0.14.2").expect("valid protocol version");
+        header.block_header_without_hash.timestamp = StarknetApiBlockTimestamp(1_700_000_000);
+        writer
+            .begin_rw_txn()
+            .expect("begin rw tx")
+            .append_header(StarknetApiBlockNumber(0), &header)
+            .expect("append header")
+            .commit()
+            .expect("commit header");
+
+        let sierra = parse_account_sierra_fixture();
+        let casm = parse_account_casm_fixture();
+        let class_hash = sierra.calculate_class_hash();
+        let compiled_class_hash = casm.hash(&HashVersion::V2);
+
+        writer
+            .begin_rw_txn()
+            .expect("begin rw tx")
+            .append_state_diff(
+                StarknetApiBlockNumber(0),
+                StarknetApiThinStateDiff {
+                    class_hash_to_compiled_class_hash: std::iter::once((
+                        class_hash,
+                        compiled_class_hash,
+                    ))
+                    .collect(),
+                    ..StarknetApiThinStateDiff::default()
+                },
+            )
+            .expect("append state diff")
+            .append_classes(StarknetApiBlockNumber(0), &[(class_hash, &sierra)], &[])
+            .expect("append classes")
+            .append_casm(&class_hash, &casm)
+            .expect("append casm")
+            .commit()
+            .expect("commit class fixtures");
+
+        (class_hash, compiled_class_hash)
+    }
+
+    #[cfg(feature = "production-adapters")]
+    fn deploy_account_transaction_for_class_hash(
+        class_hash: StarknetApiClassHash,
+    ) -> StarknetTransaction {
+        let api_tx =
+            StarknetApiDeployAccountTransaction::V1(StarknetApiDeployAccountTransactionV1 {
+                class_hash,
+                max_fee: StarknetApiFee(1_000_000_000_u128),
+                ..Default::default()
+            });
+        let executable = StarknetApiExecutableDeployAccountTransaction::create(
+            api_tx,
+            &StarknetApiChainId::Mainnet,
+        )
+        .expect("create executable deploy-account tx");
+        let tx_hash = format!("{:#x}", executable.tx_hash.0);
+        StarknetTransaction::with_executable(
+            tx_hash,
+            StarknetApiExecutableTransaction::Account(
+                StarknetApiExecutableAccountTransaction::DeployAccount(executable),
+            ),
+        )
+    }
+
+    #[cfg(feature = "production-adapters")]
     #[test]
     fn apollo_class_provider_reads_class_hashes_from_execution_and_simulation_state() {
         let dir = tempdir().expect("temp dir");
@@ -881,6 +1066,144 @@ mod tests {
             .get_compiled_class(class_hash)
             .expect_err("must fail without declared class artifacts");
         assert!(matches!(err, StateError::UndeclaredClassHash(hash) if hash == class_hash));
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn blockifier_backend_replays_account_deploy_with_declared_casm_fixtures() {
+        let dir = tempdir().expect("temp dir");
+        let (reader, mut writer) =
+            open_apollo_storage(apollo_config(dir.path())).expect("open apollo storage");
+        let (class_hash, _compiled_class_hash) = seed_declared_account_class_with_casm(&mut writer);
+        let adapter = ApolloStorageAdapter::from_parts(reader, writer);
+        let provider = Arc::new(ApolloBlockifierClassProvider::new(adapter.reader_handle()));
+
+        provider
+            .prepare_for_block_execution(1)
+            .expect("prepare class provider for block one");
+        provider
+            .get_compiled_class(class_hash)
+            .expect("declared class + casm fixtures must be runnable");
+
+        let backend = BlockifierVmBackend::starknet_mainnet().with_class_provider(provider);
+        let tx = deploy_account_transaction_for_class_hash(class_hash);
+        let expected_hash = tx.hash.clone();
+        let block = StarknetBlock {
+            number: 1,
+            parent_hash: "0x0".to_string(),
+            state_root: "0x1".to_string(),
+            timestamp: 1_700_000_001,
+            sequencer_address: "0x1".into(),
+            gas_prices: BlockGasPrices {
+                l1_gas: GasPricePerToken {
+                    price_in_fri: 1,
+                    price_in_wei: 1,
+                },
+                l1_data_gas: GasPricePerToken {
+                    price_in_fri: 1,
+                    price_in_wei: 1,
+                },
+                l2_gas: GasPricePerToken {
+                    price_in_fri: 1,
+                    price_in_wei: 1,
+                },
+            },
+            protocol_version: Version::parse("0.14.2").expect("valid version"),
+            transactions: vec![tx],
+        };
+
+        let mut state = InMemoryState::default();
+        let output = backend
+            .execute_block(&block, &mut state)
+            .expect("account deploy replay should not fatally fail");
+        assert_eq!(output.receipts.len(), 1);
+        assert_eq!(output.receipts[0].tx_hash, expected_hash);
+    }
+
+    #[cfg(feature = "production-adapters")]
+    fn seed_mainnet_genesis_header(writer: &mut ApolloStorageWriter) {
+        let mut header = StarknetApiBlockHeader::default();
+        header.block_header_without_hash.state_root = GlobalRoot(
+            StarknetApiFelt::from_hex(STARKNET_MAINNET_GENESIS_STATE_ROOT)
+                .expect("valid genesis root felt"),
+        );
+        header.block_header_without_hash.starknet_version =
+            StarknetApiVersion::try_from("0.14.2").expect("valid protocol version");
+        header.block_header_without_hash.timestamp = StarknetApiBlockTimestamp(1_700_000_000);
+        writer
+            .begin_rw_txn()
+            .expect("begin rw tx")
+            .append_header(StarknetApiBlockNumber(0), &header)
+            .expect("append genesis header")
+            .commit()
+            .expect("commit genesis header");
+    }
+
+    #[cfg(feature = "production-adapters")]
+    fn empty_test_block(number: u64) -> StarknetBlock {
+        StarknetBlock {
+            number,
+            parent_hash: format!("0x{:x}", number.saturating_sub(1)),
+            state_root: format!("0x{number:x}"),
+            timestamp: 1_700_000_000 + number,
+            sequencer_address: "0x1".into(),
+            gas_prices: BlockGasPrices {
+                l1_gas: GasPricePerToken {
+                    price_in_fri: 1,
+                    price_in_wei: 1,
+                },
+                l1_data_gas: GasPricePerToken {
+                    price_in_fri: 1,
+                    price_in_wei: 1,
+                },
+                l2_gas: GasPricePerToken {
+                    price_in_fri: 1,
+                    price_in_wei: 1,
+                },
+            },
+            protocol_version: Version::parse("0.14.2").expect("valid version"),
+            transactions: Vec::new(),
+        }
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn production_node_uses_dual_execution_backend_and_exposes_telemetry() {
+        let dir = tempdir().expect("temp dir");
+        let (reader, mut writer) =
+            open_apollo_storage(apollo_config(dir.path())).expect("open apollo storage");
+        seed_mainnet_genesis_header(&mut writer);
+        let adapter = ApolloStorageAdapter::from_parts(reader, writer);
+        let dual_config = ProductionDualExecutionConfig {
+            enable_shadow_verification: true,
+            verification_depth: 8,
+            mismatch_policy: MismatchPolicy::WarnAndFallback,
+        };
+        let node = build_mainnet_production_node_with_dual_config(
+            NodeConfig::default(),
+            adapter,
+            dual_config,
+        )
+        .expect("build production node");
+
+        let initial = node
+            .production_execution_telemetry()
+            .expect("initial telemetry");
+        assert_eq!(initial.metrics.mismatches, 0);
+        assert_eq!(initial.metrics.fast_executions, 0);
+        assert_eq!(initial.metrics.canonical_executions, 0);
+
+        let mut state = InMemoryState::default();
+        node.execution
+            .execute_verified(&empty_test_block(1), &mut state)
+            .expect("execute empty block");
+
+        let after = node
+            .production_execution_telemetry()
+            .expect("execution telemetry");
+        assert_eq!(after.metrics.mismatches, 0);
+        assert_eq!(after.metrics.fast_executions, 1);
+        assert_eq!(after.metrics.canonical_executions, 1);
     }
 
     #[cfg(feature = "production-adapters")]

@@ -4372,6 +4372,7 @@ dependencies = [
  "axum 0.7.9",
  "bincode 1.3.3",
  "blockifier",
+ "cairo-lang-starknet-classes",
  "node-spec-core",
  "reqwest",
  "semver",
