@@ -27,6 +27,11 @@ pub enum BtcfiAnomaly {
         block_number: BlockNumber,
         nullifier_key: String,
     },
+    StrkBtcNullifierTrackingSaturated {
+        block_number: BlockNumber,
+        tracked: usize,
+        max: usize,
+    },
     StrkBtcCommitmentFlood {
         block_number: BlockNumber,
         delta: u64,
@@ -115,6 +120,7 @@ pub struct StrkBtcMonitorConfig {
     pub unshield_cluster_window_blocks: u64,
     pub light_client_max_lag_blocks: u64,
     pub bridge_timeout_blocks: u64,
+    pub max_tracked_nullifiers: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,7 +134,8 @@ pub struct StrkBtcMonitor {
 }
 
 impl StrkBtcMonitor {
-    pub fn new(config: StrkBtcMonitorConfig) -> Self {
+    pub fn new(mut config: StrkBtcMonitorConfig) -> Self {
+        config.max_tracked_nullifiers = config.max_tracked_nullifiers.max(1);
         Self {
             config,
             last_merkle_root: None,
@@ -148,6 +155,7 @@ impl StrkBtcMonitor {
             return Vec::new();
         };
         let mut anomalies = Vec::new();
+        let mut nullifier_tracking_saturated = false;
 
         for (key, value) in writes {
             if key == &self.config.merkle_root_key
@@ -162,12 +170,26 @@ impl StrkBtcMonitor {
             if felt_is_zero(value) {
                 continue;
             }
-            if !self.seen_nullifiers.insert(key.clone()) {
+            if self.seen_nullifiers.contains(key) {
                 anomalies.push(BtcfiAnomaly::StrkBtcNullifierReuse {
                     block_number,
                     nullifier_key: key.clone(),
                 });
+                continue;
             }
+            if self.seen_nullifiers.len() >= self.config.max_tracked_nullifiers {
+                nullifier_tracking_saturated = true;
+                continue;
+            }
+            self.seen_nullifiers.insert(key.clone());
+        }
+
+        if nullifier_tracking_saturated {
+            anomalies.push(BtcfiAnomaly::StrkBtcNullifierTrackingSaturated {
+                block_number,
+                tracked: self.seen_nullifiers.len(),
+                max: self.config.max_tracked_nullifiers,
+            });
         }
 
         let next_merkle_root = writes.get(&self.config.merkle_root_key).map(felt_to_hex);
@@ -392,6 +414,7 @@ mod tests {
             unshield_cluster_window_blocks: 3,
             light_client_max_lag_blocks: 6,
             bridge_timeout_blocks: 20,
+            max_tracked_nullifiers: 10_000,
         }
     }
 
@@ -480,6 +503,37 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn strkbtc_monitor_bounds_nullifier_tracking_state() {
+        let mut cfg = strkbtc_config();
+        cfg.max_tracked_nullifiers = 1;
+        let mut monitor = StrkBtcMonitor::new(cfg);
+
+        let first = diff_with_write(
+            ContractAddress::from("0x222"),
+            "0xdead01",
+            StarknetFelt::from(1_u64),
+        );
+        assert!(monitor.process_state_diff(30, &first).is_empty());
+        assert_eq!(monitor.seen_nullifiers.len(), 1);
+
+        let second = diff_with_write(
+            ContractAddress::from("0x222"),
+            "0xdead02",
+            StarknetFelt::from(1_u64),
+        );
+        let anomalies = monitor.process_state_diff(31, &second);
+        assert!(matches!(
+            anomalies.as_slice(),
+            [BtcfiAnomaly::StrkBtcNullifierTrackingSaturated {
+                block_number: 31,
+                tracked: 1,
+                max: 1,
+            }]
+        ));
+        assert_eq!(monitor.seen_nullifiers.len(), 1);
     }
 
     #[test]

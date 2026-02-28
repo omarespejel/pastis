@@ -188,7 +188,7 @@ The repository currently includes core and phase-aligned scaffolding crates that
 - Blockifier adapter fail-fast guard for account transactions when class-provider integration is unavailable
 - ExEx registration hardening: per-ExEx credentials, allowlisted identities, trusted in-process sink enforcement, and sink recovery cooldown/re-enable
 - OTel-style ExEx sink implementation with deterministic notification-derived counters and block-regression telemetry
-- BTCFi/strkBTC monitor scaffolding with deterministic structural anomaly detection over state diffs
+- BTCFi/strkBTC monitor scaffolding with deterministic structural anomaly detection over state diffs and bounded nullifier tracking
 - Proving subsystem scaffold (`StwoVerifyOnly`, `ProvingPipeline`, trace-provider/prover traits) with fail-closed proof validation semantics
 - Node config hardening with validated `ChainId` parsing (mainnet/sepolia/custom strict format)
 - JSON-RPC server request handling with strict JSON-RPC envelope validation and deterministic error mapping

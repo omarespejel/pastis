@@ -30,7 +30,7 @@ This repository currently ships core, tested building blocks:
 - Dual execution orchestration with canonical fallback/mismatch handling
 - ExEx manager with bounded WAL replay and failing-sink circuit breaker
 - OTel-style ExEx sink with deterministic per-block metrics capture and regression counters
-- BTCFi/strkBTC ExEx scaffolding with structural anomaly detection primitives
+- BTCFi/strkBTC ExEx scaffolding with structural anomaly detection primitives and bounded nullifier-tracking state
 - Proving-layer scaffolding with verify-only backend and trace-driven proving pipeline
 - MCP server request handler with authenticated tool execution and bounded batch support
 - JSON-RPC server request handler with strict JSON-RPC 2.0 validation and Starknet core method coverage
