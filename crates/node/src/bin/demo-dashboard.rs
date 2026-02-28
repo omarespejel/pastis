@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
+use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -44,6 +46,8 @@ const DEFAULT_REFRESH_MS: u64 = 2_000;
 const DEFAULT_REPLAY_WINDOW: u64 = 64;
 const DEFAULT_MAX_REPLAY_PER_POLL: u64 = 16;
 const DEFAULT_REPLAY_CHECKPOINT_FILE: &str = ".pastis/replay-checkpoint.json";
+const DEFAULT_RPC_MAX_RETRIES: u32 = 2;
+const DEFAULT_RPC_RETRY_BACKOFF_MS: u64 = 250;
 const DEMO_API_KEY: &str = "boss-demo-key";
 const MAX_RECENT_ERRORS: usize = 16;
 const MAX_RECENT_ANOMALIES: usize = 512;
@@ -433,6 +437,29 @@ struct RealFetch {
     parse_warnings: Vec<String>,
 }
 
+type RpcFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
+
+trait RealRpcSource: Send + Sync {
+    fn rpc_url(&self) -> &str;
+    fn fetch_latest_block_number(&self) -> RpcFuture<'_, u64>;
+    fn fetch_block(&self, block_number: u64) -> RpcFuture<'_, RealFetch>;
+}
+
+#[derive(Debug, Clone)]
+struct RpcRetryConfig {
+    max_retries: u32,
+    base_backoff: Duration,
+}
+
+impl Default for RpcRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: DEFAULT_RPC_MAX_RETRIES,
+            base_backoff: Duration::from_millis(DEFAULT_RPC_RETRY_BACKOFF_MS),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct RuntimeDiagnostics {
     success_count: u64,
@@ -501,7 +528,8 @@ struct RealRuntimeState {
 
 #[derive(Clone)]
 struct RealRuntime {
-    client: Arc<RealRpcClient>,
+    client: Arc<dyn RealRpcSource>,
+    retry_config: RpcRetryConfig,
     btcfi: Option<Arc<Mutex<BtcfiExEx>>>,
     state: Arc<Mutex<RealRuntimeState>>,
 }
@@ -513,6 +541,24 @@ impl RealRuntime {
         replay_window: u64,
         max_replay_per_poll: u64,
         replay_checkpoint_path: Option<String>,
+    ) -> Result<Self, String> {
+        Self::new_with_rpc_source(
+            Arc::new(client),
+            btcfi_config,
+            replay_window,
+            max_replay_per_poll,
+            replay_checkpoint_path,
+            RpcRetryConfig::default(),
+        )
+    }
+
+    fn new_with_rpc_source(
+        client: Arc<dyn RealRpcSource>,
+        btcfi_config: Option<RealBtcfiConfig>,
+        replay_window: u64,
+        max_replay_per_poll: u64,
+        replay_checkpoint_path: Option<String>,
+        retry_config: RpcRetryConfig,
     ) -> Result<Self, String> {
         let btcfi = btcfi_config.map(|cfg| {
             let wrappers = cfg
@@ -536,7 +582,8 @@ impl RealRuntime {
         .map_err(|error| format!("failed to initialize replay pipeline: {error}"))?;
 
         Ok(Self {
-            client: Arc::new(client),
+            client,
+            retry_config,
             btcfi,
             state: Arc::new(Mutex::new(RealRuntimeState {
                 node: build_dashboard_node(),
@@ -549,8 +596,62 @@ impl RealRuntime {
         })
     }
 
+    async fn fetch_latest_block_number_with_retry(&self) -> Result<u64, String> {
+        let mut attempt = 0_u32;
+        loop {
+            match self.client.fetch_latest_block_number().await {
+                Ok(head) => return Ok(head),
+                Err(error) => {
+                    if attempt >= self.retry_config.max_retries {
+                        return Err(format!(
+                            "latest block RPC failed after {} attempts: {error}",
+                            self.retry_config.max_retries.saturating_add(1)
+                        ));
+                    }
+                    let backoff = self.retry_backoff(attempt);
+                    if !backoff.is_zero() {
+                        tokio::time::sleep(backoff).await;
+                    }
+                    attempt = attempt.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    async fn fetch_block_with_retry(&self, block_number: u64) -> Result<RealFetch, String> {
+        let mut attempt = 0_u32;
+        loop {
+            match self.client.fetch_block(block_number).await {
+                Ok(fetch) => return Ok(fetch),
+                Err(error) => {
+                    if attempt >= self.retry_config.max_retries {
+                        return Err(format!(
+                            "block {block_number} RPC failed after {} attempts: {error}",
+                            self.retry_config.max_retries.saturating_add(1)
+                        ));
+                    }
+                    let backoff = self.retry_backoff(attempt);
+                    if !backoff.is_zero() {
+                        tokio::time::sleep(backoff).await;
+                    }
+                    attempt = attempt.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    fn retry_backoff(&self, attempt: u32) -> Duration {
+        if self.retry_config.base_backoff.is_zero() {
+            return Duration::ZERO;
+        }
+        let factor = 1_u128 << attempt.min(20);
+        let base_ms = self.retry_config.base_backoff.as_millis();
+        let backoff_ms = base_ms.saturating_mul(factor).min(5_000);
+        Duration::from_millis(backoff_ms as u64)
+    }
+
     async fn poll_once(&self) -> Result<RealSnapshot, String> {
-        let external_head_block = match self.client.fetch_latest_block_number().await {
+        let external_head_block = match self.fetch_latest_block_number_with_retry().await {
             Ok(number) => number,
             Err(error) => {
                 let mut guard = self
@@ -575,7 +676,7 @@ impl RealRuntime {
         };
 
         for external_block in replay_plan {
-            let fetch = match self.client.fetch_block(external_block).await {
+            let fetch = match self.fetch_block_with_retry(external_block).await {
                 Ok(fetch) => fetch,
                 Err(error) => {
                     let mut guard = self
@@ -852,7 +953,7 @@ impl RealRuntime {
         let diagnostics = self.diagnostics()?;
         let mut notes = vec![format!(
             "Real mode connected to {}. BTCFi monitor is not configured; set PASTIS_MONITOR_STRKBTC_SHIELDED_POOL to enable it.",
-            self.client.rpc_url
+            self.client.rpc_url()
         )];
         if let Some(last_error) = diagnostics.last_error {
             notes.push(format!("Latest RPC error: {last_error}"));
@@ -890,6 +991,20 @@ fn new_replay_pipeline(
             pipeline.with_checkpoint_store(Arc::new(FileReplayCheckpointStore::new(path)))
         }
         None => Ok(pipeline),
+    }
+}
+
+impl RealRpcSource for RealRpcClient {
+    fn rpc_url(&self) -> &str {
+        &self.rpc_url
+    }
+
+    fn fetch_latest_block_number(&self) -> RpcFuture<'_, u64> {
+        Box::pin(RealRpcClient::fetch_latest_block_number(self))
+    }
+
+    fn fetch_block(&self, block_number: u64) -> RpcFuture<'_, RealFetch> {
+        Box::pin(RealRpcClient::fetch_block(self, block_number))
     }
 }
 
@@ -2512,6 +2627,62 @@ mod tests {
             .expect("fixture block commit should succeed");
     }
 
+    struct MockRpcSource {
+        rpc_url: String,
+        head_responses: Mutex<VecDeque<Result<u64, String>>>,
+        block_responses: Mutex<VecDeque<(u64, Result<RealFetch, String>)>>,
+    }
+
+    impl MockRpcSource {
+        fn new(
+            rpc_url: &str,
+            head_responses: Vec<Result<u64, String>>,
+            block_responses: Vec<(u64, Result<RealFetch, String>)>,
+        ) -> Self {
+            Self {
+                rpc_url: rpc_url.to_string(),
+                head_responses: Mutex::new(head_responses.into()),
+                block_responses: Mutex::new(block_responses.into()),
+            }
+        }
+    }
+
+    impl RealRpcSource for MockRpcSource {
+        fn rpc_url(&self) -> &str {
+            &self.rpc_url
+        }
+
+        fn fetch_latest_block_number(&self) -> RpcFuture<'_, u64> {
+            Box::pin(async move {
+                self.head_responses
+                    .lock()
+                    .map_err(|_| "mock head responses lock poisoned".to_string())?
+                    .pop_front()
+                    .unwrap_or_else(|| Err("no scripted head response".to_string()))
+            })
+        }
+
+        fn fetch_block(&self, block_number: u64) -> RpcFuture<'_, RealFetch> {
+            Box::pin(async move {
+                let mut guard = self
+                    .block_responses
+                    .lock()
+                    .map_err(|_| "mock block responses lock poisoned".to_string())?;
+                let Some((expected_block, response)) = guard.pop_front() else {
+                    return Err(format!(
+                        "no scripted block response for request block {block_number}"
+                    ));
+                };
+                if expected_block != block_number {
+                    return Err(format!(
+                        "mock block request mismatch: expected {expected_block}, got {block_number}"
+                    ));
+                }
+                response
+            })
+        }
+    }
+
     #[test]
     fn parse_dashboard_config_requires_rpc_in_real_mode() {
         let err = parse_dashboard_config_from(
@@ -2634,6 +2805,130 @@ mod tests {
         assert_eq!(
             config.replay_checkpoint_path.as_deref(),
             Some(DEFAULT_REPLAY_CHECKPOINT_FILE)
+        );
+    }
+
+    #[tokio::test]
+    async fn real_runtime_retries_head_rpc_and_succeeds_without_recording_failure() {
+        let fetch_623 = fetch_from_rpc_fixtures(
+            "mainnet_block_7242623_get_block_with_txs.json",
+            "mainnet_block_7242623_get_state_update.json",
+        );
+
+        let runtime = RealRuntime::new_with_rpc_source(
+            Arc::new(MockRpcSource::new(
+                "mock://rpc",
+                vec![Err("timeout".to_string()), Ok(7_242_623)],
+                vec![(7_242_623, Ok(fetch_623.clone()))],
+            )),
+            None,
+            1,
+            1,
+            None,
+            RpcRetryConfig {
+                max_retries: 1,
+                base_backoff: Duration::ZERO,
+            },
+        )
+        .expect("runtime should initialize");
+
+        let snapshot = runtime.poll_once().await.expect("poll should succeed");
+        assert_eq!(snapshot.latest_block, 7_242_623);
+
+        let diagnostics = runtime.diagnostics().expect("diagnostics should be readable");
+        assert_eq!(diagnostics.success_count, 1);
+        assert_eq!(diagnostics.failure_count, 0);
+        assert_eq!(diagnostics.consecutive_failures, 0);
+        assert_eq!(diagnostics.last_local_block, Some(1));
+        assert_eq!(diagnostics.replayed_tx_count, fetch_623.replay.transaction_hashes.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn real_runtime_reports_failure_after_retry_budget_exhausted() {
+        let runtime = RealRuntime::new_with_rpc_source(
+            Arc::new(MockRpcSource::new(
+                "mock://rpc",
+                vec![Err("timeout-1".to_string()), Err("timeout-2".to_string())],
+                Vec::new(),
+            )),
+            None,
+            1,
+            1,
+            None,
+            RpcRetryConfig {
+                max_retries: 1,
+                base_backoff: Duration::ZERO,
+            },
+        )
+        .expect("runtime should initialize");
+
+        let error = runtime
+            .poll_once()
+            .await
+            .expect_err("poll should fail after retries");
+        assert!(
+            error.contains("after 2 attempts"),
+            "unexpected error: {error}"
+        );
+
+        let diagnostics = runtime.diagnostics().expect("diagnostics should be readable");
+        assert_eq!(diagnostics.success_count, 0);
+        assert_eq!(diagnostics.failure_count, 1);
+        assert_eq!(diagnostics.consecutive_failures, 1);
+        assert!(diagnostics
+            .last_error
+            .as_deref()
+            .is_some_and(|msg| msg.contains("after 2 attempts")));
+    }
+
+    #[tokio::test]
+    async fn real_runtime_resumes_after_transient_block_fetch_failure() {
+        let fetch_623 = fetch_from_rpc_fixtures(
+            "mainnet_block_7242623_get_block_with_txs.json",
+            "mainnet_block_7242623_get_state_update.json",
+        );
+        let fetch_624 = fetch_from_rpc_fixtures(
+            "mainnet_block_7242624_get_block_with_txs.json",
+            "mainnet_block_7242624_get_state_update.json",
+        );
+
+        let runtime = RealRuntime::new_with_rpc_source(
+            Arc::new(MockRpcSource::new(
+                "mock://rpc",
+                vec![Ok(7_242_623), Ok(7_242_624)],
+                vec![
+                    (7_242_623, Ok(fetch_623.clone())),
+                    (7_242_624, Err("429 rate limited".to_string())),
+                    (7_242_624, Ok(fetch_624.clone())),
+                ],
+            )),
+            None,
+            1,
+            1,
+            None,
+            RpcRetryConfig {
+                max_retries: 1,
+                base_backoff: Duration::ZERO,
+            },
+        )
+        .expect("runtime should initialize");
+
+        let first = runtime.poll_once().await.expect("first poll should succeed");
+        assert_eq!(first.latest_block, 7_242_623);
+
+        let second = runtime.poll_once().await.expect("second poll should succeed");
+        assert_eq!(second.latest_block, 7_242_624);
+
+        let diagnostics = runtime.diagnostics().expect("diagnostics should be readable");
+        assert_eq!(diagnostics.success_count, 2);
+        assert_eq!(diagnostics.failure_count, 0);
+        assert_eq!(diagnostics.consecutive_failures, 0);
+        assert_eq!(diagnostics.last_local_block, Some(2));
+        assert_eq!(diagnostics.last_external_replayed_block, Some(7_242_624));
+        assert_eq!(
+            diagnostics.replayed_tx_count,
+            (fetch_623.replay.transaction_hashes.len() + fetch_624.replay.transaction_hashes.len())
+                as u64
         );
     }
 
