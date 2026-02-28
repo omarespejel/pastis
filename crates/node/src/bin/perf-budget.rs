@@ -269,7 +269,8 @@ fn build_metric(name: &'static str, mut samples_us: Vec<u64>, elapsed: Duration)
     let p50_us = percentile(&samples_us, 50);
     let p95_us = percentile(&samples_us, 95);
     let p99_us = percentile(&samples_us, 99);
-    let ops_per_sec = len as f64 / elapsed.as_secs_f64().max(1e-9);
+    let safe_elapsed = elapsed.as_secs_f64().max(1e-9);
+    let ops_per_sec = (len as f64 / safe_elapsed).min(1e9);
     MetricResult {
         name,
         p50_us,
@@ -503,5 +504,11 @@ This line is malformed
 MemTotal:       1024 kB
 ";
         assert_eq!(parse_mem_total_kib(meminfo), Some(1_024));
+    }
+
+    #[test]
+    fn build_metric_caps_unrealistic_ops_per_second() {
+        let metric = build_metric("demo", vec![1, 2, 3], Duration::from_nanos(1));
+        assert_eq!(metric.ops_per_sec, 1e9);
     }
 }

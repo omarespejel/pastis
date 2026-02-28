@@ -1053,9 +1053,13 @@ async fn main() -> Result<(), String> {
                 config.replay_window,
                 config.max_replay_per_poll,
             ));
+            if let Err(error) = runtime.poll_once().await {
+                eprintln!("warning: initial real runtime poll failed: {error}");
+            }
             let poll_runtime = Arc::clone(&runtime);
             tokio::spawn(async move {
                 let mut ticker = interval(Duration::from_millis(refresh_ms));
+                ticker.tick().await;
                 loop {
                     ticker.tick().await;
                     if let Err(error) = poll_runtime.poll_once().await {
@@ -1063,9 +1067,6 @@ async fn main() -> Result<(), String> {
                     }
                 }
             });
-            if let Err(error) = runtime.poll_once().await {
-                eprintln!("warning: initial real runtime poll failed: {error}");
-            }
             DashboardSource::Real { runtime }
         }
     };
@@ -1425,34 +1426,12 @@ fn parse_dashboard_config_from(
     env_replay_window: Option<String>,
     env_max_replay_per_poll: Option<String>,
 ) -> Result<DashboardConfig, String> {
-    let mode = env_mode
-        .as_deref()
-        .map(DashboardModeKind::parse)
-        .transpose()?
-        .unwrap_or(DashboardModeKind::Demo);
-    let refresh_ms = env_refresh
-        .as_deref()
-        .map(parse_refresh_ms)
-        .transpose()?
-        .unwrap_or(DEFAULT_REFRESH_MS);
-    let replay_window = env_replay_window
-        .as_deref()
-        .map(parse_positive_u64)
-        .transpose()?
-        .unwrap_or(DEFAULT_REPLAY_WINDOW);
-    let max_replay_per_poll = env_max_replay_per_poll
-        .as_deref()
-        .map(parse_positive_u64)
-        .transpose()?
-        .unwrap_or(DEFAULT_MAX_REPLAY_PER_POLL);
-    let mut config = DashboardConfig {
-        mode,
-        bind_addr: env_bind.unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string()),
-        refresh_ms,
-        rpc_url: env_rpc,
-        replay_window,
-        max_replay_per_poll,
-    };
+    let mut cli_mode: Option<DashboardModeKind> = None;
+    let mut cli_bind: Option<String> = None;
+    let mut cli_refresh_ms: Option<u64> = None;
+    let mut cli_rpc_url: Option<String> = None;
+    let mut cli_replay_window: Option<u64> = None;
+    let mut cli_max_replay_per_poll: Option<u64> = None;
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -1461,37 +1440,37 @@ fn parse_dashboard_config_from(
                 let raw = args
                     .next()
                     .ok_or_else(|| "--mode requires `demo` or `real`".to_string())?;
-                config.mode = DashboardModeKind::parse(&raw)?;
+                cli_mode = Some(DashboardModeKind::parse(&raw)?);
             }
             "--rpc-url" => {
                 let raw = args
                     .next()
                     .ok_or_else(|| "--rpc-url requires a value".to_string())?;
-                config.rpc_url = Some(raw);
+                cli_rpc_url = Some(raw);
             }
             "--bind" => {
                 let raw = args
                     .next()
                     .ok_or_else(|| "--bind requires a value".to_string())?;
-                config.bind_addr = raw;
+                cli_bind = Some(raw);
             }
             "--refresh-ms" => {
                 let raw = args
                     .next()
                     .ok_or_else(|| "--refresh-ms requires a value".to_string())?;
-                config.refresh_ms = parse_refresh_ms(&raw)?;
+                cli_refresh_ms = Some(parse_refresh_ms(&raw)?);
             }
             "--replay-window" => {
                 let raw = args
                     .next()
                     .ok_or_else(|| "--replay-window requires a value".to_string())?;
-                config.replay_window = parse_positive_u64(&raw)?;
+                cli_replay_window = Some(parse_positive_u64(&raw)?);
             }
             "--max-replay-per-poll" => {
                 let raw = args
                     .next()
                     .ok_or_else(|| "--max-replay-per-poll requires a value".to_string())?;
-                config.max_replay_per_poll = parse_positive_u64(&raw)?;
+                cli_max_replay_per_poll = Some(parse_positive_u64(&raw)?);
             }
             "--help" | "-h" => {
                 return Err(help_text());
@@ -1501,6 +1480,49 @@ fn parse_dashboard_config_from(
             }
         }
     }
+
+    let mode = match cli_mode {
+        Some(value) => value,
+        None => env_mode
+            .as_deref()
+            .map(DashboardModeKind::parse)
+            .transpose()?
+            .unwrap_or(DashboardModeKind::Demo),
+    };
+    let refresh_ms = match cli_refresh_ms {
+        Some(value) => value,
+        None => env_refresh
+            .as_deref()
+            .map(parse_refresh_ms)
+            .transpose()?
+            .unwrap_or(DEFAULT_REFRESH_MS),
+    };
+    let replay_window = match cli_replay_window {
+        Some(value) => value,
+        None => env_replay_window
+            .as_deref()
+            .map(parse_positive_u64)
+            .transpose()?
+            .unwrap_or(DEFAULT_REPLAY_WINDOW),
+    };
+    let max_replay_per_poll = match cli_max_replay_per_poll {
+        Some(value) => value,
+        None => env_max_replay_per_poll
+            .as_deref()
+            .map(parse_positive_u64)
+            .transpose()?
+            .unwrap_or(DEFAULT_MAX_REPLAY_PER_POLL),
+    };
+    let config = DashboardConfig {
+        mode,
+        bind_addr: cli_bind
+            .or(env_bind)
+            .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string()),
+        refresh_ms,
+        rpc_url: cli_rpc_url.or(env_rpc),
+        replay_window,
+        max_replay_per_poll,
+    };
 
     if config.mode == DashboardModeKind::Real && config.rpc_url.is_none() {
         return Err(
@@ -2298,8 +2320,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
         mcp.textContent = 'OK';
         mcp.className = 'value ok';
       } else {
-        mcp.textContent = status.mode === 'real' ? 'N/A' : 'FAIL';
-        mcp.className = 'value ' + (status.mode === 'real' ? 'warn' : 'danger');
+        const unconfigured = status.mode === 'real' && status.anomaly_source === 'unconfigured';
+        mcp.textContent = unconfigured ? 'N/A' : 'FAIL';
+        mcp.className = 'value ' + (unconfigured ? 'warn' : 'danger');
       }
 
       const list = document.getElementById('anomalyList');
@@ -2404,6 +2427,52 @@ mod tests {
         assert_eq!(config.rpc_url.as_deref(), Some("https://cli.rpc"));
         assert_eq!(config.replay_window, 96);
         assert_eq!(config.max_replay_per_poll, 12);
+    }
+
+    #[test]
+    fn parse_dashboard_config_cli_overrides_invalid_env_values() {
+        let config = parse_dashboard_config_from(
+            vec![
+                "--mode".to_string(),
+                "real".to_string(),
+                "--rpc-url".to_string(),
+                "https://cli.rpc".to_string(),
+                "--refresh-ms".to_string(),
+                "1700".to_string(),
+                "--replay-window".to_string(),
+                "48".to_string(),
+                "--max-replay-per-poll".to_string(),
+                "6".to_string(),
+            ],
+            Some("invalid-mode".to_string()),
+            None,
+            Some("invalid-refresh".to_string()),
+            Some("https://env.rpc".to_string()),
+            Some("invalid-window".to_string()),
+            Some("invalid-max".to_string()),
+        )
+        .expect("cli flags should override malformed env values");
+
+        assert_eq!(config.mode, DashboardModeKind::Real);
+        assert_eq!(config.rpc_url.as_deref(), Some("https://cli.rpc"));
+        assert_eq!(config.refresh_ms, 1700);
+        assert_eq!(config.replay_window, 48);
+        assert_eq!(config.max_replay_per_poll, 6);
+    }
+
+    #[test]
+    fn parse_dashboard_config_invalid_env_fails_without_cli_override() {
+        let error = parse_dashboard_config_from(
+            Vec::new(),
+            Some("invalid-mode".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("invalid env mode must fail when no cli override is present");
+        assert!(error.contains("unsupported mode"));
     }
 
     #[test]
