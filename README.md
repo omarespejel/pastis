@@ -102,6 +102,27 @@ Custom IDs are intentionally supported for private networks/appchains and test e
 - Rust toolchain (stable)
 - `cargo`
 
+### Boss Demo Dashboard
+
+Run a live local dashboard that simulates block flow, drives BTCFi anomaly generation, and queries anomalies through MCP:
+
+```bash
+cargo run -p starknet-node --bin demo-dashboard --all-features
+```
+
+Open:
+
+- `http://127.0.0.1:8080/` for the dashboard UI
+- `http://127.0.0.1:8080/api/status` for live node status JSON
+- `http://127.0.0.1:8080/api/anomalies` for live anomaly JSON
+
+What this demo proves on-screen:
+
+- Node builder wiring (`storage + execution + rpc + mcp`)
+- Block ingestion and committed-state progression
+- BTCFi/strkBTC anomaly detector behavior
+- MCP tool round-trip via `GetAnomalies`
+
 ### Validate Everything
 
 ```bash

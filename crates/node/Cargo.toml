@@ -11,9 +11,12 @@ production-adapters = [
 ]
 
 [dependencies]
+axum = "0.7"
 bincode = { workspace = true }
 node-spec-core = { path = "../node-spec-core" }
 semver = { workspace = true }
+serde = { workspace = true }
+starknet-node-exex-btcfi = { path = "../exex-btcfi" }
 starknet-node-execution = { path = "../execution" }
 starknet-node-proving = { path = "../proving" }
 starknet-node-mcp-server = { path = "../mcp-server" }
@@ -21,6 +24,7 @@ starknet-node-rpc = { path = "../rpc" }
 starknet-node-storage = { path = "../storage" }
 starknet-node-types = { path = "../types" }
 thiserror = { workspace = true }
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "time", "net"] }
 
 [dev-dependencies]
 serde_json = "1.0"
