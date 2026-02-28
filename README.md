@@ -126,6 +126,9 @@ STARKNET_RPC_URL="https://<your-starknet-rpc>" \
 cargo run -p starknet-node --bin demo-dashboard --all-features -- --mode real
 ```
 
+When enabled, the dashboard reports anomaly source as `mcp:get_anomalies(local)` and `/api/debug` includes
+`last_processed_block`, `last_local_block`, `commit_failure_count`, and retained anomaly counters.
+
 Open:
 
 - `http://127.0.0.1:8080/` for the dashboard UI

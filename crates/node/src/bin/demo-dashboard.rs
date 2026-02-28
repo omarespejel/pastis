@@ -366,9 +366,11 @@ struct RuntimeDiagnostics {
     success_count: u64,
     failure_count: u64,
     consecutive_failures: u64,
+    commit_failure_count: u64,
     last_success_unix_seconds: Option<u64>,
     last_failure_unix_seconds: Option<u64>,
     last_processed_block: Option<u64>,
+    last_local_block: Option<u64>,
     last_error: Option<String>,
     recent_errors: Vec<String>,
     anomaly_monitor_enabled: bool,
@@ -381,9 +383,11 @@ impl RuntimeDiagnostics {
             success_count: 0,
             failure_count: 0,
             consecutive_failures: 0,
+            commit_failure_count: 0,
             last_success_unix_seconds: None,
             last_failure_unix_seconds: None,
             last_processed_block: None,
+            last_local_block: None,
             last_error: None,
             recent_errors: Vec::new(),
             anomaly_monitor_enabled: false,
@@ -392,11 +396,12 @@ impl RuntimeDiagnostics {
     }
 }
 
-#[derive(Debug)]
 struct RealRuntimeState {
+    node: StarknetNode<InMemoryStorage, DemoExecution>,
     snapshot: Option<RealSnapshot>,
     diagnostics: RuntimeDiagnostics,
     recent_errors: VecDeque<String>,
+    next_local_block: u64,
 }
 
 #[derive(Clone)]
@@ -408,6 +413,13 @@ struct RealRuntime {
 
 impl RealRuntime {
     fn new(client: RealRpcClient, btcfi_config: Option<RealBtcfiConfig>) -> Self {
+        let storage = InMemoryStorage::new(InMemoryState::default());
+        let node = StarknetNodeBuilder::new(NodeConfig::default())
+            .with_storage(storage)
+            .with_execution(DemoExecution)
+            .with_rpc(true)
+            .with_mcp(true)
+            .build();
         let btcfi = btcfi_config.map(|cfg| {
             let wrappers = cfg
                 .wrappers
@@ -426,9 +438,11 @@ impl RealRuntime {
             client: Arc::new(client),
             btcfi,
             state: Arc::new(Mutex::new(RealRuntimeState {
+                node,
                 snapshot: None,
                 diagnostics,
                 recent_errors: VecDeque::new(),
+                next_local_block: 1,
             })),
         }
     }
@@ -441,26 +455,56 @@ impl RealRuntime {
                     .lock()
                     .map_err(|_| "real runtime lock poisoned".to_string())?;
                 guard.snapshot = Some(fetch.snapshot.clone());
-                guard.diagnostics.success_count = guard.diagnostics.success_count.saturating_add(1);
-                guard.diagnostics.consecutive_failures = 0;
-                guard.diagnostics.last_success_unix_seconds = Some(unix_now());
-                guard.diagnostics.last_error = None;
                 for warning in fetch.parse_warnings {
                     push_recent_error(&mut guard.recent_errors, format!("warning: {warning}"));
                 }
+
+                let should_process = guard
+                    .diagnostics
+                    .last_processed_block
+                    .map(|last| fetch.snapshot.latest_block > last)
+                    .unwrap_or(true);
+
+                if should_process {
+                    let local_block = ingest_block_from_snapshot(
+                        guard.next_local_block,
+                        fetch.snapshot.latest_block,
+                        &fetch.snapshot.state_root,
+                        fetch.snapshot.tx_count,
+                    );
+                    if let Err(error) = guard
+                        .node
+                        .storage
+                        .insert_block(local_block, fetch.state_diff.clone())
+                    {
+                        let message = format!(
+                            "failed to commit local ingest block {}: {error}",
+                            guard.next_local_block
+                        );
+                        guard.diagnostics.failure_count =
+                            guard.diagnostics.failure_count.saturating_add(1);
+                        guard.diagnostics.commit_failure_count =
+                            guard.diagnostics.commit_failure_count.saturating_add(1);
+                        guard.diagnostics.consecutive_failures =
+                            guard.diagnostics.consecutive_failures.saturating_add(1);
+                        guard.diagnostics.last_failure_unix_seconds = Some(unix_now());
+                        guard.diagnostics.last_error = Some(message.clone());
+                        push_recent_error(&mut guard.recent_errors, message.clone());
+                        guard.diagnostics.recent_errors =
+                            guard.recent_errors.iter().cloned().collect();
+                        return Err(message);
+                    }
+                    guard.diagnostics.last_local_block = Some(guard.next_local_block);
+                    guard.next_local_block = guard.next_local_block.saturating_add(1);
+                    guard.diagnostics.last_processed_block = Some(fetch.snapshot.latest_block);
+                }
+
                 if let Some(btcfi) = &self.btcfi {
-                    let should_process = guard
-                        .diagnostics
-                        .last_processed_block
-                        .map(|last| fetch.snapshot.latest_block > last)
-                        .unwrap_or(true);
                     match btcfi.lock() {
                         Ok(mut monitor) => {
                             if should_process {
                                 let _ = monitor
                                     .process_block(fetch.snapshot.latest_block, &fetch.state_diff);
-                                guard.diagnostics.last_processed_block =
-                                    Some(fetch.snapshot.latest_block);
                             }
                             guard.diagnostics.retained_anomaly_count =
                                 monitor.recent_anomalies(MAX_RECENT_ANOMALIES).len();
@@ -472,6 +516,11 @@ impl RealRuntime {
                         }
                     }
                 }
+
+                guard.diagnostics.success_count = guard.diagnostics.success_count.saturating_add(1);
+                guard.diagnostics.consecutive_failures = 0;
+                guard.diagnostics.last_success_unix_seconds = Some(unix_now());
+                guard.diagnostics.last_error = None;
                 guard.diagnostics.recent_errors = guard.recent_errors.iter().cloned().collect();
                 Ok(fetch.snapshot)
             }
@@ -517,24 +566,70 @@ impl RealRuntime {
 
     fn anomaly_source_name(&self) -> &'static str {
         if self.btcfi.is_some() {
-            "btcfi:state-diff"
+            "mcp:get_anomalies(local)"
         } else {
             "unconfigured"
         }
     }
 
-    fn recent_anomalies(&self, limit: usize) -> Result<Option<Vec<BtcfiAnomaly>>, String> {
+    fn mcp_access_controller(&self) -> McpAccessController {
+        let permissions = BTreeSet::from([
+            ToolPermission::GetNodeStatus,
+            ToolPermission::GetAnomalies,
+            ToolPermission::QueryState,
+        ]);
+        McpAccessController::new([(
+            "boss-real".to_string(),
+            AgentPolicy::new(DEMO_API_KEY, permissions, 5_000),
+        )])
+    }
+
+    fn mcp_limits(&self) -> ValidationLimits {
+        ValidationLimits {
+            max_batch_size: 64,
+            max_depth: 4,
+            max_total_tools: 256,
+        }
+    }
+
+    fn query_anomalies_via_mcp(&self, limit: u64) -> Result<Option<Vec<BtcfiAnomaly>>, String> {
         let Some(btcfi) = &self.btcfi else {
             return Ok(None);
         };
-        let guard = btcfi
+        let guard = self
+            .state
             .lock()
-            .map_err(|_| "btcfi monitor lock poisoned".to_string())?;
-        Ok(Some(guard.recent_anomalies(limit)))
+            .map_err(|_| "real runtime lock poisoned".to_string())?;
+        let server = guard.node.new_mcp_server_with_anomalies(
+            self.mcp_access_controller(),
+            self.mcp_limits(),
+            btcfi.as_ref(),
+        );
+        let response = server
+            .handle_request(McpRequest {
+                api_key: DEMO_API_KEY.to_string(),
+                tool: McpTool::GetAnomalies { limit },
+                now_unix_seconds: unix_now(),
+            })
+            .map_err(|error| format!("mcp get anomalies failed: {error}"))?;
+        match response.response {
+            McpResponse::GetAnomalies { anomalies } => Ok(Some(anomalies)),
+            other => Err(format!(
+                "unexpected MCP response for anomalies query: {other:?}"
+            )),
+        }
+    }
+
+    fn retained_anomaly_count(&self) -> Result<usize, String> {
+        if self.btcfi.is_none() {
+            return Ok(0);
+        }
+        let diagnostics = self.diagnostics()?;
+        Ok(diagnostics.retained_anomaly_count)
     }
 
     fn anomaly_strings(&self, limit: usize) -> Result<Vec<String>, String> {
-        if let Some(anomalies) = self.recent_anomalies(limit)? {
+        if let Some(anomalies) = self.query_anomalies_via_mcp(limit as u64)? {
             return Ok(anomalies
                 .into_iter()
                 .map(|anomaly| format!("{anomaly:?}"))
@@ -677,10 +772,12 @@ struct DebugPayload {
     refresh_ms: u64,
     success_count: u64,
     failure_count: u64,
+    commit_failure_count: u64,
     consecutive_failures: u64,
     last_success_unix_seconds: Option<u64>,
     last_failure_unix_seconds: Option<u64>,
     last_processed_block: Option<u64>,
+    last_local_block: Option<u64>,
     anomaly_monitor_enabled: bool,
     retained_anomaly_count: usize,
     last_error: Option<String>,
@@ -861,10 +958,12 @@ fn demo_debug(runtime: &Arc<Mutex<DemoRuntime>>, refresh_ms: u64) -> Result<Debu
         refresh_ms,
         success_count: guard.tick_successes,
         failure_count: guard.tick_failures,
+        commit_failure_count: 0,
         consecutive_failures: 0,
         last_success_unix_seconds: None,
         last_failure_unix_seconds: None,
         last_processed_block: Some(guard.next_block.saturating_sub(1)),
+        last_local_block: Some(guard.next_block.saturating_sub(1)),
         anomaly_monitor_enabled: true,
         retained_anomaly_count: guard
             .query_anomalies_via_mcp(MAX_RECENT_ANOMALIES as u64)?
@@ -878,7 +977,8 @@ fn demo_debug(runtime: &Arc<Mutex<DemoRuntime>>, refresh_ms: u64) -> Result<Debu
 async fn real_status(runtime: &Arc<RealRuntime>, refresh_ms: u64) -> Result<StatusPayload, String> {
     let snapshot = runtime.snapshot_or_refresh().await?;
     let diagnostics = runtime.diagnostics()?;
-    let anomalies = runtime.anomaly_strings(1)?;
+    let recent_anomaly_count = runtime.retained_anomaly_count()?;
+    let mcp_roundtrip_ok = runtime.query_anomalies_via_mcp(1)?.is_some();
     let now = unix_now();
     let data_age_seconds = now.checked_sub(snapshot.captured_unix_seconds);
     Ok(StatusPayload {
@@ -888,9 +988,9 @@ async fn real_status(runtime: &Arc<RealRuntime>, refresh_ms: u64) -> Result<Stat
         state_root: snapshot.state_root,
         tx_count: snapshot.tx_count,
         rpc_latency_ms: snapshot.rpc_latency_ms,
-        mcp_roundtrip_ok: false,
+        mcp_roundtrip_ok,
         anomaly_source: runtime.anomaly_source_name().to_string(),
-        recent_anomaly_count: anomalies.len(),
+        recent_anomaly_count,
         data_age_seconds,
         failure_count: diagnostics.failure_count,
         consecutive_failures: diagnostics.consecutive_failures,
@@ -914,10 +1014,12 @@ fn real_debug(runtime: &Arc<RealRuntime>, refresh_ms: u64) -> Result<DebugPayloa
         refresh_ms,
         success_count: diagnostics.success_count,
         failure_count: diagnostics.failure_count,
+        commit_failure_count: diagnostics.commit_failure_count,
         consecutive_failures: diagnostics.consecutive_failures,
         last_success_unix_seconds: diagnostics.last_success_unix_seconds,
         last_failure_unix_seconds: diagnostics.last_failure_unix_seconds,
         last_processed_block: diagnostics.last_processed_block,
+        last_local_block: diagnostics.last_local_block,
         anomaly_monitor_enabled: diagnostics.anomaly_monitor_enabled,
         retained_anomaly_count: diagnostics.retained_anomaly_count,
         last_error: diagnostics.last_error,
@@ -948,6 +1050,40 @@ fn demo_block(number: u64) -> StarknetBlock {
             },
         },
         protocol_version: Version::parse("0.14.2").expect("demo protocol version must be valid"),
+        transactions: Vec::new(),
+    }
+}
+
+fn ingest_block_from_snapshot(
+    local_number: u64,
+    external_number: u64,
+    external_state_root: &str,
+    _external_tx_count: u64,
+) -> StarknetBlock {
+    let state_root = StarknetFelt::from_str(external_state_root)
+        .map(|felt| format!("{:#x}", felt))
+        .unwrap_or_else(|_| "0x0".to_string());
+    StarknetBlock {
+        number: local_number,
+        parent_hash: format!("0x{:x}", external_number.saturating_sub(1)),
+        state_root,
+        timestamp: unix_now(),
+        sequencer_address: ContractAddress::from("0x1"),
+        gas_prices: BlockGasPrices {
+            l1_gas: GasPricePerToken {
+                price_in_fri: 1,
+                price_in_wei: 1,
+            },
+            l1_data_gas: GasPricePerToken {
+                price_in_fri: 1,
+                price_in_wei: 1,
+            },
+            l2_gas: GasPricePerToken {
+                price_in_fri: 1,
+                price_in_wei: 1,
+            },
+        },
+        protocol_version: Version::parse("0.14.2").expect("ingest protocol version must be valid"),
         transactions: Vec::new(),
     }
 }
@@ -1850,5 +1986,20 @@ mod tests {
             diff.nonces.get(&ContractAddress::from("0x222")).copied(),
             Some(StarknetFelt::from(5_u64))
         );
+    }
+
+    #[test]
+    fn ingest_block_from_snapshot_builds_valid_block() {
+        let block = ingest_block_from_snapshot(3, 7_000_123, "0x123", 11);
+        assert_eq!(block.number, 3);
+        assert_eq!(block.parent_hash, format!("0x{:x}", 7_000_122_u64));
+        assert_eq!(block.state_root, "0x123");
+        block.validate().expect("ingested block must be valid");
+
+        let invalid_root = ingest_block_from_snapshot(4, 7_000_124, "bad-root", 12);
+        assert_eq!(invalid_root.state_root, "0x0");
+        invalid_root
+            .validate()
+            .expect("fallback state root keeps block valid");
     }
 }
