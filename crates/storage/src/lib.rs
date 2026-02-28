@@ -717,6 +717,8 @@ impl StorageBackend for PapyrusStorageAdapter {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use semver::Version;
     use starknet_node_types::{
         BlockGasPrices, ContractAddress, GasPricePerToken, StarknetFelt, StarknetTransaction,
@@ -782,6 +784,31 @@ mod tests {
             .insert_block(block(2), StarknetStateDiff::default())
             .expect_err("must fail");
         assert_eq!(err, StorageError::NonSequentialBlock(2));
+    }
+
+    #[test]
+    fn rejects_invalid_block_identifiers_on_insert() {
+        let mut storage = InMemoryStorage::new(InMemoryState::default());
+        let mut invalid = block(1);
+        invalid.parent_hash = "not-a-felt".to_string();
+
+        let err = storage
+            .insert_block(invalid, StarknetStateDiff::default())
+            .expect_err("must reject invalid block");
+        assert!(matches!(err, StorageError::InvalidBlock(_)));
+    }
+
+    #[test]
+    fn rejects_invalid_state_diff_identifiers_on_insert() {
+        let mut storage = InMemoryStorage::new(InMemoryState::default());
+        let mut diff = StarknetStateDiff::default();
+        diff.storage_diffs
+            .insert("bad-contract".to_string(), BTreeMap::new());
+
+        let err = storage
+            .insert_block(block(1), diff)
+            .expect_err("must reject invalid state diff");
+        assert!(matches!(err, StorageError::InvalidStateDiff(_)));
     }
 
     #[test]

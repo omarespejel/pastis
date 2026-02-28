@@ -14,7 +14,10 @@ use rayon::ThreadPool;
 use rayon::prelude::*;
 
 pub trait NotificationSink: Send {
-    fn on_notification(&mut self, notification: StarknetExExNotification) -> Result<(), String>;
+    fn on_notification(
+        &mut self,
+        notification: Arc<StarknetExExNotification>,
+    ) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,7 +124,7 @@ impl ExExManager {
             disabled_sinks: HashSet::new(),
             buffer: VecDeque::new(),
             next_id: 1,
-            max_capacity,
+            max_capacity: max_capacity.min(MAX_WAL_REPLAY_ENTRIES),
             wal: InMemoryWal::default(),
             delivery_pool: rayon::ThreadPoolBuilder::new()
                 .num_threads(MAX_PARALLEL_DELIVERY_WORKERS.max(1))
@@ -184,7 +187,7 @@ impl ExExManager {
     }
 
     pub fn enqueue(&mut self, notification: StarknetExExNotification) -> Result<u64, ManagerError> {
-        if !self.has_capacity() {
+        if !self.has_capacity() || self.wal.entries().len() >= self.max_capacity {
             return Err(ManagerError::CapacityExceeded);
         }
 
@@ -206,6 +209,7 @@ impl ExExManager {
         let Some((notification_id, notification)) = self.buffer.front().cloned() else {
             return Ok(None);
         };
+        let notification = Arc::new(notification);
 
         if self.tiers.is_empty() {
             let mut names: Vec<String> = self.sinks.keys().cloned().collect();
@@ -244,7 +248,7 @@ impl ExExManager {
     fn deliver_tier(
         &mut self,
         tier: &[String],
-        notification: &StarknetExExNotification,
+        notification: &Arc<StarknetExExNotification>,
     ) -> Result<(), ManagerError> {
         let active_tier: Vec<String> = tier
             .iter()
@@ -345,7 +349,7 @@ impl ExExManager {
     fn deliver_to_sink(
         &self,
         name: &str,
-        notification: &StarknetExExNotification,
+        notification: &Arc<StarknetExExNotification>,
     ) -> Result<(), ManagerError> {
         let sink = self
             .sinks
@@ -357,7 +361,7 @@ impl ExExManager {
             message: "sink mutex poisoned".to_string(),
         })?;
         sink_guard
-            .on_notification(notification.clone())
+            .on_notification(Arc::clone(notification))
             .map_err(|message| ManagerError::SinkFailure {
                 name: name.to_string(),
                 message,
@@ -406,7 +410,7 @@ mod tests {
     impl NotificationSink for RecordingSink {
         fn on_notification(
             &mut self,
-            _notification: StarknetExExNotification,
+            _notification: Arc<StarknetExExNotification>,
         ) -> Result<(), String> {
             self.order_log
                 .lock()
@@ -439,7 +443,7 @@ mod tests {
     impl NotificationSink for SlowSink {
         fn on_notification(
             &mut self,
-            _notification: StarknetExExNotification,
+            _notification: Arc<StarknetExExNotification>,
         ) -> Result<(), String> {
             let start = Instant::now();
             std::thread::sleep(self.delay);
@@ -460,7 +464,7 @@ mod tests {
     impl NotificationSink for FailingSink {
         fn on_notification(
             &mut self,
-            _notification: StarknetExExNotification,
+            _notification: Arc<StarknetExExNotification>,
         ) -> Result<(), String> {
             std::thread::sleep(self.delay);
             Err(self.message.clone())
@@ -472,7 +476,7 @@ mod tests {
     impl NotificationSink for PanickingSink {
         fn on_notification(
             &mut self,
-            _notification: StarknetExExNotification,
+            _notification: Arc<StarknetExExNotification>,
         ) -> Result<(), String> {
             panic!("intentional sink panic for test");
         }
@@ -858,7 +862,7 @@ mod tests {
         impl NotificationSink for NoopSink {
             fn on_notification(
                 &mut self,
-                _notification: StarknetExExNotification,
+                _notification: Arc<StarknetExExNotification>,
             ) -> Result<(), String> {
                 Ok(())
             }
