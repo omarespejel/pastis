@@ -390,6 +390,20 @@ impl StorageBackend for InMemoryStorage {
 pub struct CheckpointSyncVerifier;
 
 impl CheckpointSyncVerifier {
+    fn normalize_hex_root(root: &str) -> String {
+        let trimmed = root.trim();
+        let unprefixed = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed);
+        let normalized = unprefixed.trim_start_matches('0').to_ascii_lowercase();
+        if normalized.is_empty() {
+            "0x0".to_string()
+        } else {
+            format!("0x{normalized}")
+        }
+    }
+
     pub fn verify(
         storage: &dyn StorageBackend,
         expected_root: &str,
@@ -405,7 +419,7 @@ impl CheckpointSyncVerifier {
                 .map_err(|error| CheckpointError::StateRootReadFailed {
                     error: error.to_string(),
                 })?;
-        if actual == expected_root {
+        if Self::normalize_hex_root(&actual) == Self::normalize_hex_root(expected_root) {
             return Ok(());
         }
         Err(CheckpointError::StateRootMismatch {
@@ -789,6 +803,71 @@ mod tests {
 
     use super::*;
 
+    #[derive(Clone)]
+    struct CanonicalRootStorage {
+        root: String,
+    }
+
+    impl HealthCheck for CanonicalRootStorage {
+        fn is_healthy(&self) -> bool {
+            true
+        }
+
+        fn detailed_status(&self) -> ComponentHealth {
+            ComponentHealth {
+                name: "canonical-root-storage".to_string(),
+                status: HealthStatus::Healthy,
+                last_block_processed: Some(0),
+                sync_lag: None,
+                error: None,
+            }
+        }
+    }
+
+    impl StorageBackend for CanonicalRootStorage {
+        fn get_state_reader(
+            &self,
+            _block_number: BlockNumber,
+        ) -> Result<Box<dyn StateReader>, StorageError> {
+            Ok(Box::new(InMemoryState::default()))
+        }
+
+        fn apply_state_diff(&mut self, _diff: &StarknetStateDiff) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        fn insert_block(
+            &mut self,
+            _block: StarknetBlock,
+            _state_diff: StarknetStateDiff,
+        ) -> Result<(), StorageError> {
+            Err(StorageError::UnsupportedOperation("insert_block"))
+        }
+
+        fn get_block(&self, _id: BlockId) -> Result<Option<StarknetBlock>, StorageError> {
+            Ok(None)
+        }
+
+        fn get_state_diff(
+            &self,
+            _block_number: BlockNumber,
+        ) -> Result<Option<StarknetStateDiff>, StorageError> {
+            Ok(None)
+        }
+
+        fn latest_block_number(&self) -> Result<BlockNumber, StorageError> {
+            Ok(0)
+        }
+
+        fn current_state_root(&self) -> Result<String, StorageError> {
+            Ok(self.root.clone())
+        }
+
+        fn state_root_semantics(&self) -> StateRootSemantics {
+            StateRootSemantics::Canonical
+        }
+    }
+
     fn block(number: BlockNumber) -> StarknetBlock {
         StarknetBlock {
             number,
@@ -900,6 +979,33 @@ mod tests {
             err,
             CheckpointError::UnsupportedStateRootSemantics {
                 backend: "in-memory-storage".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn checkpoint_verifier_normalizes_equivalent_hex_roots() {
+        let storage = CanonicalRootStorage {
+            root: "0x000AbC".to_string(),
+        };
+        CheckpointSyncVerifier::verify(&storage, "0xabc")
+            .expect("equivalent roots should be accepted");
+        CheckpointSyncVerifier::verify(&storage, "ABC")
+            .expect("prefix/case differences should be accepted");
+    }
+
+    #[test]
+    fn checkpoint_verifier_reports_mismatch_after_normalization() {
+        let storage = CanonicalRootStorage {
+            root: "0xabc".to_string(),
+        };
+        let err = CheckpointSyncVerifier::verify(&storage, "0xdef")
+            .expect_err("different canonical roots should fail");
+        assert_eq!(
+            err,
+            CheckpointError::StateRootMismatch {
+                expected: "0xdef".to_string(),
+                actual: "0xabc".to_string(),
             }
         );
     }

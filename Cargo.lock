@@ -4396,6 +4396,7 @@ name = "starknet-node-execution"
 version = "0.1.0"
 dependencies = [
  "blockifier",
+ "log",
  "node-spec-core",
  "num-traits",
  "semver",

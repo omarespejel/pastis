@@ -1092,7 +1092,10 @@ fn demo_status(
         .current_state_root()
         .map_err(|error| format!("state root read failed: {error}"))?;
     let metrics = guard.dual_metrics()?;
-    let anomalies = guard.query_anomalies_via_mcp(25)?;
+    let (anomalies, mcp_roundtrip_ok) = nonfatal_anomaly_query(
+        guard.query_anomalies_via_mcp(25),
+        "demo status anomaly query",
+    );
     Ok(StatusPayload {
         mode: DashboardModeKind::Demo.as_str().to_string(),
         chain_id: guard.node.config.chain_id.as_str().to_string(),
@@ -1100,7 +1103,7 @@ fn demo_status(
         state_root,
         tx_count: 1,
         rpc_latency_ms: saturating_u128_to_u64(started.elapsed().as_millis()),
-        mcp_roundtrip_ok: true,
+        mcp_roundtrip_ok,
         anomaly_source: "mcp:get_anomalies".to_string(),
         recent_anomaly_count: anomalies.len(),
         dual_mismatches: metrics.mismatches,
@@ -1167,7 +1170,10 @@ async fn real_status(runtime: &Arc<RealRuntime>, refresh_ms: u64) -> Result<Stat
     let snapshot = runtime.snapshot_or_refresh().await?;
     let diagnostics = runtime.diagnostics()?;
     let recent_anomaly_count = runtime.retained_anomaly_count()?;
-    let mcp_roundtrip_ok = runtime.query_anomalies_via_mcp(1)?.is_some();
+    let mcp_roundtrip_ok = nonfatal_anomaly_probe(
+        runtime.query_anomalies_via_mcp(1),
+        "real status anomaly query",
+    );
     let now = unix_now();
     let data_age_seconds = now.checked_sub(snapshot.captured_unix_seconds);
     Ok(StatusPayload {
@@ -1841,6 +1847,32 @@ fn push_recent_error(errors: &mut VecDeque<String>, message: String) {
     errors.push_back(message);
 }
 
+fn nonfatal_anomaly_query(
+    result: Result<Vec<BtcfiAnomaly>, String>,
+    context: &str,
+) -> (Vec<BtcfiAnomaly>, bool) {
+    match result {
+        Ok(anomalies) => (anomalies, true),
+        Err(error) => {
+            eprintln!("warning: {context} failed: {error}");
+            (Vec::new(), false)
+        }
+    }
+}
+
+fn nonfatal_anomaly_probe(
+    result: Result<Option<Vec<BtcfiAnomaly>>, String>,
+    context: &str,
+) -> bool {
+    match result {
+        Ok(found) => found.is_some(),
+        Err(error) => {
+            eprintln!("warning: {context} failed: {error}");
+            false
+        }
+    }
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2077,7 +2109,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       ]);
       if (!statusRes.ok || !anomaliesRes.ok || !debugRes.ok) {
         document.getElementById('meta').textContent = 'Failed to load dashboard data';
-        return;
+        return 2000;
       }
 
       const status = await statusRes.json();
@@ -2139,10 +2171,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const lastError = debug.last_error ? ` | last_error=${debug.last_error}` : '';
       document.getElementById('meta').textContent =
         `Refreshed in ${fetchMs}ms | API refresh=${status.refresh_ms}ms | anomaly source=${anomalies.source}${replayError}${lastError}`;
+      const configuredRefresh = Number(status.refresh_ms);
+      return Number.isFinite(configuredRefresh) && configuredRefresh >= 250 ? configuredRefresh : 2000;
     }
 
-    load();
-    setInterval(load, 2000);
+    async function tick() {
+      const nextMs = await load().catch(() => 2000);
+      setTimeout(tick, nextMs);
+    }
+    void tick();
   </script>
 </body>
 </html>
@@ -2429,5 +2466,20 @@ mod tests {
         assert_eq!(metrics.mismatches, 0);
         assert_eq!(metrics.fast_executions, 1);
         assert_eq!(metrics.canonical_executions, 1);
+    }
+
+    #[test]
+    fn nonfatal_anomaly_query_degrades_to_empty_results_on_error() {
+        let (anomalies, roundtrip_ok) =
+            nonfatal_anomaly_query(Err("mcp unavailable".to_string()), "test anomaly query");
+        assert!(!roundtrip_ok);
+        assert!(anomalies.is_empty());
+    }
+
+    #[test]
+    fn nonfatal_anomaly_probe_degrades_to_false_on_error() {
+        let roundtrip_ok =
+            nonfatal_anomaly_probe(Err("mcp unavailable".to_string()), "test anomaly probe");
+        assert!(!roundtrip_ok);
     }
 }

@@ -166,6 +166,16 @@ mod tests {
             .prove_block(42)
             .expect_err("missing traces must fail");
         assert_eq!(err, ProvingError::TraceUnavailable { block_number: 42 });
+        let calls = pipeline
+            .prover
+            .calls
+            .lock()
+            .expect("calls mutex should not be poisoned")
+            .clone();
+        assert!(
+            calls.is_empty(),
+            "prover must not be called when traces are missing"
+        );
     }
 
     #[test]
@@ -180,6 +190,16 @@ mod tests {
             .prove_block(42)
             .expect_err("empty trace set must fail");
         assert_eq!(err, ProvingError::EmptyTraceSet { block_number: 42 });
+        let calls = pipeline
+            .prover
+            .calls
+            .lock()
+            .expect("calls mutex should not be poisoned")
+            .clone();
+        assert!(
+            calls.is_empty(),
+            "prover must not be called when traces are empty"
+        );
     }
 
     #[test]

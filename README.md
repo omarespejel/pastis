@@ -40,19 +40,19 @@ This repository currently ships core, tested building blocks:
 
 Source entry points:
 
-- [crates/node-spec-core/src/notification.rs](/Users/espejelomar/StarkNet/pastis/crates/node-spec-core/src/notification.rs)
-- [crates/node-spec-core/src/exex_delivery.rs](/Users/espejelomar/StarkNet/pastis/crates/node-spec-core/src/exex_delivery.rs)
-- [crates/node-spec-core/src/l1_finality.rs](/Users/espejelomar/StarkNet/pastis/crates/node-spec-core/src/l1_finality.rs)
-- [crates/node-spec-core/src/protocol_version.rs](/Users/espejelomar/StarkNet/pastis/crates/node-spec-core/src/protocol_version.rs)
-- [crates/storage/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/storage/src/lib.rs)
-- [crates/execution/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/execution/src/lib.rs)
-- [crates/exex-manager/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/exex-manager/src/lib.rs)
-- [crates/exex-otel/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/exex-otel/src/lib.rs)
-- [crates/exex-btcfi/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/exex-btcfi/src/lib.rs)
-- [crates/proving/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/proving/src/lib.rs)
-- [crates/mcp-server/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/mcp-server/src/lib.rs)
-- [crates/rpc/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/rpc/src/lib.rs)
-- [crates/node/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/node/src/lib.rs)
+- [crates/node-spec-core/src/notification.rs](./crates/node-spec-core/src/notification.rs)
+- [crates/node-spec-core/src/exex_delivery.rs](./crates/node-spec-core/src/exex_delivery.rs)
+- [crates/node-spec-core/src/l1_finality.rs](./crates/node-spec-core/src/l1_finality.rs)
+- [crates/node-spec-core/src/protocol_version.rs](./crates/node-spec-core/src/protocol_version.rs)
+- [crates/storage/src/lib.rs](./crates/storage/src/lib.rs)
+- [crates/execution/src/lib.rs](./crates/execution/src/lib.rs)
+- [crates/exex-manager/src/lib.rs](./crates/exex-manager/src/lib.rs)
+- [crates/exex-otel/src/lib.rs](./crates/exex-otel/src/lib.rs)
+- [crates/exex-btcfi/src/lib.rs](./crates/exex-btcfi/src/lib.rs)
+- [crates/proving/src/lib.rs](./crates/proving/src/lib.rs)
+- [crates/mcp-server/src/lib.rs](./crates/mcp-server/src/lib.rs)
+- [crates/rpc/src/lib.rs](./crates/rpc/src/lib.rs)
+- [crates/node/src/lib.rs](./crates/node/src/lib.rs)
 
 ## External Integration Boundaries
 

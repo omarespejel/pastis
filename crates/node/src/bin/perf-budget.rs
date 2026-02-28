@@ -354,7 +354,9 @@ fn detect_mem_total_kib() -> Option<u64> {
 
 fn parse_cpu_model(cpuinfo: &str) -> Option<String> {
     for line in cpuinfo.lines() {
-        let (key, value) = line.split_once(':')?;
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
         if key.trim() == "model name" {
             let value = value.trim();
             if !value.is_empty() {
@@ -367,12 +369,16 @@ fn parse_cpu_model(cpuinfo: &str) -> Option<String> {
 
 fn parse_mem_total_kib(meminfo: &str) -> Option<u64> {
     for line in meminfo.lines() {
-        let (key, value) = line.split_once(':')?;
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
         if key.trim() != "MemTotal" {
             continue;
         }
-        let amount = value.split_whitespace().next()?;
-        return amount.parse::<u64>().ok();
+        let amount = value.split_whitespace().next();
+        if let Some(amount) = amount {
+            return amount.parse::<u64>().ok();
+        }
     }
     None
 }
@@ -469,11 +475,33 @@ model name\t: Example CPU 9000
     }
 
     #[test]
+    fn parses_cpu_model_ignores_malformed_lines() {
+        let cpuinfo = "\
+this line is malformed
+processor\t: 0
+model name\t: Example CPU 9001
+";
+        assert_eq!(
+            parse_cpu_model(cpuinfo),
+            Some("Example CPU 9001".to_string())
+        );
+    }
+
+    #[test]
     fn parses_mem_total_from_linux_meminfo() {
         let meminfo = "\
 MemTotal:       65843088 kB
 MemFree:        12345678 kB
 ";
         assert_eq!(parse_mem_total_kib(meminfo), Some(65_843_088));
+    }
+
+    #[test]
+    fn parses_mem_total_ignores_malformed_lines() {
+        let meminfo = "\
+This line is malformed
+MemTotal:       1024 kB
+";
+        assert_eq!(parse_mem_total_kib(meminfo), Some(1_024));
     }
 }

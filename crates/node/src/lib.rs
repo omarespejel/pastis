@@ -1,7 +1,13 @@
 #![forbid(unsafe_code)]
 
 #[cfg(feature = "production-adapters")]
-use std::sync::{Arc, Mutex};
+use std::cell::RefCell;
+#[cfg(feature = "production-adapters")]
+use std::collections::BTreeMap;
+#[cfg(feature = "production-adapters")]
+use std::sync::Arc;
+#[cfg(feature = "production-adapters")]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "production-adapters")]
 use apollo_storage::StorageReader as ApolloStorageReader;
@@ -347,18 +353,30 @@ impl<S: StorageBackend, E: ExecutionBackend> StarknetNodeBuilder<WithStorage<S>,
 #[cfg(feature = "production-adapters")]
 struct ApolloBlockifierClassProvider {
     reader: ApolloStorageReader,
-    state_number: Mutex<StarknetApiStateNumber>,
+    instance_id: u64,
 }
 
 #[cfg(feature = "production-adapters")]
 impl ApolloBlockifierClassProvider {
+    fn next_instance_id() -> u64 {
+        static NEXT_CLASS_PROVIDER_ID: AtomicU64 = AtomicU64::new(1);
+        NEXT_CLASS_PROVIDER_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn with_thread_local_state<T>(
+        f: impl FnOnce(&mut BTreeMap<u64, StarknetApiStateNumber>) -> T,
+    ) -> T {
+        thread_local! {
+            static STATE_BY_PROVIDER_ID: RefCell<BTreeMap<u64, StarknetApiStateNumber>> =
+                const { RefCell::new(BTreeMap::new()) };
+        }
+        STATE_BY_PROVIDER_ID.with(|state| f(&mut state.borrow_mut()))
+    }
+
     fn new(reader: ApolloStorageReader) -> Self {
         Self {
             reader,
-            // Default to pre-genesis; block/simulation hooks will update this before reads.
-            state_number: Mutex::new(StarknetApiStateNumber::right_before_block(
-                StarknetApiBlockNumber(0),
-            )),
+            instance_id: Self::next_instance_id(),
         }
     }
 
@@ -376,20 +394,19 @@ impl ApolloBlockifierClassProvider {
         Self::pre_execution_state_number(block_number)
     }
 
-    fn read_state_number(&self) -> Result<StarknetApiStateNumber, StateError> {
-        self.state_number
-            .lock()
-            .map(|guard| *guard)
-            .map_err(|_| StateError::StateReadError("class provider mutex poisoned".to_string()))
+    fn read_state_number(&self) -> StarknetApiStateNumber {
+        Self::with_thread_local_state(|state| {
+            state
+                .get(&self.instance_id)
+                .copied()
+                .unwrap_or_else(|| Self::pre_execution_state_number(0))
+        })
     }
 
-    fn write_state_number(&self, state_number: StarknetApiStateNumber) -> Result<(), StateError> {
-        let mut guard = self
-            .state_number
-            .lock()
-            .map_err(|_| StateError::StateReadError("class provider mutex poisoned".to_string()))?;
-        *guard = state_number;
-        Ok(())
+    fn write_state_number(&self, state_number: StarknetApiStateNumber) {
+        Self::with_thread_local_state(|state| {
+            state.insert(self.instance_id, state_number);
+        });
     }
 
     fn map_storage_error(context: &'static str, error: impl std::fmt::Display) -> StateError {
@@ -404,18 +421,20 @@ impl BlockifierClassProvider for ApolloBlockifierClassProvider {
     }
 
     fn prepare_for_block_execution(&self, block_number: u64) -> Result<(), StateError> {
-        self.write_state_number(Self::pre_execution_state_number(block_number))
+        self.write_state_number(Self::pre_execution_state_number(block_number));
+        Ok(())
     }
 
     fn prepare_for_simulation(&self, block_number: u64) -> Result<(), StateError> {
-        self.write_state_number(Self::simulation_state_number(block_number))
+        self.write_state_number(Self::simulation_state_number(block_number));
+        Ok(())
     }
 
     fn get_class_hash_at(
         &self,
         contract_address: StarknetApiContractAddress,
     ) -> Result<StarknetApiClassHash, StateError> {
-        let state_number = self.read_state_number()?;
+        let state_number = self.read_state_number();
         let txn = self.reader.begin_ro_txn().map_err(|error| {
             Self::map_storage_error("open apollo read txn for class hash", error)
         })?;
@@ -486,7 +505,7 @@ impl BlockifierClassProvider for ApolloBlockifierClassProvider {
         &self,
         class_hash: StarknetApiClassHash,
     ) -> Result<StarknetApiCompiledClassHash, StateError> {
-        let state_number = self.read_state_number()?;
+        let state_number = self.read_state_number();
         let txn = self.reader.begin_ro_txn().map_err(|error| {
             Self::map_storage_error("open apollo read txn for compiled class hash", error)
         })?;
@@ -549,6 +568,8 @@ mod tests {
     use std::collections::BTreeSet;
     #[cfg(feature = "production-adapters")]
     use std::path::Path;
+    #[cfg(feature = "production-adapters")]
+    use std::sync::{Arc, Barrier};
     use std::time::Duration;
 
     #[cfg(feature = "production-adapters")]
@@ -1066,6 +1087,47 @@ mod tests {
             .get_compiled_class(class_hash)
             .expect_err("must fail without declared class artifacts");
         assert!(matches!(err, StateError::UndeclaredClassHash(hash) if hash == class_hash));
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn apollo_class_provider_state_binding_is_thread_local() {
+        let dir = tempdir().expect("temp dir");
+        let (reader, mut writer) =
+            open_apollo_storage(apollo_config(dir.path())).expect("open apollo storage");
+        let (contract, class_hash, _) = seed_header_and_state_with_class_hash(&mut writer);
+        let adapter = ApolloStorageAdapter::from_parts(reader, writer);
+        let provider = Arc::new(ApolloBlockifierClassProvider::new(adapter.reader_handle()));
+        let barrier = Arc::new(Barrier::new(2));
+
+        let provider_a = Arc::clone(&provider);
+        let barrier_a = Arc::clone(&barrier);
+        let thread_a = std::thread::spawn(move || {
+            provider_a
+                .prepare_for_block_execution(0)
+                .expect("prepare pre-genesis state in thread A");
+            barrier_a.wait();
+            provider_a
+                .get_class_hash_at(contract)
+                .expect("thread A class hash lookup")
+        });
+
+        let provider_b = Arc::clone(&provider);
+        let barrier_b = Arc::clone(&barrier);
+        let thread_b = std::thread::spawn(move || {
+            provider_b
+                .prepare_for_block_execution(1)
+                .expect("prepare block one state in thread B");
+            barrier_b.wait();
+            provider_b
+                .get_class_hash_at(contract)
+                .expect("thread B class hash lookup")
+        });
+
+        let hash_a = thread_a.join().expect("thread A should join");
+        let hash_b = thread_b.join().expect("thread B should join");
+        assert_eq!(hash_a, StarknetApiClassHash::default());
+        assert_eq!(hash_b, class_hash);
     }
 
     #[cfg(feature = "production-adapters")]

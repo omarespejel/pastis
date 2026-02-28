@@ -344,7 +344,7 @@ impl DualExecutionBackend {
                 let outputs_match = fast_output.receipts == canonical_output.receipts
                     && fast_output.state_diff == canonical_output.state_diff;
                 if fast_output.builtin_stats != canonical_output.builtin_stats {
-                    eprintln!(
+                    log::warn!(
                         "warning: dual verification observed differing builtin stats at block {}",
                         block.number
                     );

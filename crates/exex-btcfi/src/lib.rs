@@ -280,7 +280,7 @@ impl StrkBtcMonitor {
         contract_btc_height: u64,
         observed_btc_height: u64,
     ) -> Vec<BtcfiAnomaly> {
-        let lag = observed_btc_height.saturating_sub(contract_btc_height);
+        let lag = observed_btc_height.abs_diff(contract_btc_height);
         if lag > self.config.light_client_max_lag_blocks {
             return vec![BtcfiAnomaly::StrkBtcLightClientDivergence {
                 block_number,
@@ -616,6 +616,15 @@ mod tests {
         let light_client = monitor.observe_light_client_heights(100, 1_000, 1_010);
         assert!(matches!(
             light_client.as_slice(),
+            [BtcfiAnomaly::StrkBtcLightClientDivergence {
+                max_lag_blocks: 6,
+                ..
+            }]
+        ));
+
+        let reverse_lag = monitor.observe_light_client_heights(100, 1_010, 1_000);
+        assert!(matches!(
+            reverse_lag.as_slice(),
             [BtcfiAnomaly::StrkBtcLightClientDivergence {
                 max_lag_blocks: 6,
                 ..
