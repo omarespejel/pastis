@@ -29,6 +29,7 @@ This repository currently ships core, tested building blocks:
 - Storage backends with Apollo adapter tests against real Starknet fixture data
 - Dual execution orchestration with canonical fallback/mismatch handling
 - ExEx manager with bounded WAL replay and failing-sink circuit breaker
+- OTel-style ExEx sink with deterministic per-block metrics capture and regression counters
 - MCP server request handler with authenticated tool execution and bounded batch support
 - JSON-RPC server request handler with strict JSON-RPC 2.0 validation and Starknet core method coverage
 - Type-state node builder that enforces composition order
@@ -42,6 +43,7 @@ Source entry points:
 - [crates/storage/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/storage/src/lib.rs)
 - [crates/execution/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/execution/src/lib.rs)
 - [crates/exex-manager/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/exex-manager/src/lib.rs)
+- [crates/exex-otel/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/exex-otel/src/lib.rs)
 - [crates/mcp-server/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/mcp-server/src/lib.rs)
 - [crates/rpc/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/rpc/src/lib.rs)
 - [crates/node/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/node/src/lib.rs)
@@ -131,10 +133,9 @@ Near-term implementation sequence:
 
 1. Expand Apollo-backed adapters and fixture coverage
 2. Continue hardening Blockifier adapter semantics across protocol versions
-3. Extend ExEx manager recovery and failure isolation behavior
-4. Extend RPC method coverage and map full Starknet error taxonomy
-5. Extend MCP server surface beyond control-plane tools (state query params, simulation, submit)
-6. Add BTCFi/strkBTC monitoring ExEx implementations
+3. Extend RPC method coverage and map full Starknet error taxonomy
+4. Extend MCP server surface beyond control-plane tools (state query params, simulation, submit)
+5. Add BTCFi/strkBTC monitoring ExEx implementations
 
 Long-term:
 

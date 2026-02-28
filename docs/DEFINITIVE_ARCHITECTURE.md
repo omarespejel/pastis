@@ -187,6 +187,7 @@ The repository currently includes core and phase-aligned scaffolding crates that
 - Dual execution mismatch handling with canonical-state safety
 - Blockifier adapter fail-fast guard for account transactions when class-provider integration is unavailable
 - ExEx registration hardening: per-ExEx credentials, allowlisted identities, trusted in-process sink enforcement, and sink recovery cooldown/re-enable
+- OTel-style ExEx sink implementation with deterministic notification-derived counters and block-regression telemetry
 - Node config hardening with validated `ChainId` parsing (mainnet/sepolia/custom strict format)
 - JSON-RPC server request handling with strict JSON-RPC envelope validation and deterministic error mapping
 - Type-state node builder enforcing storage-before-execution composition
@@ -205,3 +206,4 @@ See code in:
 - `crates/rpc/src/lib.rs`
 - `crates/node/src/lib.rs`
 - `crates/exex-manager/src/lib.rs`
+- `crates/exex-otel/src/lib.rs`

@@ -4160,6 +4160,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "starknet-node-exex-otel"
+version = "0.1.0"
+dependencies = [
+ "node-spec-core",
+ "starknet-node-exex-manager",
+]
+
+[[package]]
 name = "starknet-node-mcp-server"
 version = "0.1.0"
 dependencies = [

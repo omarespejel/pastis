@@ -1,0 +1,10 @@
+[package]
+name = "starknet-node-exex-otel"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+node-spec-core = { path = "../node-spec-core" }
+starknet-node-exex-manager = { path = "../exex-manager" }
+
