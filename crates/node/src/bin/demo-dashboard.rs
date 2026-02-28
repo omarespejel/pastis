@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,7 +27,7 @@ use starknet_node_mcp_server::{McpRequest, McpResponse};
 use starknet_node_storage::{InMemoryStorage, StorageBackend};
 use starknet_node_types::{
     BlockContext, BlockGasPrices, BuiltinStats, ContractAddress, ExecutionOutput, GasPricePerToken,
-    InMemoryState, MutableState, SimulationResult, StarknetBlock, StarknetReceipt,
+    InMemoryState, MutableState, SimulationResult, StarknetBlock, StarknetFelt, StarknetReceipt,
     StarknetStateDiff, StarknetTransaction, StateReader,
 };
 use tokio::net::TcpListener;
@@ -36,6 +37,7 @@ const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
 const DEFAULT_REFRESH_MS: u64 = 2_000;
 const DEMO_API_KEY: &str = "boss-demo-key";
 const MAX_RECENT_ERRORS: usize = 16;
+const MAX_RECENT_ANOMALIES: usize = 512;
 
 const WBTC_CONTRACT: &str = "0x111";
 const STRKBTC_SHIELDED_POOL: &str = "0x222";
@@ -75,6 +77,13 @@ struct DashboardConfig {
     bind_addr: String,
     refresh_ms: u64,
     rpc_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RealBtcfiConfig {
+    wrappers: Vec<StandardWrapperConfig>,
+    strkbtc: StrkBtcMonitorConfig,
+    max_retained_anomalies: usize,
 }
 
 #[derive(Clone)]
@@ -345,6 +354,13 @@ struct RealSnapshot {
     captured_unix_seconds: u64,
 }
 
+#[derive(Debug, Clone)]
+struct RealFetch {
+    snapshot: RealSnapshot,
+    state_diff: StarknetStateDiff,
+    parse_warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct RuntimeDiagnostics {
     success_count: u64,
@@ -352,8 +368,11 @@ struct RuntimeDiagnostics {
     consecutive_failures: u64,
     last_success_unix_seconds: Option<u64>,
     last_failure_unix_seconds: Option<u64>,
+    last_processed_block: Option<u64>,
     last_error: Option<String>,
     recent_errors: Vec<String>,
+    anomaly_monitor_enabled: bool,
+    retained_anomaly_count: usize,
 }
 
 impl RuntimeDiagnostics {
@@ -364,8 +383,11 @@ impl RuntimeDiagnostics {
             consecutive_failures: 0,
             last_success_unix_seconds: None,
             last_failure_unix_seconds: None,
+            last_processed_block: None,
             last_error: None,
             recent_errors: Vec::new(),
+            anomaly_monitor_enabled: false,
+            retained_anomaly_count: 0,
         }
     }
 }
@@ -380,16 +402,32 @@ struct RealRuntimeState {
 #[derive(Clone)]
 struct RealRuntime {
     client: Arc<RealRpcClient>,
+    btcfi: Option<Arc<Mutex<BtcfiExEx>>>,
     state: Arc<Mutex<RealRuntimeState>>,
 }
 
 impl RealRuntime {
-    fn new(client: RealRpcClient) -> Self {
+    fn new(client: RealRpcClient, btcfi_config: Option<RealBtcfiConfig>) -> Self {
+        let btcfi = btcfi_config.map(|cfg| {
+            let wrappers = cfg
+                .wrappers
+                .into_iter()
+                .map(StandardWrapperMonitor::new)
+                .collect();
+            Arc::new(Mutex::new(BtcfiExEx::new(
+                wrappers,
+                StrkBtcMonitor::new(cfg.strkbtc),
+                cfg.max_retained_anomalies,
+            )))
+        });
+        let mut diagnostics = RuntimeDiagnostics::new();
+        diagnostics.anomaly_monitor_enabled = btcfi.is_some();
         Self {
             client: Arc::new(client),
+            btcfi,
             state: Arc::new(Mutex::new(RealRuntimeState {
                 snapshot: None,
-                diagnostics: RuntimeDiagnostics::new(),
+                diagnostics,
                 recent_errors: VecDeque::new(),
             })),
         }
@@ -397,18 +435,45 @@ impl RealRuntime {
 
     async fn poll_once(&self) -> Result<RealSnapshot, String> {
         match self.client.fetch_status().await {
-            Ok(snapshot) => {
+            Ok(fetch) => {
                 let mut guard = self
                     .state
                     .lock()
                     .map_err(|_| "real runtime lock poisoned".to_string())?;
-                guard.snapshot = Some(snapshot.clone());
+                guard.snapshot = Some(fetch.snapshot.clone());
                 guard.diagnostics.success_count = guard.diagnostics.success_count.saturating_add(1);
                 guard.diagnostics.consecutive_failures = 0;
                 guard.diagnostics.last_success_unix_seconds = Some(unix_now());
                 guard.diagnostics.last_error = None;
+                for warning in fetch.parse_warnings {
+                    push_recent_error(&mut guard.recent_errors, format!("warning: {warning}"));
+                }
+                if let Some(btcfi) = &self.btcfi {
+                    let should_process = guard
+                        .diagnostics
+                        .last_processed_block
+                        .map(|last| fetch.snapshot.latest_block > last)
+                        .unwrap_or(true);
+                    match btcfi.lock() {
+                        Ok(mut monitor) => {
+                            if should_process {
+                                let _ = monitor
+                                    .process_block(fetch.snapshot.latest_block, &fetch.state_diff);
+                                guard.diagnostics.last_processed_block =
+                                    Some(fetch.snapshot.latest_block);
+                            }
+                            guard.diagnostics.retained_anomaly_count =
+                                monitor.recent_anomalies(MAX_RECENT_ANOMALIES).len();
+                        }
+                        Err(_) => {
+                            let message = "btcfi monitor lock poisoned".to_string();
+                            guard.diagnostics.last_error = Some(message.clone());
+                            push_recent_error(&mut guard.recent_errors, message);
+                        }
+                    }
+                }
                 guard.diagnostics.recent_errors = guard.recent_errors.iter().cloned().collect();
-                Ok(snapshot)
+                Ok(fetch.snapshot)
             }
             Err(error) => {
                 let mut guard = self
@@ -450,10 +515,34 @@ impl RealRuntime {
         Ok(guard.diagnostics.clone())
     }
 
-    fn anomaly_notes(&self, limit: usize) -> Result<Vec<String>, String> {
+    fn anomaly_source_name(&self) -> &'static str {
+        if self.btcfi.is_some() {
+            "btcfi:state-diff"
+        } else {
+            "unconfigured"
+        }
+    }
+
+    fn recent_anomalies(&self, limit: usize) -> Result<Option<Vec<BtcfiAnomaly>>, String> {
+        let Some(btcfi) = &self.btcfi else {
+            return Ok(None);
+        };
+        let guard = btcfi
+            .lock()
+            .map_err(|_| "btcfi monitor lock poisoned".to_string())?;
+        Ok(Some(guard.recent_anomalies(limit)))
+    }
+
+    fn anomaly_strings(&self, limit: usize) -> Result<Vec<String>, String> {
+        if let Some(anomalies) = self.recent_anomalies(limit)? {
+            return Ok(anomalies
+                .into_iter()
+                .map(|anomaly| format!("{anomaly:?}"))
+                .collect());
+        }
         let diagnostics = self.diagnostics()?;
         let mut notes = vec![format!(
-            "Real mode connected to {}. MCP anomaly source is not configured in this process yet.",
+            "Real mode connected to {}. BTCFi monitor is not configured; set PASTIS_MONITOR_STRKBTC_SHIELDED_POOL to enable it.",
             self.client.rpc_url
         )];
         if let Some(last_error) = diagnostics.last_error {
@@ -464,12 +553,6 @@ impl RealRuntime {
                 "Consecutive RPC failures: {}",
                 diagnostics.consecutive_failures
             ));
-        }
-        if limit > notes.len() {
-            notes.push(
-                "Connect a Pastis MCP anomaly endpoint to replace these notes with live alerts."
-                    .to_string(),
-            );
         }
         notes.truncate(limit);
         Ok(notes)
@@ -484,7 +567,7 @@ impl RealRpcClient {
         Ok(Self { http, rpc_url })
     }
 
-    async fn fetch_status(&self) -> Result<RealSnapshot, String> {
+    async fn fetch_status(&self) -> Result<RealFetch, String> {
         let started = Instant::now();
 
         let chain_id_raw = self.call("starknet_chainId", json!([])).await?;
@@ -512,14 +595,19 @@ impl RealRpcClient {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string();
+        let (state_diff, parse_warnings) = state_update_to_diff(&state_update)?;
 
-        Ok(RealSnapshot {
-            chain_id,
-            latest_block,
-            state_root,
-            tx_count,
-            rpc_latency_ms: saturating_u128_to_u64(started.elapsed().as_millis()),
-            captured_unix_seconds: unix_now(),
+        Ok(RealFetch {
+            snapshot: RealSnapshot {
+                chain_id,
+                latest_block,
+                state_root,
+                tx_count,
+                rpc_latency_ms: saturating_u128_to_u64(started.elapsed().as_millis()),
+                captured_unix_seconds: unix_now(),
+            },
+            state_diff,
+            parse_warnings,
         })
     }
 
@@ -592,6 +680,9 @@ struct DebugPayload {
     consecutive_failures: u64,
     last_success_unix_seconds: Option<u64>,
     last_failure_unix_seconds: Option<u64>,
+    last_processed_block: Option<u64>,
+    anomaly_monitor_enabled: bool,
+    retained_anomaly_count: usize,
     last_error: Option<String>,
     recent_errors: Vec<String>,
     snapshot_available: bool,
@@ -623,7 +714,8 @@ async fn main() -> Result<(), String> {
             let rpc_url = config.rpc_url.clone().ok_or_else(|| {
                 "real mode requires --rpc-url <url> or STARKNET_RPC_URL".to_string()
             })?;
-            let runtime = Arc::new(RealRuntime::new(RealRpcClient::new(rpc_url)?));
+            let btcfi_config = parse_real_btcfi_config_from_env()?;
+            let runtime = Arc::new(RealRuntime::new(RealRpcClient::new(rpc_url)?, btcfi_config));
             let poll_runtime = Arc::clone(&runtime);
             tokio::spawn(async move {
                 let mut ticker = interval(Duration::from_millis(refresh_ms));
@@ -639,6 +731,11 @@ async fn main() -> Result<(), String> {
             }
             DashboardSource::Real { runtime }
         }
+    };
+
+    let anomaly_source = match &source {
+        DashboardSource::Demo { .. } => "mcp:get_anomalies".to_string(),
+        DashboardSource::Real { runtime } => runtime.anomaly_source_name().to_string(),
     };
 
     let app = Router::new()
@@ -659,6 +756,7 @@ async fn main() -> Result<(), String> {
     if let Some(rpc_url) = &config.rpc_url {
         println!("rpc url: {rpc_url}");
     }
+    println!("anomaly source: {anomaly_source}");
     axum::serve(listener, app)
         .await
         .map_err(|error| format!("dashboard server failed: {error}"))?;
@@ -766,6 +864,11 @@ fn demo_debug(runtime: &Arc<Mutex<DemoRuntime>>, refresh_ms: u64) -> Result<Debu
         consecutive_failures: 0,
         last_success_unix_seconds: None,
         last_failure_unix_seconds: None,
+        last_processed_block: Some(guard.next_block.saturating_sub(1)),
+        anomaly_monitor_enabled: true,
+        retained_anomaly_count: guard
+            .query_anomalies_via_mcp(MAX_RECENT_ANOMALIES as u64)?
+            .len(),
         last_error: guard.last_error.clone(),
         recent_errors: guard.recent_errors.iter().cloned().collect(),
         snapshot_available: guard.tick_successes > 0,
@@ -775,7 +878,7 @@ fn demo_debug(runtime: &Arc<Mutex<DemoRuntime>>, refresh_ms: u64) -> Result<Debu
 async fn real_status(runtime: &Arc<RealRuntime>, refresh_ms: u64) -> Result<StatusPayload, String> {
     let snapshot = runtime.snapshot_or_refresh().await?;
     let diagnostics = runtime.diagnostics()?;
-    let anomalies = runtime.anomaly_notes(1)?;
+    let anomalies = runtime.anomaly_strings(1)?;
     let now = unix_now();
     let data_age_seconds = now.checked_sub(snapshot.captured_unix_seconds);
     Ok(StatusPayload {
@@ -786,7 +889,7 @@ async fn real_status(runtime: &Arc<RealRuntime>, refresh_ms: u64) -> Result<Stat
         tx_count: snapshot.tx_count,
         rpc_latency_ms: snapshot.rpc_latency_ms,
         mcp_roundtrip_ok: false,
-        anomaly_source: "unconfigured".to_string(),
+        anomaly_source: runtime.anomaly_source_name().to_string(),
         recent_anomaly_count: anomalies.len(),
         data_age_seconds,
         failure_count: diagnostics.failure_count,
@@ -797,9 +900,9 @@ async fn real_status(runtime: &Arc<RealRuntime>, refresh_ms: u64) -> Result<Stat
 }
 
 async fn real_anomalies(runtime: &Arc<RealRuntime>) -> Result<AnomaliesPayload, String> {
-    let anomalies = runtime.anomaly_notes(25)?;
+    let anomalies = runtime.anomaly_strings(25)?;
     Ok(AnomaliesPayload {
-        source: "unconfigured".to_string(),
+        source: runtime.anomaly_source_name().to_string(),
         anomalies,
     })
 }
@@ -814,6 +917,9 @@ fn real_debug(runtime: &Arc<RealRuntime>, refresh_ms: u64) -> Result<DebugPayloa
         consecutive_failures: diagnostics.consecutive_failures,
         last_success_unix_seconds: diagnostics.last_success_unix_seconds,
         last_failure_unix_seconds: diagnostics.last_failure_unix_seconds,
+        last_processed_block: diagnostics.last_processed_block,
+        anomaly_monitor_enabled: diagnostics.anomaly_monitor_enabled,
+        retained_anomaly_count: diagnostics.retained_anomaly_count,
         last_error: diagnostics.last_error,
         recent_errors: diagnostics.recent_errors,
         snapshot_available: runtime.snapshot()?.is_some(),
@@ -931,13 +1037,345 @@ fn parse_refresh_ms(raw: &str) -> Result<u64, String> {
         .map_err(|error| format!("invalid refresh value `{raw}`: {error}"))
 }
 
+fn parse_real_btcfi_config_from_env() -> Result<Option<RealBtcfiConfig>, String> {
+    let Some(strkbtc_pool) = env::var("PASTIS_MONITOR_STRKBTC_SHIELDED_POOL").ok() else {
+        return Ok(None);
+    };
+
+    let mut wrappers = Vec::new();
+    if let Ok(wbtc_contract) = env::var("PASTIS_MONITOR_WBTC_CONTRACT") {
+        wrappers.push(StandardWrapperConfig {
+            wrapper: StandardWrapper::Wbtc,
+            token_contract: ContractAddress::from(wbtc_contract),
+            total_supply_key: env::var("PASTIS_MONITOR_WBTC_TOTAL_SUPPLY_KEY")
+                .unwrap_or_else(|_| "0x1".to_string()),
+            expected_supply_sats: parse_env_u128(
+                "PASTIS_MONITOR_WBTC_EXPECTED_SUPPLY_SATS",
+                1_000_000,
+            )?,
+            allowed_deviation_bps: parse_env_u64("PASTIS_MONITOR_WBTC_ALLOWED_DEVIATION_BPS", 50)?,
+        });
+    }
+
+    let strkbtc = StrkBtcMonitorConfig {
+        shielded_pool_contract: ContractAddress::from(strkbtc_pool),
+        merkle_root_key: env::var("PASTIS_MONITOR_STRKBTC_MERKLE_ROOT_KEY")
+            .unwrap_or_else(|_| STRKBTC_MERKLE_ROOT_KEY.to_string()),
+        commitment_count_key: env::var("PASTIS_MONITOR_STRKBTC_COMMITMENT_COUNT_KEY")
+            .unwrap_or_else(|_| STRKBTC_COMMITMENT_COUNT_KEY.to_string()),
+        nullifier_count_key: env::var("PASTIS_MONITOR_STRKBTC_NULLIFIER_COUNT_KEY")
+            .unwrap_or_else(|_| STRKBTC_NULLIFIER_COUNT_KEY.to_string()),
+        nullifier_key_prefix: env::var("PASTIS_MONITOR_STRKBTC_NULLIFIER_PREFIX")
+            .unwrap_or_else(|_| STRKBTC_NULLIFIER_PREFIX.to_string()),
+        commitment_flood_threshold: parse_env_u64(
+            "PASTIS_MONITOR_STRKBTC_COMMITMENT_FLOOD_THRESHOLD",
+            8,
+        )?,
+        unshield_cluster_threshold: parse_env_u64(
+            "PASTIS_MONITOR_STRKBTC_UNSHIELD_CLUSTER_THRESHOLD",
+            4,
+        )?,
+        unshield_cluster_window_blocks: parse_env_u64(
+            "PASTIS_MONITOR_STRKBTC_UNSHIELD_CLUSTER_WINDOW_BLOCKS",
+            3,
+        )?,
+        light_client_max_lag_blocks: parse_env_u64(
+            "PASTIS_MONITOR_STRKBTC_LIGHT_CLIENT_MAX_LAG_BLOCKS",
+            6,
+        )?,
+        bridge_timeout_blocks: parse_env_u64("PASTIS_MONITOR_STRKBTC_BRIDGE_TIMEOUT_BLOCKS", 20)?,
+        max_tracked_nullifiers: parse_env_usize(
+            "PASTIS_MONITOR_STRKBTC_MAX_TRACKED_NULLIFIERS",
+            10_000,
+        )?,
+    };
+
+    Ok(Some(RealBtcfiConfig {
+        wrappers,
+        strkbtc,
+        max_retained_anomalies: parse_env_usize(
+            "PASTIS_MONITOR_MAX_RETAINED_ANOMALIES",
+            MAX_RECENT_ANOMALIES,
+        )?,
+    }))
+}
+
+fn parse_env_u64(name: &str, default: u64) -> Result<u64, String> {
+    match env::var(name) {
+        Ok(raw) => raw
+            .parse::<u64>()
+            .map_err(|error| format!("invalid {name} value `{raw}`: {error}")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn parse_env_u128(name: &str, default: u128) -> Result<u128, String> {
+    match env::var(name) {
+        Ok(raw) => raw
+            .parse::<u128>()
+            .map_err(|error| format!("invalid {name} value `{raw}`: {error}")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn parse_env_usize(name: &str, default: usize) -> Result<usize, String> {
+    match env::var(name) {
+        Ok(raw) => raw
+            .parse::<usize>()
+            .map_err(|error| format!("invalid {name} value `{raw}`: {error}")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn state_update_to_diff(state_update: &Value) -> Result<(StarknetStateDiff, Vec<String>), String> {
+    let mut diff = StarknetStateDiff::default();
+    let mut warnings = Vec::new();
+    let state_diff = state_update
+        .get("state_diff")
+        .ok_or_else(|| format!("state_update is missing state_diff: {state_update}"))?;
+
+    if let Some(storage_diffs) = state_diff.get("storage_diffs") {
+        parse_storage_diffs(storage_diffs, &mut diff, &mut warnings);
+    }
+    if let Some(nonces) = state_diff.get("nonces") {
+        parse_nonces(nonces, &mut diff, &mut warnings);
+    }
+    if let Some(declared_classes) = state_diff.get("declared_classes") {
+        parse_declared_classes(declared_classes, &mut diff, &mut warnings);
+    }
+    if let Some(deprecated_declared_classes) = state_diff.get("deprecated_declared_classes") {
+        parse_deprecated_declared_classes(deprecated_declared_classes, &mut diff, &mut warnings);
+    }
+
+    diff.validate()
+        .map_err(|error| format!("converted state diff is invalid: {error}"))?;
+    Ok((diff, warnings))
+}
+
+fn parse_storage_diffs(raw: &Value, diff: &mut StarknetStateDiff, warnings: &mut Vec<String>) {
+    match raw {
+        Value::Array(items) => {
+            for item in items {
+                let Some(address_raw) = item
+                    .get("address")
+                    .or_else(|| item.get("contract_address"))
+                    .and_then(Value::as_str)
+                else {
+                    warnings.push(format!("storage diff entry missing address: {item}"));
+                    continue;
+                };
+                let Some(contract) = parse_contract_address(address_raw, warnings) else {
+                    continue;
+                };
+                let Some(entries) = item
+                    .get("storage_entries")
+                    .or_else(|| item.get("entries"))
+                    .and_then(Value::as_array)
+                else {
+                    warnings.push(format!(
+                        "storage diff entry missing storage_entries array for {address_raw}"
+                    ));
+                    continue;
+                };
+                let writes = diff.storage_diffs.entry(contract).or_default();
+                for entry in entries {
+                    parse_storage_entry(entry, writes, warnings);
+                }
+            }
+        }
+        Value::Object(object) => {
+            for (address_raw, entries) in object {
+                let Some(contract) = parse_contract_address(address_raw, warnings) else {
+                    continue;
+                };
+                let writes = diff.storage_diffs.entry(contract).or_default();
+                match entries {
+                    Value::Array(items) => {
+                        for entry in items {
+                            parse_storage_entry(entry, writes, warnings);
+                        }
+                    }
+                    Value::Object(map_entries) => {
+                        for (key_raw, value_raw) in map_entries {
+                            parse_storage_kv(key_raw, value_raw, writes, warnings);
+                        }
+                    }
+                    other => warnings.push(format!(
+                        "unsupported storage_diffs payload for {address_raw}: {other}"
+                    )),
+                }
+            }
+        }
+        other => warnings.push(format!("unsupported storage_diffs shape: {other}")),
+    }
+}
+
+fn parse_storage_entry(
+    entry: &Value,
+    writes: &mut BTreeMap<String, StarknetFelt>,
+    warnings: &mut Vec<String>,
+) {
+    let Some(key_raw) = entry.get("key").and_then(Value::as_str) else {
+        warnings.push(format!("storage entry missing key: {entry}"));
+        return;
+    };
+    let Some(value_raw) = entry.get("value") else {
+        warnings.push(format!(
+            "storage entry missing value for key {key_raw}: {entry}"
+        ));
+        return;
+    };
+    parse_storage_kv(key_raw, value_raw, writes, warnings);
+}
+
+fn parse_storage_kv(
+    key_raw: &str,
+    value_raw: &Value,
+    writes: &mut BTreeMap<String, StarknetFelt>,
+    warnings: &mut Vec<String>,
+) {
+    let Some(storage_key) = canonicalize_hex_felt(key_raw, "storage key", warnings) else {
+        return;
+    };
+    let Some(value) = value_as_felt(value_raw, "storage value", warnings) else {
+        return;
+    };
+    writes.insert(storage_key, value);
+}
+
+fn parse_nonces(raw: &Value, diff: &mut StarknetStateDiff, warnings: &mut Vec<String>) {
+    match raw {
+        Value::Array(items) => {
+            for item in items {
+                let Some(address_raw) = item
+                    .get("contract_address")
+                    .or_else(|| item.get("address"))
+                    .and_then(Value::as_str)
+                else {
+                    warnings.push(format!("nonce entry missing contract_address: {item}"));
+                    continue;
+                };
+                let Some(contract) = parse_contract_address(address_raw, warnings) else {
+                    continue;
+                };
+                let Some(nonce_raw) = item.get("nonce") else {
+                    warnings.push(format!(
+                        "nonce entry missing nonce for {address_raw}: {item}"
+                    ));
+                    continue;
+                };
+                let Some(nonce) = value_as_felt(nonce_raw, "nonce", warnings) else {
+                    continue;
+                };
+                diff.nonces.insert(contract, nonce);
+            }
+        }
+        Value::Object(object) => {
+            for (address_raw, nonce_raw) in object {
+                let Some(contract) = parse_contract_address(address_raw, warnings) else {
+                    continue;
+                };
+                let Some(nonce) = value_as_felt(nonce_raw, "nonce", warnings) else {
+                    continue;
+                };
+                diff.nonces.insert(contract, nonce);
+            }
+        }
+        other => warnings.push(format!("unsupported nonces shape: {other}")),
+    }
+}
+
+fn parse_declared_classes(raw: &Value, diff: &mut StarknetStateDiff, warnings: &mut Vec<String>) {
+    let Some(items) = raw.as_array() else {
+        warnings.push(format!("unsupported declared_classes shape: {raw}"));
+        return;
+    };
+    for item in items {
+        let class_hash_raw = if let Some(hash) = item.as_str() {
+            hash
+        } else if let Some(hash) = item.get("class_hash").and_then(Value::as_str) {
+            hash
+        } else {
+            warnings.push(format!("declared class entry missing class_hash: {item}"));
+            continue;
+        };
+        if let Some(class_hash) = canonicalize_hex_felt(class_hash_raw, "class hash", warnings) {
+            diff.declared_classes.push(class_hash.into());
+        }
+    }
+}
+
+fn parse_deprecated_declared_classes(
+    raw: &Value,
+    diff: &mut StarknetStateDiff,
+    warnings: &mut Vec<String>,
+) {
+    let Some(items) = raw.as_array() else {
+        warnings.push(format!(
+            "unsupported deprecated_declared_classes shape: {raw}"
+        ));
+        return;
+    };
+    for item in items {
+        let Some(class_hash_raw) = item.as_str() else {
+            warnings.push(format!(
+                "deprecated declared class must be string hash, got: {item}"
+            ));
+            continue;
+        };
+        if let Some(class_hash) = canonicalize_hex_felt(class_hash_raw, "class hash", warnings) {
+            diff.declared_classes.push(class_hash.into());
+        }
+    }
+}
+
+fn parse_contract_address(raw: &str, warnings: &mut Vec<String>) -> Option<ContractAddress> {
+    canonicalize_hex_felt(raw, "contract address", warnings).map(ContractAddress::from)
+}
+
+fn canonicalize_hex_felt(raw: &str, field: &str, warnings: &mut Vec<String>) -> Option<String> {
+    match StarknetFelt::from_str(raw) {
+        Ok(value) => Some(format!("{:#x}", value)),
+        Err(error) => {
+            warnings.push(format!("invalid {field} `{raw}`: {error}"));
+            None
+        }
+    }
+}
+
+fn value_as_felt(raw: &Value, field: &str, warnings: &mut Vec<String>) -> Option<StarknetFelt> {
+    match raw {
+        Value::String(value) => match StarknetFelt::from_str(value) {
+            Ok(felt) => Some(felt),
+            Err(error) => {
+                warnings.push(format!("invalid {field} `{value}`: {error}"));
+                None
+            }
+        },
+        Value::Number(number) => {
+            if let Some(value) = number.as_u64() {
+                Some(StarknetFelt::from(value))
+            } else {
+                warnings.push(format!("non-u64 numeric {field} is unsupported: {number}"));
+                None
+            }
+        }
+        other => {
+            warnings.push(format!("unsupported {field} type: {other}"));
+            None
+        }
+    }
+}
+
 fn help_text() -> String {
     "usage: demo-dashboard [--mode demo|real] [--rpc-url <url>] [--bind <addr>] [--refresh-ms <ms>]
 environment:
   PASTIS_DASHBOARD_MODE=demo|real
   STARKNET_RPC_URL=https://...
   PASTIS_DASHBOARD_BIND=127.0.0.1:8080
-  PASTIS_DASHBOARD_REFRESH_MS=2000"
+  PASTIS_DASHBOARD_REFRESH_MS=2000
+  PASTIS_MONITOR_STRKBTC_SHIELDED_POOL=0x...
+  PASTIS_MONITOR_WBTC_CONTRACT=0x..."
         .to_string()
 }
 
@@ -1344,5 +1782,73 @@ mod tests {
         assert_eq!(errors.len(), MAX_RECENT_ERRORS);
         assert_eq!(errors.front().map(String::as_str), Some("error-4"));
         assert_eq!(errors.back().map(String::as_str), Some("error-19"));
+    }
+
+    #[test]
+    fn state_update_to_diff_parses_array_shape() {
+        let update = json!({
+            "state_diff": {
+                "storage_diffs": [{
+                    "address": "0x111",
+                    "storage_entries": [
+                        {"key": "0x1", "value": "0x2"},
+                        {"key": "0x2", "value": "0x3"}
+                    ]
+                }],
+                "nonces": [{
+                    "contract_address": "0x111",
+                    "nonce": "0x9"
+                }],
+                "declared_classes": [{"class_hash": "0xabc"}],
+                "deprecated_declared_classes": ["0xdef"]
+            }
+        });
+
+        let (diff, warnings) = state_update_to_diff(&update).expect("diff should parse");
+        assert!(warnings.is_empty());
+        assert_eq!(
+            diff.storage_diffs
+                .get(&ContractAddress::from("0x111"))
+                .and_then(|writes| writes.get("0x1"))
+                .copied(),
+            Some(StarknetFelt::from(2_u64))
+        );
+        assert_eq!(
+            diff.nonces.get(&ContractAddress::from("0x111")).copied(),
+            Some(StarknetFelt::from(9_u64))
+        );
+        assert_eq!(diff.declared_classes.len(), 2);
+    }
+
+    #[test]
+    fn state_update_to_diff_parses_object_shape_with_warnings() {
+        let update = json!({
+            "state_diff": {
+                "storage_diffs": {
+                    "0x222": {
+                        "0x10": "0x20",
+                        "bad-key": "0x30"
+                    }
+                },
+                "nonces": {
+                    "0x222": "0x5"
+                },
+                "declared_classes": ["0x123", {"class_hash": "bad-hash"}]
+            }
+        });
+
+        let (diff, warnings) = state_update_to_diff(&update).expect("diff should parse");
+        assert!(!warnings.is_empty());
+        assert_eq!(
+            diff.storage_diffs
+                .get(&ContractAddress::from("0x222"))
+                .and_then(|writes| writes.get("0x10"))
+                .copied(),
+            Some(StarknetFelt::from(0x20_u64))
+        );
+        assert_eq!(
+            diff.nonces.get(&ContractAddress::from("0x222")).copied(),
+            Some(StarknetFelt::from(5_u64))
+        );
     }
 }

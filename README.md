@@ -117,6 +117,15 @@ STARKNET_RPC_URL="https://<your-starknet-rpc>" \
 cargo run -p starknet-node --bin demo-dashboard --all-features -- --mode real
 ```
 
+Enable live BTCFi anomaly processing in `real` mode (state-diff driven) by setting monitor env vars:
+
+```bash
+PASTIS_MONITOR_STRKBTC_SHIELDED_POOL="0x<shielded-pool-contract>" \
+PASTIS_MONITOR_WBTC_CONTRACT="0x<wbtc-contract>" \
+STARKNET_RPC_URL="https://<your-starknet-rpc>" \
+cargo run -p starknet-node --bin demo-dashboard --all-features -- --mode real
+```
+
 Open:
 
 - `http://127.0.0.1:8080/` for the dashboard UI
@@ -129,6 +138,8 @@ What this demo proves on-screen:
 - Node builder wiring (`storage + execution + rpc + mcp`)
 - Block ingestion and committed-state progression (`demo` mode)
 - Live chain status pull from Starknet JSON-RPC (`real` mode)
+- Real-mode `starknet_getStateUpdate` conversion into internal `StarknetStateDiff`
+- Optional real-mode BTCFi anomaly processing (`btcfi:state-diff` source)
 - BTCFi/strkBTC anomaly detector behavior
 - MCP tool round-trip via `GetAnomalies`
 
