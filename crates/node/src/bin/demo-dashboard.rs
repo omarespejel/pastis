@@ -18,7 +18,10 @@ use semver::Version;
 use serde::Serialize;
 use serde_json::{Value, json};
 use starknet_node::{NodeConfig, StarknetNode, StarknetNodeBuilder};
-use starknet_node_execution::{ExecutionBackend, ExecutionError};
+use starknet_node_execution::{
+    DualExecutionBackend, DualExecutionMetrics, ExecutionBackend, ExecutionError, ExecutionMode,
+    MismatchPolicy,
+};
 use starknet_node_exex_btcfi::{
     BtcfiAnomaly, BtcfiExEx, StandardWrapper, StandardWrapperConfig, StandardWrapperMonitor,
     StrkBtcMonitor, StrkBtcMonitorConfig,
@@ -138,7 +141,8 @@ impl ExecutionBackend for DemoExecution {
 }
 
 struct DemoRuntime {
-    node: StarknetNode<InMemoryStorage, DemoExecution>,
+    node: StarknetNode<InMemoryStorage, DualExecutionBackend>,
+    execution_state: InMemoryState,
     btcfi: Mutex<BtcfiExEx>,
     next_block: u64,
     commitment_count: u64,
@@ -156,7 +160,7 @@ impl DemoRuntime {
         let storage = InMemoryStorage::new(InMemoryState::default());
         let node = StarknetNodeBuilder::new(NodeConfig::default())
             .with_storage(storage)
-            .with_execution(DemoExecution)
+            .with_execution(build_dashboard_execution_backend())
             .with_rpc(true)
             .with_mcp(true)
             .build();
@@ -185,6 +189,7 @@ impl DemoRuntime {
 
         Self {
             node,
+            execution_state: InMemoryState::default(),
             btcfi: Mutex::new(BtcfiExEx::new(vec![wrapper], strkbtc, 256)),
             next_block: 1,
             commitment_count: 0,
@@ -203,6 +208,15 @@ impl DemoRuntime {
         let block = demo_block(block_number);
         let diff = self.build_state_diff(block_number);
 
+        if let Err(error) = self
+            .node
+            .execution
+            .execute_block(&block, &mut self.execution_state)
+        {
+            let message = format!("execute block failed: {error}");
+            self.record_tick_error(message.clone());
+            return Err(message);
+        }
         if let Err(error) = self.node.storage.insert_block(block, diff.clone()) {
             let message = format!("insert block failed: {error}");
             self.record_tick_error(message.clone());
@@ -216,6 +230,13 @@ impl DemoRuntime {
         self.next_block = self.next_block.saturating_add(1);
         self.tick_successes = self.tick_successes.saturating_add(1);
         Ok(())
+    }
+
+    fn dual_metrics(&self) -> Result<DualExecutionMetrics, String> {
+        self.node
+            .execution
+            .metrics()
+            .map_err(|error| format!("dual execution metrics unavailable: {error}"))
     }
 
     fn record_tick_error(&mut self, message: String) {
@@ -367,6 +388,7 @@ struct RuntimeDiagnostics {
     failure_count: u64,
     consecutive_failures: u64,
     commit_failure_count: u64,
+    execution_failure_count: u64,
     last_success_unix_seconds: Option<u64>,
     last_failure_unix_seconds: Option<u64>,
     last_processed_block: Option<u64>,
@@ -375,6 +397,9 @@ struct RuntimeDiagnostics {
     recent_errors: Vec<String>,
     anomaly_monitor_enabled: bool,
     retained_anomaly_count: usize,
+    dual_mismatches: u64,
+    dual_fast_executions: u64,
+    dual_canonical_executions: u64,
 }
 
 impl RuntimeDiagnostics {
@@ -384,6 +409,7 @@ impl RuntimeDiagnostics {
             failure_count: 0,
             consecutive_failures: 0,
             commit_failure_count: 0,
+            execution_failure_count: 0,
             last_success_unix_seconds: None,
             last_failure_unix_seconds: None,
             last_processed_block: None,
@@ -392,12 +418,16 @@ impl RuntimeDiagnostics {
             recent_errors: Vec::new(),
             anomaly_monitor_enabled: false,
             retained_anomaly_count: 0,
+            dual_mismatches: 0,
+            dual_fast_executions: 0,
+            dual_canonical_executions: 0,
         }
     }
 }
 
 struct RealRuntimeState {
-    node: StarknetNode<InMemoryStorage, DemoExecution>,
+    node: StarknetNode<InMemoryStorage, DualExecutionBackend>,
+    execution_state: InMemoryState,
     snapshot: Option<RealSnapshot>,
     diagnostics: RuntimeDiagnostics,
     recent_errors: VecDeque<String>,
@@ -416,7 +446,7 @@ impl RealRuntime {
         let storage = InMemoryStorage::new(InMemoryState::default());
         let node = StarknetNodeBuilder::new(NodeConfig::default())
             .with_storage(storage)
-            .with_execution(DemoExecution)
+            .with_execution(build_dashboard_execution_backend())
             .with_rpc(true)
             .with_mcp(true)
             .build();
@@ -439,6 +469,7 @@ impl RealRuntime {
             btcfi,
             state: Arc::new(Mutex::new(RealRuntimeState {
                 node,
+                execution_state: InMemoryState::default(),
                 snapshot: None,
                 diagnostics,
                 recent_errors: VecDeque::new(),
@@ -472,6 +503,30 @@ impl RealRuntime {
                         &fetch.snapshot.state_root,
                         fetch.snapshot.tx_count,
                     );
+                    let mut execution_state = std::mem::take(&mut guard.execution_state);
+                    let execution_result = guard
+                        .node
+                        .execution
+                        .execute_block(&local_block, &mut execution_state);
+                    guard.execution_state = execution_state;
+                    if let Err(error) = execution_result {
+                        let message = format!(
+                            "failed to execute local ingest block {}: {error}",
+                            guard.next_local_block
+                        );
+                        guard.diagnostics.failure_count =
+                            guard.diagnostics.failure_count.saturating_add(1);
+                        guard.diagnostics.execution_failure_count =
+                            guard.diagnostics.execution_failure_count.saturating_add(1);
+                        guard.diagnostics.consecutive_failures =
+                            guard.diagnostics.consecutive_failures.saturating_add(1);
+                        guard.diagnostics.last_failure_unix_seconds = Some(unix_now());
+                        guard.diagnostics.last_error = Some(message.clone());
+                        push_recent_error(&mut guard.recent_errors, message.clone());
+                        guard.diagnostics.recent_errors =
+                            guard.recent_errors.iter().cloned().collect();
+                        return Err(message);
+                    }
                     if let Err(error) = guard
                         .node
                         .storage
@@ -497,6 +552,17 @@ impl RealRuntime {
                     guard.diagnostics.last_local_block = Some(guard.next_local_block);
                     guard.next_local_block = guard.next_local_block.saturating_add(1);
                     guard.diagnostics.last_processed_block = Some(fetch.snapshot.latest_block);
+                }
+                match guard.node.execution.metrics() {
+                    Ok(metrics) => {
+                        guard.diagnostics.dual_mismatches = metrics.mismatches;
+                        guard.diagnostics.dual_fast_executions = metrics.fast_executions;
+                        guard.diagnostics.dual_canonical_executions = metrics.canonical_executions;
+                    }
+                    Err(error) => push_recent_error(
+                        &mut guard.recent_errors,
+                        format!("warning: failed to read dual execution metrics: {error}"),
+                    ),
                 }
 
                 if let Some(btcfi) = &self.btcfi {
@@ -653,6 +719,18 @@ impl RealRuntime {
         Ok(notes)
     }
 }
+
+fn build_dashboard_execution_backend() -> DualExecutionBackend {
+    DualExecutionBackend::new(
+        Some(Box::new(DemoExecution)),
+        Box::new(DemoExecution),
+        ExecutionMode::DualWithVerification {
+            verification_depth: 32,
+        },
+        MismatchPolicy::WarnAndFallback,
+    )
+}
+
 impl RealRpcClient {
     fn new(rpc_url: String) -> Result<Self, String> {
         let http = reqwest::Client::builder()
@@ -753,6 +831,9 @@ struct StatusPayload {
     mcp_roundtrip_ok: bool,
     anomaly_source: String,
     recent_anomaly_count: usize,
+    dual_mismatches: u64,
+    dual_fast_executions: u64,
+    dual_canonical_executions: u64,
     data_age_seconds: Option<u64>,
     failure_count: u64,
     consecutive_failures: u64,
@@ -773,6 +854,7 @@ struct DebugPayload {
     success_count: u64,
     failure_count: u64,
     commit_failure_count: u64,
+    execution_failure_count: u64,
     consecutive_failures: u64,
     last_success_unix_seconds: Option<u64>,
     last_failure_unix_seconds: Option<u64>,
@@ -780,6 +862,9 @@ struct DebugPayload {
     last_local_block: Option<u64>,
     anomaly_monitor_enabled: bool,
     retained_anomaly_count: usize,
+    dual_mismatches: u64,
+    dual_fast_executions: u64,
+    dual_canonical_executions: u64,
     last_error: Option<String>,
     recent_errors: Vec<String>,
     snapshot_available: bool,
@@ -916,6 +1001,7 @@ fn demo_status(
         .storage
         .current_state_root()
         .map_err(|error| format!("state root read failed: {error}"))?;
+    let metrics = guard.dual_metrics()?;
     let anomalies = guard.query_anomalies_via_mcp(25)?;
     Ok(StatusPayload {
         mode: DashboardModeKind::Demo.as_str().to_string(),
@@ -927,6 +1013,9 @@ fn demo_status(
         mcp_roundtrip_ok: true,
         anomaly_source: "mcp:get_anomalies".to_string(),
         recent_anomaly_count: anomalies.len(),
+        dual_mismatches: metrics.mismatches,
+        dual_fast_executions: metrics.fast_executions,
+        dual_canonical_executions: metrics.canonical_executions,
         data_age_seconds: Some(0),
         failure_count: guard.tick_failures,
         consecutive_failures: 0,
@@ -953,12 +1042,14 @@ fn demo_debug(runtime: &Arc<Mutex<DemoRuntime>>, refresh_ms: u64) -> Result<Debu
     let guard = runtime
         .lock()
         .map_err(|_| "runtime lock poisoned".to_string())?;
+    let metrics = guard.dual_metrics()?;
     Ok(DebugPayload {
         mode: DashboardModeKind::Demo.as_str().to_string(),
         refresh_ms,
         success_count: guard.tick_successes,
         failure_count: guard.tick_failures,
         commit_failure_count: 0,
+        execution_failure_count: guard.tick_failures,
         consecutive_failures: 0,
         last_success_unix_seconds: None,
         last_failure_unix_seconds: None,
@@ -968,6 +1059,9 @@ fn demo_debug(runtime: &Arc<Mutex<DemoRuntime>>, refresh_ms: u64) -> Result<Debu
         retained_anomaly_count: guard
             .query_anomalies_via_mcp(MAX_RECENT_ANOMALIES as u64)?
             .len(),
+        dual_mismatches: metrics.mismatches,
+        dual_fast_executions: metrics.fast_executions,
+        dual_canonical_executions: metrics.canonical_executions,
         last_error: guard.last_error.clone(),
         recent_errors: guard.recent_errors.iter().cloned().collect(),
         snapshot_available: guard.tick_successes > 0,
@@ -991,6 +1085,9 @@ async fn real_status(runtime: &Arc<RealRuntime>, refresh_ms: u64) -> Result<Stat
         mcp_roundtrip_ok,
         anomaly_source: runtime.anomaly_source_name().to_string(),
         recent_anomaly_count,
+        dual_mismatches: diagnostics.dual_mismatches,
+        dual_fast_executions: diagnostics.dual_fast_executions,
+        dual_canonical_executions: diagnostics.dual_canonical_executions,
         data_age_seconds,
         failure_count: diagnostics.failure_count,
         consecutive_failures: diagnostics.consecutive_failures,
@@ -1015,6 +1112,7 @@ fn real_debug(runtime: &Arc<RealRuntime>, refresh_ms: u64) -> Result<DebugPayloa
         success_count: diagnostics.success_count,
         failure_count: diagnostics.failure_count,
         commit_failure_count: diagnostics.commit_failure_count,
+        execution_failure_count: diagnostics.execution_failure_count,
         consecutive_failures: diagnostics.consecutive_failures,
         last_success_unix_seconds: diagnostics.last_success_unix_seconds,
         last_failure_unix_seconds: diagnostics.last_failure_unix_seconds,
@@ -1022,6 +1120,9 @@ fn real_debug(runtime: &Arc<RealRuntime>, refresh_ms: u64) -> Result<DebugPayloa
         last_local_block: diagnostics.last_local_block,
         anomaly_monitor_enabled: diagnostics.anomaly_monitor_enabled,
         retained_anomaly_count: diagnostics.retained_anomaly_count,
+        dual_mismatches: diagnostics.dual_mismatches,
+        dual_fast_executions: diagnostics.dual_fast_executions,
+        dual_canonical_executions: diagnostics.dual_canonical_executions,
         last_error: diagnostics.last_error,
         recent_errors: diagnostics.recent_errors,
         snapshot_available: runtime.snapshot()?.is_some(),
@@ -1715,6 +1816,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <div class="card"><h3>MCP Roundtrip</h3><div class="value" id="mcpStatus">-</div></div>
       <div class="card"><h3>Anomaly Source</h3><div class="value mono" id="anomalySource">-</div></div>
       <div class="card"><h3>Recent Anomalies</h3><div class="value warn" id="anomalyCount">-</div></div>
+      <div class="card"><h3>Dual Mismatches</h3><div class="value danger" id="dualMismatches">-</div></div>
+      <div class="card"><h3>Dual Fast Execs</h3><div class="value" id="dualFast">-</div></div>
+      <div class="card"><h3>Dual Canonical Execs</h3><div class="value" id="dualCanonical">-</div></div>
       <div class="card"><h3>Data Age (s)</h3><div class="value" id="dataAge">-</div></div>
       <div class="card"><h3>Failures</h3><div class="value" id="failureCount">-</div></div>
     </div>
@@ -1793,6 +1897,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       document.getElementById('stateRoot').textContent = status.state_root;
       document.getElementById('anomalySource').textContent = status.anomaly_source;
       document.getElementById('anomalyCount').textContent = status.recent_anomaly_count;
+      document.getElementById('dualMismatches').textContent = status.dual_mismatches;
+      document.getElementById('dualFast').textContent = status.dual_fast_executions;
+      document.getElementById('dualCanonical').textContent = status.dual_canonical_executions;
       document.getElementById('dataAge').textContent =
         status.data_age_seconds === null ? 'n/a' : String(status.data_age_seconds);
       document.getElementById('failureCount').textContent =
@@ -2001,5 +2108,20 @@ mod tests {
         invalid_root
             .validate()
             .expect("fallback state root keeps block valid");
+    }
+
+    #[test]
+    fn demo_runtime_tick_updates_dual_execution_metrics() {
+        let mut runtime = DemoRuntime::new();
+        runtime.tick().expect("tick should succeed");
+
+        let metrics = runtime
+            .node
+            .execution
+            .metrics()
+            .expect("dual metrics should be readable");
+        assert_eq!(metrics.mismatches, 0);
+        assert_eq!(metrics.fast_executions, 1);
+        assert_eq!(metrics.canonical_executions, 1);
     }
 }
