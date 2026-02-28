@@ -1,10 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use argon2::{Algorithm, Argon2, Params, Version};
 use pbkdf2::pbkdf2_hmac_array;
 use rand::{RngCore, rngs::OsRng};
 use sha2::Sha256;
 
-const API_KEY_KDF_ITERATIONS: u32 = 150_000;
+const API_KEY_ARGON2_MEMORY_KIB: u32 = 19 * 1024;
+const API_KEY_ARGON2_ITERATIONS: u32 = 2;
+const API_KEY_ARGON2_PARALLELISM: u32 = 1;
+const API_KEY_LEGACY_PBKDF2_ITERATIONS: u32 = 150_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiKeyKdf {
+    Argon2id,
+    LegacyPbkdf2Sha256,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpTool {
@@ -55,6 +65,7 @@ pub enum ValidationError {
 pub struct AgentPolicy {
     pub api_key_salt: [u8; 16],
     pub api_key_hash: [u8; 32],
+    pub api_key_kdf: ApiKeyKdf,
     pub permissions: BTreeSet<ToolPermission>,
     pub max_requests_per_minute: u32,
 }
@@ -67,16 +78,32 @@ impl AgentPolicy {
     ) -> Self {
         let mut api_key_salt = [0_u8; 16];
         OsRng.fill_bytes(&mut api_key_salt);
+        let (api_key_kdf, api_key_hash) =
+            match hash_api_key_argon2id(api_key.as_ref(), &api_key_salt) {
+                Ok(hash) => (ApiKeyKdf::Argon2id, hash),
+                Err(_) => (
+                    ApiKeyKdf::LegacyPbkdf2Sha256,
+                    hash_api_key_legacy_pbkdf2(api_key.as_ref(), &api_key_salt),
+                ),
+            };
         Self {
             api_key_salt,
-            api_key_hash: hash_api_key(api_key.as_ref(), &api_key_salt),
+            api_key_hash,
+            api_key_kdf,
             permissions,
             max_requests_per_minute,
         }
     }
 
     fn verify_api_key(&self, api_key: &str) -> bool {
-        self.api_key_hash == hash_api_key(api_key, &self.api_key_salt)
+        match self.api_key_kdf {
+            ApiKeyKdf::Argon2id => hash_api_key_argon2id(api_key, &self.api_key_salt)
+                .map(|hash| hash == self.api_key_hash)
+                .unwrap_or(false),
+            ApiKeyKdf::LegacyPbkdf2Sha256 => {
+                self.api_key_hash == hash_api_key_legacy_pbkdf2(api_key, &self.api_key_salt)
+            }
+        }
     }
 }
 
@@ -175,8 +202,24 @@ impl McpAccessController {
     }
 }
 
-fn hash_api_key(api_key: &str, salt: &[u8; 16]) -> [u8; 32] {
-    pbkdf2_hmac_array::<Sha256, 32>(api_key.as_bytes(), salt, API_KEY_KDF_ITERATIONS)
+fn hash_api_key_argon2id(api_key: &str, salt: &[u8; 16]) -> Result<[u8; 32], String> {
+    let params = Params::new(
+        API_KEY_ARGON2_MEMORY_KIB,
+        API_KEY_ARGON2_ITERATIONS,
+        API_KEY_ARGON2_PARALLELISM,
+        Some(32),
+    )
+    .map_err(|error| format!("invalid Argon2 params: {error}"))?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut output = [0_u8; 32];
+    argon2
+        .hash_password_into(api_key.as_bytes(), salt, &mut output)
+        .map_err(|error| format!("argon2 key derivation failed: {error}"))?;
+    Ok(output)
+}
+
+fn hash_api_key_legacy_pbkdf2(api_key: &str, salt: &[u8; 16]) -> [u8; 32] {
+    pbkdf2_hmac_array::<Sha256, 32>(api_key.as_bytes(), salt, API_KEY_LEGACY_PBKDF2_ITERATIONS)
 }
 
 pub fn validate_tool(tool: &McpTool, limits: ValidationLimits) -> Result<(), ValidationError> {
@@ -374,5 +417,22 @@ mod tests {
                 agent_id: "agent-a".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn allows_requests_with_same_timestamp() {
+        let mut access = McpAccessController::new([("agent-a".to_string(), read_only_policy(3))]);
+        access
+            .authorize("agent-a", "secret", &McpTool::QueryState, 1_000)
+            .expect("first");
+        access
+            .authorize("agent-a", "secret", &McpTool::QueryState, 1_000)
+            .expect("same timestamp should be accepted");
+    }
+
+    #[test]
+    fn agent_policy_defaults_to_argon2id() {
+        let policy = read_only_policy(2);
+        assert_eq!(policy.api_key_kdf, ApiKeyKdf::Argon2id);
     }
 }

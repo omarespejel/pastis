@@ -57,13 +57,48 @@ pub enum NodeInitError {
 }
 
 #[cfg(feature = "production-adapters")]
-fn validate_bootstrap_storage<S: StorageBackend>(storage: &S) -> Result<(), NodeInitError> {
+const STARKNET_MAINNET_GENESIS_STATE_ROOT: &str =
+    "0x21870ba80540e7831fb21c591ee93481f5ae1bb71ff85a86ddd465be4eddee6";
+
+#[cfg(feature = "production-adapters")]
+fn normalize_hex(input: &str) -> String {
+    let raw = input.trim();
+    let stripped = raw
+        .strip_prefix("0x")
+        .or_else(|| raw.strip_prefix("0X"))
+        .unwrap_or(raw);
+    let normalized = stripped.trim_start_matches('0').to_ascii_lowercase();
+    if normalized.is_empty() {
+        "0x0".to_string()
+    } else {
+        format!("0x{normalized}")
+    }
+}
+
+#[cfg(feature = "production-adapters")]
+fn validate_bootstrap_storage<S: StorageBackend>(
+    storage: &S,
+    config: &NodeConfig,
+) -> Result<(), NodeInitError> {
     let latest = storage
         .latest_block_number()
         .map_err(|error| NodeInitError::StorageCheck(error.to_string()))?;
     storage
         .get_state_reader(0)
         .map_err(|error| NodeInitError::StorageIntegrity(error.to_string()))?;
+    if config.chain_id == "SN_MAIN"
+        && let Some(genesis) = storage
+            .get_block(BlockId::Number(0))
+            .map_err(|error| NodeInitError::StorageIntegrity(error.to_string()))?
+    {
+        let expected = normalize_hex(STARKNET_MAINNET_GENESIS_STATE_ROOT);
+        let actual = normalize_hex(&genesis.state_root);
+        if actual != expected {
+            return Err(NodeInitError::StorageIntegrity(format!(
+                "mainnet genesis state root mismatch: expected {expected}, got {actual}"
+            )));
+        }
+    }
     if latest > 0 {
         let tip = storage
             .get_block(BlockId::Number(latest))
@@ -153,7 +188,7 @@ pub fn build_mainnet_production_node(
     config: NodeConfig,
     storage: PapyrusStorageAdapter,
 ) -> Result<StarknetNode<PapyrusStorageAdapter, BlockifierVmBackend>, NodeInitError> {
-    validate_bootstrap_storage(&storage)?;
+    validate_bootstrap_storage(&storage, &config)?;
     Ok(StarknetNodeBuilder::new(config)
         .with_storage(storage)
         .with_execution(BlockifierVmBackend::starknet_mainnet())
@@ -164,6 +199,8 @@ pub fn build_mainnet_production_node(
 mod tests {
     use std::time::Duration;
 
+    #[cfg(feature = "production-adapters")]
+    use semver::Version;
     use starknet_node_execution::ExecutionError;
     use starknet_node_storage::InMemoryStorage;
     #[cfg(feature = "production-adapters")]
@@ -173,7 +210,9 @@ mod tests {
         StarknetBlock, StarknetReceipt, StarknetStateDiff, StarknetTransaction, StateReader,
     };
     #[cfg(feature = "production-adapters")]
-    use starknet_node_types::{BlockId, ComponentHealth, HealthCheck, HealthStatus};
+    use starknet_node_types::{
+        BlockGasPrices, BlockId, ComponentHealth, GasPricePerToken, HealthCheck, HealthStatus,
+    };
 
     use super::*;
 
@@ -310,7 +349,8 @@ mod tests {
     #[test]
     fn bootstrap_validation_rejects_unhealthy_storage() {
         let storage = UnhealthyStorage(InMemoryStorage::new(InMemoryState::default()));
-        let err = validate_bootstrap_storage(&storage).expect_err("must fail");
+        let err =
+            validate_bootstrap_storage(&storage, &NodeConfig::default()).expect_err("must fail");
         assert!(matches!(err, NodeInitError::StorageUnhealthy));
     }
 
@@ -318,11 +358,99 @@ mod tests {
     #[test]
     fn bootstrap_validation_accepts_healthy_storage() {
         let storage = InMemoryStorage::new(InMemoryState::default());
-        validate_bootstrap_storage(&storage).expect("healthy storage");
+        validate_bootstrap_storage(&storage, &NodeConfig::default()).expect("healthy storage");
     }
 
     #[cfg(feature = "production-adapters")]
     struct InconsistentLatestStorage;
+
+    #[cfg(feature = "production-adapters")]
+    struct GenesisBlockStorage {
+        inner: InMemoryStorage,
+        block0: StarknetBlock,
+    }
+
+    #[cfg(feature = "production-adapters")]
+    fn block_zero_with_state_root(state_root: &str) -> StarknetBlock {
+        StarknetBlock {
+            number: 0,
+            parent_hash: "0x0".to_string(),
+            state_root: state_root.to_string(),
+            timestamp: 0,
+            sequencer_address: "0x1".to_string(),
+            gas_prices: BlockGasPrices {
+                l1_gas: GasPricePerToken {
+                    price_in_fri: 1,
+                    price_in_wei: 1,
+                },
+                l1_data_gas: GasPricePerToken {
+                    price_in_fri: 1,
+                    price_in_wei: 1,
+                },
+                l2_gas: GasPricePerToken {
+                    price_in_fri: 1,
+                    price_in_wei: 1,
+                },
+            },
+            protocol_version: Version::parse("0.14.2").expect("valid version"),
+            transactions: Vec::new(),
+        }
+    }
+
+    #[cfg(feature = "production-adapters")]
+    impl HealthCheck for GenesisBlockStorage {
+        fn is_healthy(&self) -> bool {
+            self.inner.is_healthy()
+        }
+
+        fn detailed_status(&self) -> ComponentHealth {
+            self.inner.detailed_status()
+        }
+    }
+
+    #[cfg(feature = "production-adapters")]
+    impl StorageBackend for GenesisBlockStorage {
+        fn get_state_reader(
+            &self,
+            block_number: u64,
+        ) -> Result<Box<dyn StateReader>, StorageError> {
+            self.inner.get_state_reader(block_number)
+        }
+
+        fn apply_state_diff(&mut self, diff: &StarknetStateDiff) -> Result<(), StorageError> {
+            self.inner.apply_state_diff(diff)
+        }
+
+        fn insert_block(
+            &mut self,
+            block: StarknetBlock,
+            state_diff: StarknetStateDiff,
+        ) -> Result<(), StorageError> {
+            self.inner.insert_block(block, state_diff)
+        }
+
+        fn get_block(&self, id: BlockId) -> Result<Option<StarknetBlock>, StorageError> {
+            if matches!(id, BlockId::Number(0)) {
+                return Ok(Some(self.block0.clone()));
+            }
+            self.inner.get_block(id)
+        }
+
+        fn get_state_diff(
+            &self,
+            block_number: u64,
+        ) -> Result<Option<StarknetStateDiff>, StorageError> {
+            self.inner.get_state_diff(block_number)
+        }
+
+        fn latest_block_number(&self) -> Result<u64, StorageError> {
+            self.inner.latest_block_number()
+        }
+
+        fn current_state_root(&self) -> String {
+            self.inner.current_state_root()
+        }
+    }
 
     #[cfg(feature = "production-adapters")]
     impl HealthCheck for InconsistentLatestStorage {
@@ -393,7 +521,33 @@ mod tests {
     #[test]
     fn bootstrap_validation_rejects_missing_tip_block_body() {
         let storage = InconsistentLatestStorage;
-        let err = validate_bootstrap_storage(&storage).expect_err("must fail");
+        let err =
+            validate_bootstrap_storage(&storage, &NodeConfig::default()).expect_err("must fail");
         assert!(matches!(err, NodeInitError::StorageIntegrity(_)));
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn bootstrap_validation_rejects_mainnet_genesis_root_mismatch_when_block_zero_exists() {
+        let storage = GenesisBlockStorage {
+            inner: InMemoryStorage::new(InMemoryState::default()),
+            block0: block_zero_with_state_root("0xdead"),
+        };
+
+        let err =
+            validate_bootstrap_storage(&storage, &NodeConfig::default()).expect_err("must fail");
+        assert!(matches!(err, NodeInitError::StorageIntegrity(_)));
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn bootstrap_validation_accepts_mainnet_genesis_root_match_when_block_zero_exists() {
+        let storage = GenesisBlockStorage {
+            inner: InMemoryStorage::new(InMemoryState::default()),
+            block0: block_zero_with_state_root(STARKNET_MAINNET_GENESIS_STATE_ROOT),
+        };
+
+        validate_bootstrap_storage(&storage, &NodeConfig::default())
+            .expect("matching mainnet genesis root");
     }
 }

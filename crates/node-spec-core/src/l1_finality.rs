@@ -35,14 +35,16 @@ impl L1FinalityTracker {
         &mut self,
         entry: PostedStateRoot,
     ) -> Result<(), FinalityError> {
-        if let Some(existing) = self.posted_by_l2_block.get(&entry.l2_block_number)
-            && existing.state_root != entry.state_root
-        {
-            return Err(FinalityError::ConflictingPostedRoot {
-                l2_block_number: entry.l2_block_number,
-                existing_root: existing.state_root.clone(),
-                new_root: entry.state_root.clone(),
-            });
+        if let Some(existing) = self.posted_by_l2_block.get(&entry.l2_block_number) {
+            if existing.state_root != entry.state_root {
+                return Err(FinalityError::ConflictingPostedRoot {
+                    l2_block_number: entry.l2_block_number,
+                    existing_root: existing.state_root.clone(),
+                    new_root: entry.state_root.clone(),
+                });
+            }
+            // Preserve the earliest observed posting metadata for idempotent reposts.
+            return Ok(());
         }
         self.posted_by_l2_block.insert(entry.l2_block_number, entry);
         Ok(())
@@ -201,6 +203,9 @@ mod tests {
         tracker
             .record_state_root_posted(root(120, 10_010))
             .expect("idempotent repost");
+
+        tracker.update_finalized_eth_block(10_005);
+        assert_eq!(tracker.latest_verified_block(), Some(120));
     }
 
     #[test]

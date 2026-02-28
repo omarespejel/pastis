@@ -213,42 +213,49 @@ impl ExExManager {
         let mut tier_failures: Vec<(String, String)> = Vec::new();
 
         for chunk in active_tier.chunks(MAX_PARALLEL_DELIVERY_WORKERS.max(1)) {
-            let results: Vec<(String, Result<(), ManagerError>)> =
-                if let Some(pool) = &self.delivery_pool {
-                    pool.install(|| {
-                        chunk
-                            .par_iter()
-                            .map(|name| {
-                                let result = catch_unwind(AssertUnwindSafe(|| {
-                                    self.deliver_to_sink(name, notification)
-                                }))
-                                .unwrap_or_else(|_| {
-                                    Err(ManagerError::SinkFailure {
-                                        name: name.clone(),
-                                        message: "sink thread panicked".to_string(),
-                                    })
-                                });
-                                (name.clone(), result)
-                            })
-                            .collect()
-                    })
-                } else {
+            let results: Vec<(String, Result<(), ManagerError>)> = if let Some(pool) =
+                &self.delivery_pool
+            {
+                pool.install(|| {
                     chunk
-                        .iter()
+                        .par_iter()
                         .map(|name| {
                             let result = catch_unwind(AssertUnwindSafe(|| {
                                 self.deliver_to_sink(name, notification)
                             }))
-                            .unwrap_or_else(|_| {
+                            .unwrap_or_else(|panic_payload| {
                                 Err(ManagerError::SinkFailure {
                                     name: name.clone(),
-                                    message: "sink thread panicked".to_string(),
+                                    message: format!(
+                                        "sink panicked: {}",
+                                        panic_payload_message(panic_payload)
+                                    ),
                                 })
                             });
                             (name.clone(), result)
                         })
                         .collect()
-                };
+                })
+            } else {
+                chunk
+                    .iter()
+                    .map(|name| {
+                        let result = catch_unwind(AssertUnwindSafe(|| {
+                            self.deliver_to_sink(name, notification)
+                        }))
+                        .unwrap_or_else(|panic_payload| {
+                            Err(ManagerError::SinkFailure {
+                                name: name.clone(),
+                                message: format!(
+                                    "sink panicked: {}",
+                                    panic_payload_message(panic_payload)
+                                ),
+                            })
+                        });
+                        (name.clone(), result)
+                    })
+                    .collect()
+            };
 
             for (name, result) in results {
                 match result {
@@ -316,6 +323,16 @@ impl ExExManager {
     fn is_sink_disabled(&self, name: &str) -> bool {
         self.disabled_sinks.contains(name)
     }
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "unknown panic payload".to_string()
 }
 
 #[cfg(test)]
@@ -777,7 +794,7 @@ mod tests {
         assert!(matches!(
             err,
             ManagerError::SinkFailure { name, message }
-            if name == "panic-sink" && message == "sink thread panicked"
+            if name == "panic-sink" && message.contains("intentional sink panic for test")
         ));
     }
 

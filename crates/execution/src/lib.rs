@@ -843,14 +843,26 @@ impl BlockifierVmBackend {
                 executable.tx_hash().0
             )));
         }
-        if let ExecutableStarknetTransaction::L1Handler(l1_handler) = &executable
-            && l1_handler.tx.calldata.0.is_empty()
-        {
-            return Err(ExecutionError::Backend(format!(
-                "invalid L1 handler tx {} in block {}: calldata must include the from-address \
-                 slot",
-                tx.hash, block_number
-            )));
+        match &executable {
+            ExecutableStarknetTransaction::L1Handler(l1_handler)
+                if l1_handler.tx.calldata.0.is_empty() =>
+            {
+                return Err(ExecutionError::Backend(format!(
+                    "invalid L1 handler tx {} in block {}: calldata must include the \
+                     from-address slot",
+                    tx.hash, block_number
+                )));
+            }
+            ExecutableStarknetTransaction::L1Handler(_) => {}
+            ExecutableStarknetTransaction::Account(account_tx) => {
+                return Err(ExecutionError::Backend(format!(
+                    "unsupported executable transaction type {:?} for tx {} in block {}: \
+                     class-provider integration is required for account transactions",
+                    account_tx.tx_type(),
+                    tx.hash,
+                    block_number
+                )));
+            }
         }
         Ok(BlockifierTransaction::new_for_sequencing(executable))
     }
@@ -1345,6 +1357,27 @@ mod tests {
     }
 
     #[cfg(feature = "blockifier-adapter")]
+    fn executable_account_invoke_tx(hash: &str) -> StarknetTransaction {
+        use starknet_api::executable_transaction::{
+            AccountTransaction as ExecutableAccountTransaction,
+            InvokeTransaction as ExecutableInvokeTransaction, Transaction as ExecutableTx,
+        };
+        use starknet_api::transaction::{
+            InvokeTransaction as ApiInvokeTransaction, InvokeTransactionV0, TransactionHash,
+        };
+
+        let executable = ExecutableInvokeTransaction {
+            tx: ApiInvokeTransaction::V0(InvokeTransactionV0::default()),
+            tx_hash: TransactionHash(BlockifierFelt::from_str(hash).expect("valid tx hash")),
+        };
+
+        StarknetTransaction::with_executable(
+            hash.to_string(),
+            ExecutableTx::Account(ExecutableAccountTransaction::Invoke(executable)),
+        )
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
     struct StaticExecutableResolver;
 
     #[cfg(feature = "blockifier-adapter")]
@@ -1816,6 +1849,33 @@ mod tests {
         match err {
             ExecutionError::Backend(message) => {
                 assert!(message.contains("invalid L1 handler tx"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    #[test]
+    fn blockifier_backend_rejects_account_txs_without_class_provider_integration() {
+        let backend = BlockifierVmBackend::starknet_mainnet();
+        let mut state = InMemoryState::default();
+        let block = StarknetBlock {
+            number: 12,
+            parent_hash: "0xb".to_string(),
+            state_root: "0xc".to_string(),
+            timestamp: 1_700_000_012,
+            sequencer_address: "0x1".to_string(),
+            gas_prices: sample_gas_prices(),
+            protocol_version: Version::parse("0.14.2").expect("valid version"),
+            transactions: vec![executable_account_invoke_tx("0x123")],
+        };
+
+        let err = backend
+            .execute_block(&block, &mut state)
+            .expect_err("must fail for account tx without class provider");
+        match err {
+            ExecutionError::Backend(message) => {
+                assert!(message.contains("class-provider integration is required"));
             }
             other => panic!("unexpected error variant: {other:?}"),
         }

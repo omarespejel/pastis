@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+argon2 = "0.5"
 bincode = { workspace = true }
 pbkdf2 = "0.12"
 rand = "0.8"

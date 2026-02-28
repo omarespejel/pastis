@@ -179,8 +179,10 @@ The repository currently includes core and phase-aligned scaffolding crates that
 - Protocol constants resolver with exact-match-first and same-line patch fallback (`major.minor`), fail-closed on unknown protocol lines
 - L1 finality gating and unfinalized reorg invalidation
 - MCP batch recursion/size validation
+- MCP access control hardened with Argon2id API-key derivation (legacy PBKDF2 fallback only on derivation failure)
 - Storage backend behavior (sequential inserts, block snapshots, deterministic state roots)
 - Dual execution mismatch handling with canonical-state safety
+- Blockifier adapter fail-fast guard for account transactions when class-provider integration is unavailable
 - Type-state node builder enforcing storage-before-execution composition
 - ExEx manager behavior (registration DAG validation, bounded queue, WAL replay compatibility)
 
