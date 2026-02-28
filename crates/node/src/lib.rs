@@ -4,7 +4,7 @@
 use starknet_node_execution::BlockifierVmBackend;
 use starknet_node_execution::ExecutionBackend;
 #[cfg(feature = "production-adapters")]
-use starknet_node_storage::PapyrusStorageAdapter;
+use starknet_node_storage::ApolloStorageAdapter;
 use starknet_node_storage::StorageBackend;
 #[cfg(feature = "production-adapters")]
 use starknet_node_types::BlockId;
@@ -235,8 +235,8 @@ impl<S: StorageBackend, E: ExecutionBackend> StarknetNodeBuilder<WithStorage<S>,
 #[cfg(feature = "production-adapters")]
 pub fn build_mainnet_production_node(
     config: NodeConfig,
-    storage: PapyrusStorageAdapter,
-) -> Result<StarknetNode<PapyrusStorageAdapter, BlockifierVmBackend>, NodeInitError> {
+    storage: ApolloStorageAdapter,
+) -> Result<StarknetNode<ApolloStorageAdapter, BlockifierVmBackend>, NodeInitError> {
     validate_bootstrap_storage(&storage, &config)?;
     Ok(StarknetNodeBuilder::new(config)
         .with_storage(storage)

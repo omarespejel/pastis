@@ -1,37 +1,37 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
-#[cfg(feature = "papyrus-adapter")]
+#[cfg(feature = "apollo-adapter")]
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
-#[cfg(feature = "papyrus-adapter")]
-use papyrus_storage::body::BodyStorageReader;
-#[cfg(feature = "papyrus-adapter")]
-use papyrus_storage::header::HeaderStorageReader;
-#[cfg(feature = "papyrus-adapter")]
-use papyrus_storage::state::StateStorageReader;
-#[cfg(feature = "papyrus-adapter")]
-use papyrus_storage::{
-    StorageConfig as PapyrusStorageConfig, StorageReader as PapyrusStorageReader,
-    StorageWriter as PapyrusStorageWriter, open_storage as open_papyrus_storage,
+#[cfg(feature = "apollo-adapter")]
+use apollo_storage::body::BodyStorageReader;
+#[cfg(feature = "apollo-adapter")]
+use apollo_storage::header::HeaderStorageReader;
+#[cfg(feature = "apollo-adapter")]
+use apollo_storage::state::StateStorageReader;
+#[cfg(feature = "apollo-adapter")]
+use apollo_storage::{
+    StorageConfig as ApolloStorageConfig, StorageReader as ApolloStorageReader,
+    StorageWriter as ApolloStorageWriter, open_storage as open_apollo_storage,
 };
-#[cfg(feature = "papyrus-adapter")]
-use starknet_api::block::BlockNumber as PapyrusBlockNumber;
-#[cfg(feature = "papyrus-adapter")]
-use starknet_api::core::{ContractAddress as PapyrusContractAddress, Nonce as PapyrusNonce};
-#[cfg(feature = "papyrus-adapter")]
-use starknet_api::hash::StarkHash as PapyrusFelt;
-#[cfg(feature = "papyrus-adapter")]
-use starknet_api::state::ThinStateDiff as PapyrusThinStateDiff;
-#[cfg(feature = "papyrus-adapter")]
-use starknet_api::state::{StateNumber as PapyrusStateNumber, StorageKey as PapyrusStorageKey};
+#[cfg(feature = "apollo-adapter")]
+use starknet_api::block::BlockNumber as ApolloBlockNumber;
+#[cfg(feature = "apollo-adapter")]
+use starknet_api::core::{ContractAddress as ApolloContractAddress, Nonce as ApolloNonce};
+#[cfg(feature = "apollo-adapter")]
+use starknet_api::hash::StarkHash as ApolloFelt;
+#[cfg(feature = "apollo-adapter")]
+use starknet_api::state::ThinStateDiff as ApolloThinStateDiff;
+#[cfg(feature = "apollo-adapter")]
+use starknet_api::state::{StateNumber as ApolloStateNumber, StorageKey as ApolloStorageKey};
 
-#[cfg(feature = "papyrus-adapter")]
+#[cfg(feature = "apollo-adapter")]
 use starknet_node_types::StarknetFelt;
-#[cfg(feature = "papyrus-adapter")]
+#[cfg(feature = "apollo-adapter")]
 use starknet_node_types::StarknetTransaction;
-#[cfg(feature = "papyrus-adapter")]
+#[cfg(feature = "apollo-adapter")]
 use starknet_node_types::{BlockGasPrices, GasPricePerToken};
 use starknet_node_types::{
     BlockId, BlockNumber, ComponentHealth, HealthCheck, HealthStatus, InMemoryState, StarknetBlock,
@@ -63,11 +63,11 @@ pub enum StorageError {
     InvalidStateDiff(String),
     #[error("state limits exceeded while applying diff: {0}")]
     StateLimitExceeded(String),
-    #[cfg(feature = "papyrus-adapter")]
-    #[error("papyrus storage error: {0}")]
-    Papyrus(String),
-    #[cfg(feature = "papyrus-adapter")]
-    #[error("invalid protocol version in papyrus header: {0}")]
+    #[cfg(feature = "apollo-adapter")]
+    #[error("apollo storage error: {0}")]
+    Apollo(String),
+    #[cfg(feature = "apollo-adapter")]
+    #[error("invalid protocol version in apollo header: {0}")]
     InvalidProtocolVersion(String),
 }
 
@@ -226,7 +226,7 @@ impl<S: StorageBackend> StorageBackend for ThreadSafeStorage<S> {
 #[derive(Debug, Clone)]
 pub struct InMemoryStorage {
     // Lightweight backend for tests and local development.
-    // This backend is not consensus-canonical for state roots. Use `PapyrusStorageAdapter`
+    // This backend is not consensus-canonical for state roots. Use `ApolloStorageAdapter`
     // for canonical roots and wrap in `ThreadSafeStorage` for shared multi-thread access.
     blocks: BTreeMap<BlockNumber, StarknetBlock>,
     state_diffs: BTreeMap<BlockNumber, StarknetStateDiff>,
@@ -385,15 +385,15 @@ impl CheckpointSyncVerifier {
     }
 }
 
-#[cfg(feature = "papyrus-adapter")]
+#[cfg(feature = "apollo-adapter")]
 #[derive(Clone)]
-struct PapyrusStateReaderAdapter {
-    reader: PapyrusStorageReader,
-    state_number: PapyrusStateNumber,
+struct ApolloStateReaderAdapter {
+    reader: ApolloStorageReader,
+    state_number: ApolloStateNumber,
 }
 
-#[cfg(feature = "papyrus-adapter")]
-impl StateReader for PapyrusStateReaderAdapter {
+#[cfg(feature = "apollo-adapter")]
+impl StateReader for ApolloStateReaderAdapter {
     fn get_storage(&self, contract: &String, key: &str) -> Option<StarknetFelt> {
         let contract = parse_contract_address(contract)?;
         let key = parse_storage_key(key)?;
@@ -402,38 +402,38 @@ impl StateReader for PapyrusStateReaderAdapter {
         let value = state_reader
             .get_storage_at(self.state_number, &contract, &key)
             .ok()?;
-        papyrus_felt_to_node_felt(value).ok()
+        apollo_felt_to_node_felt(value).ok()
     }
 
     fn nonce_of(&self, contract: &String) -> Option<StarknetFelt> {
         let contract = parse_contract_address(contract)?;
         let txn = self.reader.begin_ro_txn().ok()?;
         let state_reader = txn.get_state_reader().ok()?;
-        let nonce: PapyrusNonce = state_reader
+        let nonce: ApolloNonce = state_reader
             .get_nonce_at(self.state_number, &contract)
             .ok()??;
-        papyrus_felt_to_node_felt(nonce.0).ok()
+        apollo_felt_to_node_felt(nonce.0).ok()
     }
 }
 
-#[cfg(feature = "papyrus-adapter")]
-pub struct PapyrusStorageAdapter {
-    reader: PapyrusStorageReader,
-    _writer: PapyrusStorageWriter,
+#[cfg(feature = "apollo-adapter")]
+pub struct ApolloStorageAdapter {
+    reader: ApolloStorageReader,
+    _writer: ApolloStorageWriter,
 }
 
-#[cfg(feature = "papyrus-adapter")]
-impl PapyrusStorageAdapter {
-    pub fn open(config: PapyrusStorageConfig) -> Result<Self, StorageError> {
-        let (reader, writer) = open_papyrus_storage(config)
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+#[cfg(feature = "apollo-adapter")]
+impl ApolloStorageAdapter {
+    pub fn open(config: ApolloStorageConfig) -> Result<Self, StorageError> {
+        let (reader, writer) =
+            open_apollo_storage(config).map_err(|error| StorageError::Apollo(error.to_string()))?;
         Ok(Self {
             reader,
             _writer: writer,
         })
     }
 
-    pub fn from_parts(reader: PapyrusStorageReader, writer: PapyrusStorageWriter) -> Self {
+    pub fn from_parts(reader: ApolloStorageReader, writer: ApolloStorageWriter) -> Self {
         Self {
             reader,
             _writer: writer,
@@ -444,53 +444,56 @@ impl PapyrusStorageAdapter {
         let txn = self
             .reader
             .begin_ro_txn()
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+            .map_err(|error| StorageError::Apollo(error.to_string()))?;
         let marker = txn
             .get_header_marker()
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+            .map_err(|error| StorageError::Apollo(error.to_string()))?;
         let Some(latest_number) = latest_block_from_marker(marker) else {
             return Ok("0x0".to_string());
         };
 
         let header = txn
             .get_block_header(latest_number)
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+            .map_err(|error| StorageError::Apollo(error.to_string()))?;
         match header {
-            Some(header) => Ok(format!("{:#x}", header.state_root.0)),
+            Some(header) => Ok(format!(
+                "{:#x}",
+                header.block_header_without_hash.state_root.0
+            )),
             None => Ok("0x0".to_string()),
         }
     }
 }
 
-#[cfg(feature = "papyrus-adapter")]
-fn latest_block_from_marker(marker: PapyrusBlockNumber) -> Option<PapyrusBlockNumber> {
-    marker.0.checked_sub(1).map(PapyrusBlockNumber)
+#[cfg(feature = "apollo-adapter")]
+fn latest_block_from_marker(marker: ApolloBlockNumber) -> Option<ApolloBlockNumber> {
+    marker.0.checked_sub(1).map(ApolloBlockNumber)
 }
 
-#[cfg(feature = "papyrus-adapter")]
-fn parse_contract_address(raw: &str) -> Option<PapyrusContractAddress> {
-    let felt = PapyrusFelt::from_str(raw).ok()?;
-    PapyrusContractAddress::try_from(felt).ok()
+#[cfg(feature = "apollo-adapter")]
+fn parse_contract_address(raw: &str) -> Option<ApolloContractAddress> {
+    let felt = ApolloFelt::from_str(raw).ok()?;
+    ApolloContractAddress::try_from(felt).ok()
 }
 
-#[cfg(feature = "papyrus-adapter")]
-fn parse_storage_key(raw: &str) -> Option<PapyrusStorageKey> {
-    let felt = PapyrusFelt::from_str(raw).ok()?;
-    PapyrusStorageKey::try_from(felt).ok()
+#[cfg(feature = "apollo-adapter")]
+fn parse_storage_key(raw: &str) -> Option<ApolloStorageKey> {
+    let felt = ApolloFelt::from_str(raw).ok()?;
+    ApolloStorageKey::try_from(felt).ok()
 }
 
-#[cfg(feature = "papyrus-adapter")]
-fn papyrus_felt_to_node_felt(value: PapyrusFelt) -> Result<StarknetFelt, StorageError> {
+#[cfg(feature = "apollo-adapter")]
+fn apollo_felt_to_node_felt(value: ApolloFelt) -> Result<StarknetFelt, StorageError> {
     let encoded = format!("{:#x}", value);
     StarknetFelt::from_hex(&encoded).map_err(|error| StorageError::InvalidFeltEncoding {
-        field: "papyrus_felt",
+        field: "apollo_felt",
         value: encoded,
         error: error.to_string(),
     })
 }
 
-#[cfg(feature = "papyrus-adapter")]
-fn map_thin_state_diff(diff: PapyrusThinStateDiff) -> Result<StarknetStateDiff, StorageError> {
+#[cfg(feature = "apollo-adapter")]
+fn map_thin_state_diff(diff: ApolloThinStateDiff) -> Result<StarknetStateDiff, StorageError> {
     let mut mapped = StarknetStateDiff::default();
     for (address, writes) in diff.storage_diffs {
         let contract = format!("{:#x}", address.0.key());
@@ -498,17 +501,17 @@ fn map_thin_state_diff(diff: PapyrusThinStateDiff) -> Result<StarknetStateDiff, 
         for (key, value) in writes {
             mapped_writes.insert(
                 format!("{:#x}", key.0.key()),
-                papyrus_felt_to_node_felt(value)?,
+                apollo_felt_to_node_felt(value)?,
             );
         }
     }
     for (address, nonce) in diff.nonces {
         mapped.nonces.insert(
             format!("{:#x}", address.0.key()),
-            papyrus_felt_to_node_felt(nonce.0)?,
+            apollo_felt_to_node_felt(nonce.0)?,
         );
     }
-    for class_hash in diff.declared_classes.keys() {
+    for class_hash in diff.class_hash_to_compiled_class_hash.keys() {
         mapped.declared_classes.push(format!("{:#x}", class_hash.0));
     }
     for class_hash in &diff.deprecated_declared_classes {
@@ -517,7 +520,7 @@ fn map_thin_state_diff(diff: PapyrusThinStateDiff) -> Result<StarknetStateDiff, 
     Ok(mapped)
 }
 
-#[cfg(feature = "papyrus-adapter")]
+#[cfg(feature = "apollo-adapter")]
 fn parse_starknet_version_to_semver(raw: &str) -> Result<semver::Version, StorageError> {
     if let Ok(version) = semver::Version::parse(raw) {
         return Ok(version);
@@ -538,8 +541,8 @@ fn parse_starknet_version_to_semver(raw: &str) -> Result<semver::Version, Storag
     )))
 }
 
-#[cfg(feature = "papyrus-adapter")]
-impl HealthCheck for PapyrusStorageAdapter {
+#[cfg(feature = "apollo-adapter")]
+impl HealthCheck for ApolloStorageAdapter {
     fn is_healthy(&self) -> bool {
         self.read_current_state_root().is_ok()
     }
@@ -551,7 +554,7 @@ impl HealthCheck for PapyrusStorageAdapter {
             .err()
             .map(|error| error.to_string());
         ComponentHealth {
-            name: "papyrus-storage-adapter".to_string(),
+            name: "apollo-storage-adapter".to_string(),
             status: if error.is_none() {
                 HealthStatus::Healthy
             } else {
@@ -564,8 +567,8 @@ impl HealthCheck for PapyrusStorageAdapter {
     }
 }
 
-#[cfg(feature = "papyrus-adapter")]
-impl StorageBackend for PapyrusStorageAdapter {
+#[cfg(feature = "apollo-adapter")]
+impl StorageBackend for ApolloStorageAdapter {
     fn get_state_reader(
         &self,
         block_number: BlockNumber,
@@ -573,10 +576,10 @@ impl StorageBackend for PapyrusStorageAdapter {
         let txn = self
             .reader
             .begin_ro_txn()
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+            .map_err(|error| StorageError::Apollo(error.to_string()))?;
         let state_marker = txn
             .get_state_marker()
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+            .map_err(|error| StorageError::Apollo(error.to_string()))?;
         let latest_state_block = latest_block_from_marker(state_marker);
         let state_number = if let Some(latest) = latest_state_block {
             if block_number > latest.0 {
@@ -585,16 +588,16 @@ impl StorageBackend for PapyrusStorageAdapter {
                     latest: latest.0,
                 });
             }
-            PapyrusStateNumber::unchecked_right_after_block(PapyrusBlockNumber(block_number))
+            ApolloStateNumber::unchecked_right_after_block(ApolloBlockNumber(block_number))
         } else if block_number == 0 {
-            PapyrusStateNumber::right_before_block(PapyrusBlockNumber(0))
+            ApolloStateNumber::right_before_block(ApolloBlockNumber(0))
         } else {
             return Err(StorageError::BlockOutOfRange {
                 requested: block_number,
                 latest: 0,
             });
         };
-        Ok(Box::new(PapyrusStateReaderAdapter {
+        Ok(Box::new(ApolloStateReaderAdapter {
             reader: self.reader.clone(),
             state_number,
         }))
@@ -602,7 +605,7 @@ impl StorageBackend for PapyrusStorageAdapter {
 
     fn apply_state_diff(&mut self, _diff: &StarknetStateDiff) -> Result<(), StorageError> {
         Err(StorageError::UnsupportedOperation(
-            "apply_state_diff is not supported for papyrus adapter",
+            "apply_state_diff is not supported for apollo adapter",
         ))
     }
 
@@ -612,7 +615,7 @@ impl StorageBackend for PapyrusStorageAdapter {
         _state_diff: StarknetStateDiff,
     ) -> Result<(), StorageError> {
         Err(StorageError::UnsupportedOperation(
-            "insert_block is not supported for papyrus adapter",
+            "insert_block is not supported for apollo adapter",
         ))
     }
 
@@ -620,13 +623,13 @@ impl StorageBackend for PapyrusStorageAdapter {
         let txn = self
             .reader
             .begin_ro_txn()
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+            .map_err(|error| StorageError::Apollo(error.to_string()))?;
         let number = match id {
-            BlockId::Number(number) => PapyrusBlockNumber(number),
+            BlockId::Number(number) => ApolloBlockNumber(number),
             BlockId::Latest => {
                 let marker = txn
                     .get_header_marker()
-                    .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+                    .map_err(|error| StorageError::Apollo(error.to_string()))?;
                 let Some(latest) = latest_block_from_marker(marker) else {
                     return Ok(None);
                 };
@@ -636,43 +639,43 @@ impl StorageBackend for PapyrusStorageAdapter {
 
         let header = txn
             .get_block_header(number)
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+            .map_err(|error| StorageError::Apollo(error.to_string()))?;
         let Some(header) = header else {
             return Ok(None);
         };
 
+        let header_without_hash = header.block_header_without_hash;
         let protocol_version =
-            parse_starknet_version_to_semver(&header.starknet_version.to_string())?;
+            parse_starknet_version_to_semver(&header_without_hash.starknet_version.to_string())?;
         let l1_gas = GasPricePerToken {
-            price_in_fri: header.l1_gas_price.price_in_fri.0,
-            price_in_wei: header.l1_gas_price.price_in_wei.0,
+            price_in_fri: header_without_hash.l1_gas_price.price_in_fri.0,
+            price_in_wei: header_without_hash.l1_gas_price.price_in_wei.0,
         };
         let l1_data_gas = GasPricePerToken {
-            price_in_fri: header.l1_data_gas_price.price_in_fri.0,
-            price_in_wei: header.l1_data_gas_price.price_in_wei.0,
+            price_in_fri: header_without_hash.l1_data_gas_price.price_in_fri.0,
+            price_in_wei: header_without_hash.l1_data_gas_price.price_in_wei.0,
+        };
+        let l2_gas = GasPricePerToken {
+            price_in_fri: header_without_hash.l2_gas_price.price_in_fri.0,
+            price_in_wei: header_without_hash.l2_gas_price.price_in_wei.0,
         };
         let transactions = txn
             .get_block_transaction_hashes(number)
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?
+            .map_err(|error| StorageError::Apollo(error.to_string()))?
             .unwrap_or_default()
             .into_iter()
             .map(|hash| StarknetTransaction::new(format!("{:#x}", hash.0)))
             .collect();
         Ok(Some(StarknetBlock {
             number: number.0,
-            parent_hash: format!("{:#x}", header.parent_hash.0),
-            state_root: format!("{:#x}", header.state_root.0),
-            timestamp: header.timestamp.0,
-            sequencer_address: format!("{:#x}", header.sequencer.0.0.key()),
+            parent_hash: format!("{:#x}", header_without_hash.parent_hash.0),
+            state_root: format!("{:#x}", header_without_hash.state_root.0),
+            timestamp: header_without_hash.timestamp.0,
+            sequencer_address: format!("{:#x}", header_without_hash.sequencer.0.0.key()),
             gas_prices: BlockGasPrices {
                 l1_gas,
                 l1_data_gas,
-                // Starknet v0.13 headers do not carry L2 gas prices. Use explicit fallback
-                // instead of implicit defaults to avoid accidental fee-policy drift.
-                l2_gas: GasPricePerToken {
-                    price_in_fri: 1,
-                    price_in_wei: 1,
-                },
+                l2_gas,
             },
             protocol_version,
             transactions,
@@ -686,10 +689,10 @@ impl StorageBackend for PapyrusStorageAdapter {
         let txn = self
             .reader
             .begin_ro_txn()
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+            .map_err(|error| StorageError::Apollo(error.to_string()))?;
         let maybe_diff = txn
-            .get_state_diff(PapyrusBlockNumber(block_number))
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+            .get_state_diff(ApolloBlockNumber(block_number))
+            .map_err(|error| StorageError::Apollo(error.to_string()))?;
         maybe_diff.map(map_thin_state_diff).transpose()
     }
 
@@ -697,10 +700,10 @@ impl StorageBackend for PapyrusStorageAdapter {
         let txn = self
             .reader
             .begin_ro_txn()
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+            .map_err(|error| StorageError::Apollo(error.to_string()))?;
         let marker = txn
             .get_header_marker()
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+            .map_err(|error| StorageError::Apollo(error.to_string()))?;
         Ok(latest_block_from_marker(marker).map(|n| n.0).unwrap_or(0))
     }
 
@@ -708,7 +711,7 @@ impl StorageBackend for PapyrusStorageAdapter {
         match self.read_current_state_root() {
             Ok(root) => root,
             Err(error) => {
-                eprintln!("papyrus-storage-adapter: failed to read current state root: {error}");
+                eprintln!("apollo-storage-adapter: failed to read current state root: {error}");
                 "0x0".to_string()
             }
         }
@@ -897,35 +900,35 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "papyrus-adapter"))]
-mod papyrus_tests {
+#[cfg(all(test, feature = "apollo-adapter"))]
+mod apollo_tests {
     use std::path::Path;
 
-    use papyrus_storage::body::BodyStorageWriter;
-    use papyrus_storage::db::DbConfig;
-    use papyrus_storage::header::HeaderStorageWriter;
-    use papyrus_storage::mmap_file::MmapFileConfig;
-    use papyrus_storage::state::StateStorageWriter;
-    use papyrus_storage::{StorageConfig as PapyrusStorageConfig, StorageScope};
+    use apollo_storage::body::BodyStorageWriter;
+    use apollo_storage::db::DbConfig;
+    use apollo_storage::header::HeaderStorageWriter;
+    use apollo_storage::mmap_file::MmapFileConfig;
+    use apollo_storage::state::StateStorageWriter;
+    use apollo_storage::{StorageConfig as ApolloStorageConfig, StorageScope};
     use semver::Version;
     use serde::Deserialize;
     use starknet_api::block::{
-        BlockHeader, BlockNumber as PapyrusBlockNumber, BlockTimestamp as PapyrusBlockTimestamp,
-        StarknetVersion as PapyrusVersion,
+        BlockHeader, BlockNumber as ApolloBlockNumber, BlockTimestamp as ApolloBlockTimestamp,
+        StarknetVersion as ApolloVersion,
     };
     use starknet_api::core::{
-        ChainId, ClassHash as PapyrusClassHash, CompiledClassHash as PapyrusCompiledClassHash,
-        ContractAddress as PapyrusContractAddress, Nonce as PapyrusNonce,
+        ChainId, ClassHash as ApolloClassHash, CompiledClassHash as ApolloCompiledClassHash,
+        ContractAddress as ApolloContractAddress, GlobalRoot, Nonce as ApolloNonce,
     };
-    use starknet_api::hash::StarkHash as PapyrusFelt;
+    use starknet_api::hash::StarkHash as ApolloFelt;
     use starknet_api::state::{
-        StorageKey as PapyrusStorageKey, ThinStateDiff as PapyrusThinStateDiff,
+        StorageKey as ApolloStorageKey, ThinStateDiff as ApolloThinStateDiff,
     };
     use starknet_api::transaction::{
-        L1HandlerTransaction as PapyrusL1HandlerTransaction,
-        L1HandlerTransactionOutput as PapyrusL1HandlerTransactionOutput,
-        Transaction as PapyrusTransaction, TransactionHash as PapyrusTransactionHash,
-        TransactionOutput as PapyrusTransactionOutput,
+        L1HandlerTransaction as ApolloL1HandlerTransaction,
+        L1HandlerTransactionOutput as ApolloL1HandlerTransactionOutput,
+        Transaction as ApolloTransaction, TransactionHash as ApolloTransactionHash,
+        TransactionOutput as ApolloTransactionOutput,
     };
     use tempfile::tempdir;
 
@@ -938,8 +941,8 @@ mod papyrus_tests {
         protocol_version: String,
     }
 
-    fn papyrus_config(path: &Path) -> PapyrusStorageConfig {
-        PapyrusStorageConfig {
+    fn apollo_config(path: &Path) -> ApolloStorageConfig {
+        ApolloStorageConfig {
             db_config: DbConfig {
                 path_prefix: path.to_path_buf(),
                 chain_id: ChainId::Other("SN_MAIN".to_string()),
@@ -947,6 +950,7 @@ mod papyrus_tests {
                 min_size: 1 << 20,
                 max_size: 1 << 35,
                 growth_step: 1 << 26,
+                max_readers: 1 << 13,
             },
             mmap_file_config: MmapFileConfig {
                 max_size: 1 << 24,
@@ -965,60 +969,62 @@ mod papyrus_tests {
     }
 
     fn seed_header(
-        adapter: &mut PapyrusStorageAdapter,
+        adapter: &mut ApolloStorageAdapter,
         fixture: &StarknetFixture,
     ) -> Result<(), StorageError> {
-        let root = PapyrusFelt::from_hex(&fixture.state_root)
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
-        let header = BlockHeader {
-            state_root: starknet_api::core::GlobalRoot(root),
-            starknet_version: PapyrusVersion(fixture.protocol_version.clone()),
-            timestamp: PapyrusBlockTimestamp(1_700_000_000 + fixture.block_number),
-            ..BlockHeader::default()
-        };
+        let version = ApolloVersion::try_from(fixture.protocol_version.as_str())
+            .map_err(|error| StorageError::InvalidProtocolVersion(error.to_string()))?;
+        let root = ApolloFelt::from_hex(&fixture.state_root)
+            .map_err(|error| StorageError::Apollo(error.to_string()))?;
+        let mut header = BlockHeader::default();
+        header.block_header_without_hash.state_root = GlobalRoot(root);
+        header.block_header_without_hash.starknet_version = version;
+        header.block_header_without_hash.timestamp =
+            ApolloBlockTimestamp(1_700_000_000 + fixture.block_number);
 
         adapter
             ._writer
             .begin_rw_txn()
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?
-            .append_header(PapyrusBlockNumber(fixture.block_number), &header)
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?
+            .map_err(|error| StorageError::Apollo(error.to_string()))?
+            .append_header(ApolloBlockNumber(fixture.block_number), &header)
+            .map_err(|error| StorageError::Apollo(error.to_string()))?
             .commit()
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+            .map_err(|error| StorageError::Apollo(error.to_string()))?;
 
         Ok(())
     }
 
     fn seed_state_diff(
-        adapter: &mut PapyrusStorageAdapter,
+        adapter: &mut ApolloStorageAdapter,
         block_number: u64,
-        storage_value: PapyrusFelt,
+        storage_value: ApolloFelt,
     ) -> Result<(String, String, String), StorageError> {
-        let contract = PapyrusContractAddress::from(0xabc_u64);
-        let key = PapyrusStorageKey::from(0x1_u64);
-        let nonce = PapyrusNonce(PapyrusFelt::from(5_u64));
-        let class_hash = PapyrusClassHash(PapyrusFelt::from(0x55_u64));
-        let compiled_class_hash = PapyrusCompiledClassHash(PapyrusFelt::from(0x66_u64));
+        let contract = ApolloContractAddress::from(0xabc_u64);
+        let key = ApolloStorageKey::from(0x1_u64);
+        let nonce = ApolloNonce(ApolloFelt::from(5_u64));
+        let class_hash = ApolloClassHash(ApolloFelt::from(0x55_u64));
+        let compiled_class_hash = ApolloCompiledClassHash(ApolloFelt::from(0x66_u64));
 
-        let thin_diff = PapyrusThinStateDiff {
+        let thin_diff = ApolloThinStateDiff {
             storage_diffs: std::iter::once((
                 contract,
                 std::iter::once((key, storage_value)).collect(),
             ))
             .collect(),
-            declared_classes: std::iter::once((class_hash, compiled_class_hash)).collect(),
+            class_hash_to_compiled_class_hash: std::iter::once((class_hash, compiled_class_hash))
+                .collect(),
             nonces: std::iter::once((contract, nonce)).collect(),
-            ..PapyrusThinStateDiff::default()
+            ..ApolloThinStateDiff::default()
         };
 
         adapter
             ._writer
             .begin_rw_txn()
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?
-            .append_state_diff(PapyrusBlockNumber(block_number), thin_diff)
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?
+            .map_err(|error| StorageError::Apollo(error.to_string()))?
+            .append_state_diff(ApolloBlockNumber(block_number), thin_diff)
+            .map_err(|error| StorageError::Apollo(error.to_string()))?
             .commit()
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+            .map_err(|error| StorageError::Apollo(error.to_string()))?;
 
         Ok((
             format!("{:#x}", contract.0.key()),
@@ -1028,37 +1034,37 @@ mod papyrus_tests {
     }
 
     fn seed_body_with_single_tx_hash(
-        adapter: &mut PapyrusStorageAdapter,
+        adapter: &mut ApolloStorageAdapter,
         block_number: u64,
-        tx_hash: PapyrusFelt,
+        tx_hash: ApolloFelt,
     ) -> Result<(), StorageError> {
-        let tx = PapyrusL1HandlerTransaction::default();
+        let tx = ApolloL1HandlerTransaction::default();
 
         let body = starknet_api::block::BlockBody {
-            transactions: vec![PapyrusTransaction::L1Handler(tx)],
-            transaction_outputs: vec![PapyrusTransactionOutput::L1Handler(
-                PapyrusL1HandlerTransactionOutput::default(),
+            transactions: vec![ApolloTransaction::L1Handler(tx)],
+            transaction_outputs: vec![ApolloTransactionOutput::L1Handler(
+                ApolloL1HandlerTransactionOutput::default(),
             )],
-            transaction_hashes: vec![PapyrusTransactionHash(tx_hash)],
+            transaction_hashes: vec![ApolloTransactionHash(tx_hash)],
         };
 
         adapter
             ._writer
             .begin_rw_txn()
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?
-            .append_body(PapyrusBlockNumber(block_number), body)
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?
+            .map_err(|error| StorageError::Apollo(error.to_string()))?
+            .append_body(ApolloBlockNumber(block_number), body)
+            .map_err(|error| StorageError::Apollo(error.to_string()))?
             .commit()
-            .map_err(|error| StorageError::Papyrus(error.to_string()))?;
+            .map_err(|error| StorageError::Apollo(error.to_string()))?;
         Ok(())
     }
 
     #[test]
-    fn papyrus_adapter_reads_fixture_root_and_latest_block() {
+    fn apollo_adapter_reads_fixture_root_and_latest_block() {
         let fixture = parse_fixture();
         let dir = tempdir().expect("temp dir");
         let mut adapter =
-            PapyrusStorageAdapter::open(papyrus_config(dir.path())).expect("open papyrus");
+            ApolloStorageAdapter::open(apollo_config(dir.path())).expect("open apollo");
 
         seed_header(&mut adapter, &fixture).expect("seed header");
 
@@ -1067,17 +1073,17 @@ mod papyrus_tests {
             fixture.block_number
         );
         let root = adapter.read_current_state_root().expect("root");
-        let actual = PapyrusFelt::from_hex(&root).expect("hex root");
-        let expected = PapyrusFelt::from_hex(&fixture.state_root).expect("fixture root");
+        let actual = ApolloFelt::from_hex(&root).expect("hex root");
+        let expected = ApolloFelt::from_hex(&fixture.state_root).expect("fixture root");
         assert_eq!(actual, expected);
     }
 
     #[test]
-    fn checkpoint_verifier_accepts_fixture_root_from_papyrus_adapter() {
+    fn checkpoint_verifier_accepts_fixture_root_from_apollo_adapter() {
         let fixture = parse_fixture();
         let dir = tempdir().expect("temp dir");
         let mut adapter =
-            PapyrusStorageAdapter::open(papyrus_config(dir.path())).expect("open papyrus");
+            ApolloStorageAdapter::open(apollo_config(dir.path())).expect("open apollo");
 
         seed_header(&mut adapter, &fixture).expect("seed header");
 
@@ -1085,11 +1091,11 @@ mod papyrus_tests {
     }
 
     #[test]
-    fn papyrus_adapter_normalizes_four_component_protocol_versions() {
+    fn apollo_adapter_normalizes_four_component_protocol_versions() {
         let fixture = parse_fixture();
         let dir = tempdir().expect("temp dir");
         let mut adapter =
-            PapyrusStorageAdapter::open(papyrus_config(dir.path())).expect("open papyrus");
+            ApolloStorageAdapter::open(apollo_config(dir.path())).expect("open apollo");
 
         let mut fixture = fixture;
         fixture.protocol_version = "0.13.1.1".to_string();
@@ -1107,19 +1113,16 @@ mod papyrus_tests {
     }
 
     #[test]
-    fn papyrus_adapter_maps_state_diff_and_state_reader() {
+    fn apollo_adapter_maps_state_diff_and_state_reader() {
         let fixture = parse_fixture();
         let dir = tempdir().expect("temp dir");
         let mut adapter =
-            PapyrusStorageAdapter::open(papyrus_config(dir.path())).expect("open papyrus");
+            ApolloStorageAdapter::open(apollo_config(dir.path())).expect("open apollo");
 
         seed_header(&mut adapter, &fixture).expect("seed header");
-        let (contract, key, declared_class) = seed_state_diff(
-            &mut adapter,
-            fixture.block_number,
-            PapyrusFelt::from(77_u64),
-        )
-        .expect("seed state diff");
+        let (contract, key, declared_class) =
+            seed_state_diff(&mut adapter, fixture.block_number, ApolloFelt::from(77_u64))
+                .expect("seed state diff");
 
         let reader = adapter
             .get_state_reader(fixture.block_number)
@@ -1149,14 +1152,14 @@ mod papyrus_tests {
     }
 
     #[test]
-    fn papyrus_adapter_preserves_large_state_diff_values_without_truncation() {
+    fn apollo_adapter_preserves_large_state_diff_values_without_truncation() {
         let fixture = parse_fixture();
         let dir = tempdir().expect("temp dir");
         let mut adapter =
-            PapyrusStorageAdapter::open(papyrus_config(dir.path())).expect("open papyrus");
+            ApolloStorageAdapter::open(apollo_config(dir.path())).expect("open apollo");
 
         seed_header(&mut adapter, &fixture).expect("seed header");
-        let huge = PapyrusFelt::from_hex("0x10000000000000000").expect("felt");
+        let huge = ApolloFelt::from_hex("0x10000000000000000").expect("felt");
         seed_state_diff(&mut adapter, fixture.block_number, huge).expect("seed state diff");
 
         let diff = adapter
@@ -1178,11 +1181,11 @@ mod papyrus_tests {
     }
 
     #[test]
-    fn papyrus_adapter_rejects_future_state_reader_requests() {
+    fn apollo_adapter_rejects_future_state_reader_requests() {
         let fixture = parse_fixture();
         let dir = tempdir().expect("temp dir");
         let mut adapter =
-            PapyrusStorageAdapter::open(papyrus_config(dir.path())).expect("open papyrus");
+            ApolloStorageAdapter::open(apollo_config(dir.path())).expect("open apollo");
         seed_header(&mut adapter, &fixture).expect("seed header");
 
         let err = match adapter.get_state_reader(fixture.block_number + 1) {
@@ -1199,17 +1202,17 @@ mod papyrus_tests {
     }
 
     #[test]
-    fn papyrus_adapter_populates_block_transactions_from_body_hashes() {
+    fn apollo_adapter_populates_block_transactions_from_body_hashes() {
         let fixture = parse_fixture();
         let dir = tempdir().expect("temp dir");
         let mut adapter =
-            PapyrusStorageAdapter::open(papyrus_config(dir.path())).expect("open papyrus");
+            ApolloStorageAdapter::open(apollo_config(dir.path())).expect("open apollo");
 
         seed_header(&mut adapter, &fixture).expect("seed header");
         seed_body_with_single_tx_hash(
             &mut adapter,
             fixture.block_number,
-            PapyrusFelt::from(0xabc_u64),
+            ApolloFelt::from(0xabc_u64),
         )
         .expect("seed body");
 

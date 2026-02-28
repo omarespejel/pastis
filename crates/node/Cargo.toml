@@ -6,7 +6,7 @@ edition = "2024"
 [features]
 default = []
 production-adapters = [
-    "starknet-node-storage/papyrus-adapter",
+    "starknet-node-storage/apollo-adapter",
     "starknet-node-execution/blockifier-adapter",
 ]
 

@@ -24,7 +24,7 @@ The core type system intentionally excludes prover-only data (`CairoTrace`, proo
 
 ### 2.2 Storage
 
-Papyrus is the storage backend of record. State root and trie logic are delegated to Papyrus rather than reimplemented.
+Apollo Storage is the storage backend of record. State root and trie logic are delegated to Apollo rather than reimplemented.
 
 ### 2.3 Consensus and P2P
 

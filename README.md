@@ -26,7 +26,7 @@ This repository currently ships core, tested building blocks:
 - ExEx delivery planning with dependencies, priorities, cycle detection, and depth limits
 - L1 finality tracker with reorg invalidation and contiguous verified-block progression
 - Protocol-version constant resolution with fail-closed behavior
-- Storage backends with Papyrus adapter tests against real Starknet fixture data
+- Storage backends with Apollo adapter tests against real Starknet fixture data
 - Dual execution orchestration with canonical fallback/mismatch handling
 - ExEx manager with bounded WAL replay and failing-sink circuit breaker
 - Type-state node builder that enforces composition order
@@ -66,7 +66,7 @@ Planned integrations with `starknet-agentic`, `starkclaw`, and `SISNA` are treat
    - `CanonicalOnly`
    - `FastOnly`
    - `DualWithVerification`
-3. State is committed via storage backend behavior (Papyrus for canonical Starknet semantics).
+3. State is committed via storage backend behavior (Apollo storage for canonical Starknet semantics).
 4. ExEx notifications are WAL-persisted before delivery.
 5. ExEx manager delivers notifications in deterministic dependency tiers.
 6. Agent-facing surfaces (e.g., MCP) consume notifications and read state without mutating consensus-critical paths.
@@ -83,19 +83,11 @@ Planned integrations with `starknet-agentic`, `starkclaw`, and `SISNA` are treat
 ```bash
 cargo fmt --all --check
 cargo test --workspace
-cargo test -p starknet-node-storage --features papyrus-adapter
+cargo test -p starknet-node-storage --features apollo-adapter
 cargo test -p starknet-node-execution --features blockifier-adapter
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-./scripts/check-vendored-size-of.sh
+./scripts/check-storage-adapter-deps.sh
 ```
-
-## Dependency Integrity
-
-Pastis currently patches `size-of` to a reviewed vendored copy for upstream compatibility.
-
-- Integrity is enforced in CI by:
-  - [scripts/check-vendored-size-of.sh](/Users/espejelomar/StarkNet/pastis/scripts/check-vendored-size-of.sh)
-  - [vendor/size-of/VENDOR_SHA256](/Users/espejelomar/StarkNet/pastis/vendor/size-of/VENDOR_SHA256)
 
 ## Performance Gate (Next Step)
 
@@ -119,7 +111,7 @@ Tune limits with environment variables:
 
 Near-term implementation sequence:
 
-1. Expand Papyrus-backed adapters and fixture coverage
+1. Expand Apollo-backed adapters and fixture coverage
 2. Continue hardening Blockifier adapter semantics across protocol versions
 3. Extend ExEx manager recovery and failure isolation behavior
 4. Land MCP server implementation and tool auth/rate limits
