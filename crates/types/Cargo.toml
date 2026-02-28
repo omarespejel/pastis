@@ -1,0 +1,15 @@
+[package]
+name = "starknet-node-types"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+blockifier-adapter = ["dep:starknet_api"]
+
+[dependencies]
+semver = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+starknet-types-core = "0.2.4"
+starknet_api = { git = "https://github.com/starkware-libs/sequencer", rev = "69b4c8d378580a1aec345f23dadd4766e036fe3b", package = "starknet_api", optional = true }

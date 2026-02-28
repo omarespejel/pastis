@@ -1,0 +1,25 @@
+[package]
+name = "starknet-node-execution"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+blockifier-adapter = [
+    "dep:blockifier",
+    "dep:starknet_api",
+    "dep:num-traits",
+    "starknet-node-types/blockifier-adapter",
+]
+
+[dependencies]
+node-spec-core = { path = "../node-spec-core" }
+semver = { workspace = true }
+starknet-node-types = { path = "../types" }
+thiserror = { workspace = true }
+
+# Keep production adapters aligned with sequencer monorepo revisions so execution/state
+# integration uses a single blockifier/starknet_api type universe.
+blockifier = { git = "https://github.com/starkware-libs/sequencer", rev = "69b4c8d378580a1aec345f23dadd4766e036fe3b", package = "blockifier", optional = true }
+starknet_api = { git = "https://github.com/starkware-libs/sequencer", rev = "69b4c8d378580a1aec345f23dadd4766e036fe3b", package = "starknet_api", optional = true }
+num-traits = { version = "0.2", optional = true }

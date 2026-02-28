@@ -1,0 +1,11 @@
+[package]
+name = "starknet-node-exex-manager"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bincode = { workspace = true }
+node-spec-core = { path = "../node-spec-core" }
+rayon = "1.11"
+thiserror = { workspace = true }

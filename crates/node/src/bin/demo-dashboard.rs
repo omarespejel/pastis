@@ -1,0 +1,2005 @@
+#![forbid(unsafe_code)]
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::env;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::Html;
+use axum::routing::get;
+use axum::{Json, Router};
+use node_spec_core::mcp::{
+    AgentPolicy, McpAccessController, McpTool, ToolPermission, ValidationLimits,
+};
+use semver::Version;
+use serde::Serialize;
+use serde_json::{Value, json};
+use starknet_node::{NodeConfig, StarknetNode, StarknetNodeBuilder};
+use starknet_node_execution::{ExecutionBackend, ExecutionError};
+use starknet_node_exex_btcfi::{
+    BtcfiAnomaly, BtcfiExEx, StandardWrapper, StandardWrapperConfig, StandardWrapperMonitor,
+    StrkBtcMonitor, StrkBtcMonitorConfig,
+};
+use starknet_node_mcp_server::{McpRequest, McpResponse};
+use starknet_node_storage::{InMemoryStorage, StorageBackend};
+use starknet_node_types::{
+    BlockContext, BlockGasPrices, BuiltinStats, ContractAddress, ExecutionOutput, GasPricePerToken,
+    InMemoryState, MutableState, SimulationResult, StarknetBlock, StarknetFelt, StarknetReceipt,
+    StarknetStateDiff, StarknetTransaction, StateReader,
+};
+use tokio::net::TcpListener;
+use tokio::time::interval;
+
+const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
+const DEFAULT_REFRESH_MS: u64 = 2_000;
+const DEMO_API_KEY: &str = "boss-demo-key";
+const MAX_RECENT_ERRORS: usize = 16;
+const MAX_RECENT_ANOMALIES: usize = 512;
+
+const WBTC_CONTRACT: &str = "0x111";
+const STRKBTC_SHIELDED_POOL: &str = "0x222";
+const STRKBTC_MERKLE_ROOT_KEY: &str = "0x10";
+const STRKBTC_COMMITMENT_COUNT_KEY: &str = "0x11";
+const STRKBTC_NULLIFIER_COUNT_KEY: &str = "0x12";
+const STRKBTC_NULLIFIER_PREFIX: &str = "0xdead";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DashboardModeKind {
+    Demo,
+    Real,
+}
+
+impl DashboardModeKind {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.to_ascii_lowercase().as_str() {
+            "demo" => Ok(Self::Demo),
+            "real" => Ok(Self::Real),
+            _ => Err(format!(
+                "unsupported mode `{raw}`. expected `demo` or `real`"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Demo => "demo",
+            Self::Real => "real",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DashboardConfig {
+    mode: DashboardModeKind,
+    bind_addr: String,
+    refresh_ms: u64,
+    rpc_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RealBtcfiConfig {
+    wrappers: Vec<StandardWrapperConfig>,
+    strkbtc: StrkBtcMonitorConfig,
+    max_retained_anomalies: usize,
+}
+
+#[derive(Clone)]
+struct AppState {
+    source: DashboardSource,
+    refresh_ms: u64,
+}
+
+#[derive(Clone)]
+enum DashboardSource {
+    Demo { runtime: Arc<Mutex<DemoRuntime>> },
+    Real { runtime: Arc<RealRuntime> },
+}
+
+struct DemoExecution;
+
+impl ExecutionBackend for DemoExecution {
+    fn execute_block(
+        &self,
+        block: &StarknetBlock,
+        _state: &mut dyn MutableState,
+    ) -> Result<ExecutionOutput, ExecutionError> {
+        Ok(ExecutionOutput {
+            receipts: vec![StarknetReceipt {
+                tx_hash: format!("0x{:x}", block.number).into(),
+                execution_status: true,
+                events: 0,
+                gas_consumed: 1,
+            }],
+            state_diff: StarknetStateDiff::default(),
+            builtin_stats: BuiltinStats::default(),
+            execution_time: Duration::from_millis(1),
+        })
+    }
+
+    fn simulate_tx(
+        &self,
+        tx: &StarknetTransaction,
+        _state: &dyn StateReader,
+        _block_context: &BlockContext,
+    ) -> Result<SimulationResult, ExecutionError> {
+        Ok(SimulationResult {
+            receipt: StarknetReceipt {
+                tx_hash: tx.hash.clone(),
+                execution_status: true,
+                events: 0,
+                gas_consumed: 1,
+            },
+            estimated_fee: 1,
+        })
+    }
+}
+
+struct DemoRuntime {
+    node: StarknetNode<InMemoryStorage, DemoExecution>,
+    btcfi: Mutex<BtcfiExEx>,
+    next_block: u64,
+    commitment_count: u64,
+    nullifier_count: u64,
+    merkle_root: u64,
+    last_nullifier_key: Option<String>,
+    tick_successes: u64,
+    tick_failures: u64,
+    last_error: Option<String>,
+    recent_errors: VecDeque<String>,
+}
+
+impl DemoRuntime {
+    fn new() -> Self {
+        let storage = InMemoryStorage::new(InMemoryState::default());
+        let node = StarknetNodeBuilder::new(NodeConfig::default())
+            .with_storage(storage)
+            .with_execution(DemoExecution)
+            .with_rpc(true)
+            .with_mcp(true)
+            .build();
+
+        let wrapper = StandardWrapperMonitor::new(StandardWrapperConfig {
+            wrapper: StandardWrapper::Wbtc,
+            token_contract: ContractAddress::from(WBTC_CONTRACT),
+            total_supply_key: "0x1".to_string(),
+            expected_supply_sats: 1_000_000,
+            allowed_deviation_bps: 50,
+        });
+
+        let strkbtc = StrkBtcMonitor::new(StrkBtcMonitorConfig {
+            shielded_pool_contract: ContractAddress::from(STRKBTC_SHIELDED_POOL),
+            merkle_root_key: STRKBTC_MERKLE_ROOT_KEY.to_string(),
+            commitment_count_key: STRKBTC_COMMITMENT_COUNT_KEY.to_string(),
+            nullifier_count_key: STRKBTC_NULLIFIER_COUNT_KEY.to_string(),
+            nullifier_key_prefix: STRKBTC_NULLIFIER_PREFIX.to_string(),
+            commitment_flood_threshold: 8,
+            unshield_cluster_threshold: 4,
+            unshield_cluster_window_blocks: 3,
+            light_client_max_lag_blocks: 6,
+            bridge_timeout_blocks: 20,
+            max_tracked_nullifiers: 10_000,
+        });
+
+        Self {
+            node,
+            btcfi: Mutex::new(BtcfiExEx::new(vec![wrapper], strkbtc, 256)),
+            next_block: 1,
+            commitment_count: 0,
+            nullifier_count: 0,
+            merkle_root: 0x100,
+            last_nullifier_key: None,
+            tick_successes: 0,
+            tick_failures: 0,
+            last_error: None,
+            recent_errors: VecDeque::new(),
+        }
+    }
+
+    fn tick(&mut self) -> Result<(), String> {
+        let block_number = self.next_block;
+        let block = demo_block(block_number);
+        let diff = self.build_state_diff(block_number);
+
+        if let Err(error) = self.node.storage.insert_block(block, diff.clone()) {
+            let message = format!("insert block failed: {error}");
+            self.record_tick_error(message.clone());
+            return Err(message);
+        }
+        if let Ok(mut btcfi) = self.btcfi.lock() {
+            let _ = btcfi.process_block(block_number, &diff);
+        } else {
+            self.record_tick_error("btcfi lock poisoned while processing block".to_string());
+        }
+        self.next_block = self.next_block.saturating_add(1);
+        self.tick_successes = self.tick_successes.saturating_add(1);
+        Ok(())
+    }
+
+    fn record_tick_error(&mut self, message: String) {
+        self.tick_failures = self.tick_failures.saturating_add(1);
+        self.last_error = Some(message.clone());
+        push_recent_error(&mut self.recent_errors, message);
+    }
+
+    fn build_state_diff(&mut self, block_number: u64) -> StarknetStateDiff {
+        let mut storage_diffs: BTreeMap<
+            ContractAddress,
+            BTreeMap<String, starknet_node_types::StarknetFelt>,
+        > = BTreeMap::new();
+
+        let wbtc_supply = if block_number.is_multiple_of(7) {
+            1_200_000_u64
+        } else {
+            1_000_000_u64 + (block_number % 2_000)
+        };
+        storage_diffs.insert(
+            ContractAddress::from(WBTC_CONTRACT),
+            BTreeMap::from([(
+                "0x1".to_string(),
+                starknet_node_types::StarknetFelt::from(wbtc_supply),
+            )]),
+        );
+
+        let commitment_delta = if block_number.is_multiple_of(5) {
+            15
+        } else {
+            1
+        };
+        self.commitment_count = self.commitment_count.saturating_add(commitment_delta);
+
+        let unshield_delta = if block_number.is_multiple_of(4) { 3 } else { 1 };
+        self.nullifier_count = self.nullifier_count.saturating_add(unshield_delta);
+
+        if !block_number.is_multiple_of(5) {
+            self.merkle_root = self.merkle_root.saturating_add(1);
+        }
+
+        let nullifier_key = if block_number.is_multiple_of(9) {
+            self.last_nullifier_key
+                .clone()
+                .unwrap_or_else(|| format!("{STRKBTC_NULLIFIER_PREFIX}0001"))
+        } else {
+            let generated = format!("{STRKBTC_NULLIFIER_PREFIX}{block_number:04x}");
+            self.last_nullifier_key = Some(generated.clone());
+            generated
+        };
+
+        storage_diffs.insert(
+            ContractAddress::from(STRKBTC_SHIELDED_POOL),
+            BTreeMap::from([
+                (
+                    STRKBTC_MERKLE_ROOT_KEY.to_string(),
+                    starknet_node_types::StarknetFelt::from(self.merkle_root),
+                ),
+                (
+                    STRKBTC_COMMITMENT_COUNT_KEY.to_string(),
+                    starknet_node_types::StarknetFelt::from(self.commitment_count),
+                ),
+                (
+                    STRKBTC_NULLIFIER_COUNT_KEY.to_string(),
+                    starknet_node_types::StarknetFelt::from(self.nullifier_count),
+                ),
+                (
+                    nullifier_key,
+                    starknet_node_types::StarknetFelt::from(1_u64),
+                ),
+            ]),
+        );
+
+        StarknetStateDiff {
+            storage_diffs,
+            nonces: BTreeMap::new(),
+            declared_classes: Vec::new(),
+        }
+    }
+
+    fn mcp_access_controller(&self) -> McpAccessController {
+        let permissions = BTreeSet::from([
+            ToolPermission::GetNodeStatus,
+            ToolPermission::GetAnomalies,
+            ToolPermission::QueryState,
+        ]);
+        McpAccessController::new([(
+            "boss-demo".to_string(),
+            AgentPolicy::new(DEMO_API_KEY, permissions, 5_000),
+        )])
+    }
+
+    fn mcp_limits(&self) -> ValidationLimits {
+        ValidationLimits {
+            max_batch_size: 64,
+            max_depth: 4,
+            max_total_tools: 256,
+        }
+    }
+
+    fn query_anomalies_via_mcp(&self, limit: u64) -> Result<Vec<BtcfiAnomaly>, String> {
+        let server = self.node.new_mcp_server_with_anomalies(
+            self.mcp_access_controller(),
+            self.mcp_limits(),
+            &self.btcfi,
+        );
+        let response = server
+            .handle_request(McpRequest {
+                api_key: DEMO_API_KEY.to_string(),
+                tool: McpTool::GetAnomalies { limit },
+                now_unix_seconds: unix_now(),
+            })
+            .map_err(|error| format!("mcp get anomalies failed: {error}"))?;
+        match response.response {
+            McpResponse::GetAnomalies { anomalies } => Ok(anomalies),
+            other => Err(format!(
+                "unexpected MCP response for anomalies query: {other:?}"
+            )),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RealRpcClient {
+    http: reqwest::Client,
+    rpc_url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RealSnapshot {
+    chain_id: String,
+    latest_block: u64,
+    state_root: String,
+    tx_count: u64,
+    rpc_latency_ms: u64,
+    captured_unix_seconds: u64,
+}
+
+#[derive(Debug, Clone)]
+struct RealFetch {
+    snapshot: RealSnapshot,
+    state_diff: StarknetStateDiff,
+    parse_warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeDiagnostics {
+    success_count: u64,
+    failure_count: u64,
+    consecutive_failures: u64,
+    commit_failure_count: u64,
+    last_success_unix_seconds: Option<u64>,
+    last_failure_unix_seconds: Option<u64>,
+    last_processed_block: Option<u64>,
+    last_local_block: Option<u64>,
+    last_error: Option<String>,
+    recent_errors: Vec<String>,
+    anomaly_monitor_enabled: bool,
+    retained_anomaly_count: usize,
+}
+
+impl RuntimeDiagnostics {
+    fn new() -> Self {
+        Self {
+            success_count: 0,
+            failure_count: 0,
+            consecutive_failures: 0,
+            commit_failure_count: 0,
+            last_success_unix_seconds: None,
+            last_failure_unix_seconds: None,
+            last_processed_block: None,
+            last_local_block: None,
+            last_error: None,
+            recent_errors: Vec::new(),
+            anomaly_monitor_enabled: false,
+            retained_anomaly_count: 0,
+        }
+    }
+}
+
+struct RealRuntimeState {
+    node: StarknetNode<InMemoryStorage, DemoExecution>,
+    snapshot: Option<RealSnapshot>,
+    diagnostics: RuntimeDiagnostics,
+    recent_errors: VecDeque<String>,
+    next_local_block: u64,
+}
+
+#[derive(Clone)]
+struct RealRuntime {
+    client: Arc<RealRpcClient>,
+    btcfi: Option<Arc<Mutex<BtcfiExEx>>>,
+    state: Arc<Mutex<RealRuntimeState>>,
+}
+
+impl RealRuntime {
+    fn new(client: RealRpcClient, btcfi_config: Option<RealBtcfiConfig>) -> Self {
+        let storage = InMemoryStorage::new(InMemoryState::default());
+        let node = StarknetNodeBuilder::new(NodeConfig::default())
+            .with_storage(storage)
+            .with_execution(DemoExecution)
+            .with_rpc(true)
+            .with_mcp(true)
+            .build();
+        let btcfi = btcfi_config.map(|cfg| {
+            let wrappers = cfg
+                .wrappers
+                .into_iter()
+                .map(StandardWrapperMonitor::new)
+                .collect();
+            Arc::new(Mutex::new(BtcfiExEx::new(
+                wrappers,
+                StrkBtcMonitor::new(cfg.strkbtc),
+                cfg.max_retained_anomalies,
+            )))
+        });
+        let mut diagnostics = RuntimeDiagnostics::new();
+        diagnostics.anomaly_monitor_enabled = btcfi.is_some();
+        Self {
+            client: Arc::new(client),
+            btcfi,
+            state: Arc::new(Mutex::new(RealRuntimeState {
+                node,
+                snapshot: None,
+                diagnostics,
+                recent_errors: VecDeque::new(),
+                next_local_block: 1,
+            })),
+        }
+    }
+
+    async fn poll_once(&self) -> Result<RealSnapshot, String> {
+        match self.client.fetch_status().await {
+            Ok(fetch) => {
+                let mut guard = self
+                    .state
+                    .lock()
+                    .map_err(|_| "real runtime lock poisoned".to_string())?;
+                guard.snapshot = Some(fetch.snapshot.clone());
+                for warning in fetch.parse_warnings {
+                    push_recent_error(&mut guard.recent_errors, format!("warning: {warning}"));
+                }
+
+                let should_process = guard
+                    .diagnostics
+                    .last_processed_block
+                    .map(|last| fetch.snapshot.latest_block > last)
+                    .unwrap_or(true);
+
+                if should_process {
+                    let local_block = ingest_block_from_snapshot(
+                        guard.next_local_block,
+                        fetch.snapshot.latest_block,
+                        &fetch.snapshot.state_root,
+                        fetch.snapshot.tx_count,
+                    );
+                    if let Err(error) = guard
+                        .node
+                        .storage
+                        .insert_block(local_block, fetch.state_diff.clone())
+                    {
+                        let message = format!(
+                            "failed to commit local ingest block {}: {error}",
+                            guard.next_local_block
+                        );
+                        guard.diagnostics.failure_count =
+                            guard.diagnostics.failure_count.saturating_add(1);
+                        guard.diagnostics.commit_failure_count =
+                            guard.diagnostics.commit_failure_count.saturating_add(1);
+                        guard.diagnostics.consecutive_failures =
+                            guard.diagnostics.consecutive_failures.saturating_add(1);
+                        guard.diagnostics.last_failure_unix_seconds = Some(unix_now());
+                        guard.diagnostics.last_error = Some(message.clone());
+                        push_recent_error(&mut guard.recent_errors, message.clone());
+                        guard.diagnostics.recent_errors =
+                            guard.recent_errors.iter().cloned().collect();
+                        return Err(message);
+                    }
+                    guard.diagnostics.last_local_block = Some(guard.next_local_block);
+                    guard.next_local_block = guard.next_local_block.saturating_add(1);
+                    guard.diagnostics.last_processed_block = Some(fetch.snapshot.latest_block);
+                }
+
+                if let Some(btcfi) = &self.btcfi {
+                    match btcfi.lock() {
+                        Ok(mut monitor) => {
+                            if should_process {
+                                let _ = monitor
+                                    .process_block(fetch.snapshot.latest_block, &fetch.state_diff);
+                            }
+                            guard.diagnostics.retained_anomaly_count =
+                                monitor.recent_anomalies(MAX_RECENT_ANOMALIES).len();
+                        }
+                        Err(_) => {
+                            let message = "btcfi monitor lock poisoned".to_string();
+                            guard.diagnostics.last_error = Some(message.clone());
+                            push_recent_error(&mut guard.recent_errors, message);
+                        }
+                    }
+                }
+
+                guard.diagnostics.success_count = guard.diagnostics.success_count.saturating_add(1);
+                guard.diagnostics.consecutive_failures = 0;
+                guard.diagnostics.last_success_unix_seconds = Some(unix_now());
+                guard.diagnostics.last_error = None;
+                guard.diagnostics.recent_errors = guard.recent_errors.iter().cloned().collect();
+                Ok(fetch.snapshot)
+            }
+            Err(error) => {
+                let mut guard = self
+                    .state
+                    .lock()
+                    .map_err(|_| "real runtime lock poisoned".to_string())?;
+                guard.diagnostics.failure_count = guard.diagnostics.failure_count.saturating_add(1);
+                guard.diagnostics.consecutive_failures =
+                    guard.diagnostics.consecutive_failures.saturating_add(1);
+                guard.diagnostics.last_failure_unix_seconds = Some(unix_now());
+                guard.diagnostics.last_error = Some(error.clone());
+                push_recent_error(&mut guard.recent_errors, error.clone());
+                guard.diagnostics.recent_errors = guard.recent_errors.iter().cloned().collect();
+                Err(error)
+            }
+        }
+    }
+
+    fn snapshot(&self) -> Result<Option<RealSnapshot>, String> {
+        let guard = self
+            .state
+            .lock()
+            .map_err(|_| "real runtime lock poisoned".to_string())?;
+        Ok(guard.snapshot.clone())
+    }
+
+    async fn snapshot_or_refresh(&self) -> Result<RealSnapshot, String> {
+        if let Some(snapshot) = self.snapshot()? {
+            return Ok(snapshot);
+        }
+        self.poll_once().await
+    }
+
+    fn diagnostics(&self) -> Result<RuntimeDiagnostics, String> {
+        let guard = self
+            .state
+            .lock()
+            .map_err(|_| "real runtime lock poisoned".to_string())?;
+        Ok(guard.diagnostics.clone())
+    }
+
+    fn anomaly_source_name(&self) -> &'static str {
+        if self.btcfi.is_some() {
+            "mcp:get_anomalies(local)"
+        } else {
+            "unconfigured"
+        }
+    }
+
+    fn mcp_access_controller(&self) -> McpAccessController {
+        let permissions = BTreeSet::from([
+            ToolPermission::GetNodeStatus,
+            ToolPermission::GetAnomalies,
+            ToolPermission::QueryState,
+        ]);
+        McpAccessController::new([(
+            "boss-real".to_string(),
+            AgentPolicy::new(DEMO_API_KEY, permissions, 5_000),
+        )])
+    }
+
+    fn mcp_limits(&self) -> ValidationLimits {
+        ValidationLimits {
+            max_batch_size: 64,
+            max_depth: 4,
+            max_total_tools: 256,
+        }
+    }
+
+    fn query_anomalies_via_mcp(&self, limit: u64) -> Result<Option<Vec<BtcfiAnomaly>>, String> {
+        let Some(btcfi) = &self.btcfi else {
+            return Ok(None);
+        };
+        let guard = self
+            .state
+            .lock()
+            .map_err(|_| "real runtime lock poisoned".to_string())?;
+        let server = guard.node.new_mcp_server_with_anomalies(
+            self.mcp_access_controller(),
+            self.mcp_limits(),
+            btcfi.as_ref(),
+        );
+        let response = server
+            .handle_request(McpRequest {
+                api_key: DEMO_API_KEY.to_string(),
+                tool: McpTool::GetAnomalies { limit },
+                now_unix_seconds: unix_now(),
+            })
+            .map_err(|error| format!("mcp get anomalies failed: {error}"))?;
+        match response.response {
+            McpResponse::GetAnomalies { anomalies } => Ok(Some(anomalies)),
+            other => Err(format!(
+                "unexpected MCP response for anomalies query: {other:?}"
+            )),
+        }
+    }
+
+    fn retained_anomaly_count(&self) -> Result<usize, String> {
+        if self.btcfi.is_none() {
+            return Ok(0);
+        }
+        let diagnostics = self.diagnostics()?;
+        Ok(diagnostics.retained_anomaly_count)
+    }
+
+    fn anomaly_strings(&self, limit: usize) -> Result<Vec<String>, String> {
+        if let Some(anomalies) = self.query_anomalies_via_mcp(limit as u64)? {
+            return Ok(anomalies
+                .into_iter()
+                .map(|anomaly| format!("{anomaly:?}"))
+                .collect());
+        }
+        let diagnostics = self.diagnostics()?;
+        let mut notes = vec![format!(
+            "Real mode connected to {}. BTCFi monitor is not configured; set PASTIS_MONITOR_STRKBTC_SHIELDED_POOL to enable it.",
+            self.client.rpc_url
+        )];
+        if let Some(last_error) = diagnostics.last_error {
+            notes.push(format!("Latest RPC error: {last_error}"));
+        }
+        if diagnostics.consecutive_failures > 0 {
+            notes.push(format!(
+                "Consecutive RPC failures: {}",
+                diagnostics.consecutive_failures
+            ));
+        }
+        notes.truncate(limit);
+        Ok(notes)
+    }
+}
+impl RealRpcClient {
+    fn new(rpc_url: String) -> Result<Self, String> {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .build()
+            .map_err(|error| format!("failed to build HTTP client: {error}"))?;
+        Ok(Self { http, rpc_url })
+    }
+
+    async fn fetch_status(&self) -> Result<RealFetch, String> {
+        let started = Instant::now();
+
+        let chain_id_raw = self.call("starknet_chainId", json!([])).await?;
+        let chain_id = chain_id_raw
+            .as_str()
+            .map(std::string::ToString::to_string)
+            .unwrap_or_else(|| chain_id_raw.to_string());
+
+        let block_head = self.call("starknet_blockHashAndNumber", json!([])).await?;
+        let latest_block = value_as_u64(block_head.get("block_number").unwrap_or(&Value::Null))
+            .ok_or_else(|| {
+                format!("starknet_blockHashAndNumber missing block_number: {block_head}")
+            })?;
+
+        let block_selector = json!([{ "block_number": latest_block }]);
+        let tx_count_raw = self
+            .call("starknet_getBlockTransactionCount", block_selector.clone())
+            .await?;
+        let tx_count = value_as_u64(&tx_count_raw)
+            .ok_or_else(|| format!("invalid tx count payload: {tx_count_raw}"))?;
+
+        let state_update = self.call("starknet_getStateUpdate", block_selector).await?;
+        let state_root = state_update
+            .get("new_root")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let (state_diff, parse_warnings) = state_update_to_diff(&state_update)?;
+
+        Ok(RealFetch {
+            snapshot: RealSnapshot {
+                chain_id,
+                latest_block,
+                state_root,
+                tx_count,
+                rpc_latency_ms: saturating_u128_to_u64(started.elapsed().as_millis()),
+                captured_unix_seconds: unix_now(),
+            },
+            state_diff,
+            parse_warnings,
+        })
+    }
+
+    async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        });
+
+        let response = self
+            .http
+            .post(&self.rpc_url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|error| format!("RPC {method} request failed: {error}"))?;
+        let http_status = response.status();
+        let body: Value = response
+            .json()
+            .await
+            .map_err(|error| format!("RPC {method} invalid JSON response: {error}"))?;
+
+        if !http_status.is_success() {
+            return Err(format!(
+                "RPC {method} returned HTTP {} with body {}",
+                http_status, body
+            ));
+        }
+        if let Some(error) = body.get("error") {
+            return Err(format!("RPC {method} error payload: {error}"));
+        }
+        body.get("result")
+            .cloned()
+            .ok_or_else(|| format!("RPC {method} response missing `result`: {body}"))
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct StatusPayload {
+    mode: String,
+    chain_id: String,
+    latest_block: u64,
+    state_root: String,
+    tx_count: u64,
+    rpc_latency_ms: u64,
+    mcp_roundtrip_ok: bool,
+    anomaly_source: String,
+    recent_anomaly_count: usize,
+    data_age_seconds: Option<u64>,
+    failure_count: u64,
+    consecutive_failures: u64,
+    last_error: Option<String>,
+    refresh_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct AnomaliesPayload {
+    source: String,
+    anomalies: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DebugPayload {
+    mode: String,
+    refresh_ms: u64,
+    success_count: u64,
+    failure_count: u64,
+    commit_failure_count: u64,
+    consecutive_failures: u64,
+    last_success_unix_seconds: Option<u64>,
+    last_failure_unix_seconds: Option<u64>,
+    last_processed_block: Option<u64>,
+    last_local_block: Option<u64>,
+    anomaly_monitor_enabled: bool,
+    retained_anomaly_count: usize,
+    last_error: Option<String>,
+    recent_errors: Vec<String>,
+    snapshot_available: bool,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), String> {
+    let config = parse_dashboard_config()?;
+    let refresh_ms = config.refresh_ms.max(250);
+
+    let source = match config.mode {
+        DashboardModeKind::Demo => {
+            let runtime = Arc::new(Mutex::new(DemoRuntime::new()));
+            let simulation_runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                let mut ticker = interval(Duration::from_millis(refresh_ms));
+                loop {
+                    ticker.tick().await;
+                    if let Ok(mut guard) = simulation_runtime.lock()
+                        && let Err(error) = guard.tick()
+                    {
+                        eprintln!("warning: demo runtime tick failed: {error}");
+                    }
+                }
+            });
+            DashboardSource::Demo { runtime }
+        }
+        DashboardModeKind::Real => {
+            let rpc_url = config.rpc_url.clone().ok_or_else(|| {
+                "real mode requires --rpc-url <url> or STARKNET_RPC_URL".to_string()
+            })?;
+            let btcfi_config = parse_real_btcfi_config_from_env()?;
+            let runtime = Arc::new(RealRuntime::new(RealRpcClient::new(rpc_url)?, btcfi_config));
+            let poll_runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                let mut ticker = interval(Duration::from_millis(refresh_ms));
+                loop {
+                    ticker.tick().await;
+                    if let Err(error) = poll_runtime.poll_once().await {
+                        eprintln!("warning: real runtime poll failed: {error}");
+                    }
+                }
+            });
+            if let Err(error) = runtime.poll_once().await {
+                eprintln!("warning: initial real runtime poll failed: {error}");
+            }
+            DashboardSource::Real { runtime }
+        }
+    };
+
+    let anomaly_source = match &source {
+        DashboardSource::Demo { .. } => "mcp:get_anomalies".to_string(),
+        DashboardSource::Real { runtime } => runtime.anomaly_source_name().to_string(),
+    };
+
+    let app = Router::new()
+        .route("/", get(index))
+        .route("/api/status", get(status))
+        .route("/api/anomalies", get(anomalies))
+        .route("/api/debug", get(debug))
+        .with_state(AppState { source, refresh_ms });
+
+    let listener = TcpListener::bind(&config.bind_addr)
+        .await
+        .map_err(|error| format!("failed to bind {}: {error}", config.bind_addr))?;
+    println!("dashboard: http://{}/", config.bind_addr);
+    println!("mode: {}", config.mode.as_str());
+    if matches!(config.mode, DashboardModeKind::Demo) {
+        println!("demo mcp api key: {DEMO_API_KEY}");
+    }
+    if let Some(rpc_url) = &config.rpc_url {
+        println!("rpc url: {rpc_url}");
+    }
+    println!("anomaly source: {anomaly_source}");
+    axum::serve(listener, app)
+        .await
+        .map_err(|error| format!("dashboard server failed: {error}"))?;
+    Ok(())
+}
+
+async fn index() -> Html<&'static str> {
+    Html(INDEX_HTML)
+}
+
+async fn status(
+    State(state): State<AppState>,
+) -> Result<Json<StatusPayload>, (StatusCode, String)> {
+    let payload = match &state.source {
+        DashboardSource::Demo { runtime } => demo_status(runtime, state.refresh_ms),
+        DashboardSource::Real { runtime } => real_status(runtime, state.refresh_ms).await,
+    };
+    payload
+        .map(Json)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))
+}
+
+async fn anomalies(
+    State(state): State<AppState>,
+) -> Result<Json<AnomaliesPayload>, (StatusCode, String)> {
+    let payload = match &state.source {
+        DashboardSource::Demo { runtime } => demo_anomalies(runtime),
+        DashboardSource::Real { runtime } => real_anomalies(runtime).await,
+    };
+    payload
+        .map(Json)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))
+}
+
+async fn debug(State(state): State<AppState>) -> Result<Json<DebugPayload>, (StatusCode, String)> {
+    let payload = match &state.source {
+        DashboardSource::Demo { runtime } => demo_debug(runtime, state.refresh_ms),
+        DashboardSource::Real { runtime } => real_debug(runtime, state.refresh_ms),
+    };
+    payload
+        .map(Json)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))
+}
+
+fn demo_status(
+    runtime: &Arc<Mutex<DemoRuntime>>,
+    refresh_ms: u64,
+) -> Result<StatusPayload, String> {
+    let started = Instant::now();
+    let guard = runtime
+        .lock()
+        .map_err(|_| "runtime lock poisoned".to_string())?;
+    let latest_block = guard
+        .node
+        .storage
+        .latest_block_number()
+        .map_err(|error| format!("latest block read failed: {error}"))?;
+    let state_root = guard
+        .node
+        .storage
+        .current_state_root()
+        .map_err(|error| format!("state root read failed: {error}"))?;
+    let anomalies = guard.query_anomalies_via_mcp(25)?;
+    Ok(StatusPayload {
+        mode: DashboardModeKind::Demo.as_str().to_string(),
+        chain_id: guard.node.config.chain_id.as_str().to_string(),
+        latest_block,
+        state_root,
+        tx_count: 1,
+        rpc_latency_ms: saturating_u128_to_u64(started.elapsed().as_millis()),
+        mcp_roundtrip_ok: true,
+        anomaly_source: "mcp:get_anomalies".to_string(),
+        recent_anomaly_count: anomalies.len(),
+        data_age_seconds: Some(0),
+        failure_count: guard.tick_failures,
+        consecutive_failures: 0,
+        last_error: guard.last_error.clone(),
+        refresh_ms,
+    })
+}
+
+fn demo_anomalies(runtime: &Arc<Mutex<DemoRuntime>>) -> Result<AnomaliesPayload, String> {
+    let guard = runtime
+        .lock()
+        .map_err(|_| "runtime lock poisoned".to_string())?;
+    let anomalies = guard.query_anomalies_via_mcp(25)?;
+    Ok(AnomaliesPayload {
+        source: "mcp:get_anomalies".to_string(),
+        anomalies: anomalies
+            .into_iter()
+            .map(|anomaly| format!("{anomaly:?}"))
+            .collect(),
+    })
+}
+
+fn demo_debug(runtime: &Arc<Mutex<DemoRuntime>>, refresh_ms: u64) -> Result<DebugPayload, String> {
+    let guard = runtime
+        .lock()
+        .map_err(|_| "runtime lock poisoned".to_string())?;
+    Ok(DebugPayload {
+        mode: DashboardModeKind::Demo.as_str().to_string(),
+        refresh_ms,
+        success_count: guard.tick_successes,
+        failure_count: guard.tick_failures,
+        commit_failure_count: 0,
+        consecutive_failures: 0,
+        last_success_unix_seconds: None,
+        last_failure_unix_seconds: None,
+        last_processed_block: Some(guard.next_block.saturating_sub(1)),
+        last_local_block: Some(guard.next_block.saturating_sub(1)),
+        anomaly_monitor_enabled: true,
+        retained_anomaly_count: guard
+            .query_anomalies_via_mcp(MAX_RECENT_ANOMALIES as u64)?
+            .len(),
+        last_error: guard.last_error.clone(),
+        recent_errors: guard.recent_errors.iter().cloned().collect(),
+        snapshot_available: guard.tick_successes > 0,
+    })
+}
+
+async fn real_status(runtime: &Arc<RealRuntime>, refresh_ms: u64) -> Result<StatusPayload, String> {
+    let snapshot = runtime.snapshot_or_refresh().await?;
+    let diagnostics = runtime.diagnostics()?;
+    let recent_anomaly_count = runtime.retained_anomaly_count()?;
+    let mcp_roundtrip_ok = runtime.query_anomalies_via_mcp(1)?.is_some();
+    let now = unix_now();
+    let data_age_seconds = now.checked_sub(snapshot.captured_unix_seconds);
+    Ok(StatusPayload {
+        mode: DashboardModeKind::Real.as_str().to_string(),
+        chain_id: snapshot.chain_id,
+        latest_block: snapshot.latest_block,
+        state_root: snapshot.state_root,
+        tx_count: snapshot.tx_count,
+        rpc_latency_ms: snapshot.rpc_latency_ms,
+        mcp_roundtrip_ok,
+        anomaly_source: runtime.anomaly_source_name().to_string(),
+        recent_anomaly_count,
+        data_age_seconds,
+        failure_count: diagnostics.failure_count,
+        consecutive_failures: diagnostics.consecutive_failures,
+        last_error: diagnostics.last_error,
+        refresh_ms,
+    })
+}
+
+async fn real_anomalies(runtime: &Arc<RealRuntime>) -> Result<AnomaliesPayload, String> {
+    let anomalies = runtime.anomaly_strings(25)?;
+    Ok(AnomaliesPayload {
+        source: runtime.anomaly_source_name().to_string(),
+        anomalies,
+    })
+}
+
+fn real_debug(runtime: &Arc<RealRuntime>, refresh_ms: u64) -> Result<DebugPayload, String> {
+    let diagnostics = runtime.diagnostics()?;
+    Ok(DebugPayload {
+        mode: DashboardModeKind::Real.as_str().to_string(),
+        refresh_ms,
+        success_count: diagnostics.success_count,
+        failure_count: diagnostics.failure_count,
+        commit_failure_count: diagnostics.commit_failure_count,
+        consecutive_failures: diagnostics.consecutive_failures,
+        last_success_unix_seconds: diagnostics.last_success_unix_seconds,
+        last_failure_unix_seconds: diagnostics.last_failure_unix_seconds,
+        last_processed_block: diagnostics.last_processed_block,
+        last_local_block: diagnostics.last_local_block,
+        anomaly_monitor_enabled: diagnostics.anomaly_monitor_enabled,
+        retained_anomaly_count: diagnostics.retained_anomaly_count,
+        last_error: diagnostics.last_error,
+        recent_errors: diagnostics.recent_errors,
+        snapshot_available: runtime.snapshot()?.is_some(),
+    })
+}
+
+fn demo_block(number: u64) -> StarknetBlock {
+    StarknetBlock {
+        number,
+        parent_hash: format!("0x{:x}", number.saturating_sub(1)),
+        state_root: format!("0x{:x}", number.saturating_mul(17)),
+        timestamp: 1_700_000_000 + number,
+        sequencer_address: ContractAddress::from("0x1234"),
+        gas_prices: BlockGasPrices {
+            l1_gas: GasPricePerToken {
+                price_in_fri: 1,
+                price_in_wei: 1,
+            },
+            l1_data_gas: GasPricePerToken {
+                price_in_fri: 1,
+                price_in_wei: 1,
+            },
+            l2_gas: GasPricePerToken {
+                price_in_fri: 1,
+                price_in_wei: 1,
+            },
+        },
+        protocol_version: Version::parse("0.14.2").expect("demo protocol version must be valid"),
+        transactions: Vec::new(),
+    }
+}
+
+fn ingest_block_from_snapshot(
+    local_number: u64,
+    external_number: u64,
+    external_state_root: &str,
+    _external_tx_count: u64,
+) -> StarknetBlock {
+    let state_root = StarknetFelt::from_str(external_state_root)
+        .map(|felt| format!("{:#x}", felt))
+        .unwrap_or_else(|_| "0x0".to_string());
+    StarknetBlock {
+        number: local_number,
+        parent_hash: format!("0x{:x}", external_number.saturating_sub(1)),
+        state_root,
+        timestamp: unix_now(),
+        sequencer_address: ContractAddress::from("0x1"),
+        gas_prices: BlockGasPrices {
+            l1_gas: GasPricePerToken {
+                price_in_fri: 1,
+                price_in_wei: 1,
+            },
+            l1_data_gas: GasPricePerToken {
+                price_in_fri: 1,
+                price_in_wei: 1,
+            },
+            l2_gas: GasPricePerToken {
+                price_in_fri: 1,
+                price_in_wei: 1,
+            },
+        },
+        protocol_version: Version::parse("0.14.2").expect("ingest protocol version must be valid"),
+        transactions: Vec::new(),
+    }
+}
+
+fn parse_dashboard_config() -> Result<DashboardConfig, String> {
+    let args: Vec<String> = env::args().skip(1).collect();
+    parse_dashboard_config_from(
+        args,
+        env::var("PASTIS_DASHBOARD_MODE").ok(),
+        env::var("PASTIS_DASHBOARD_BIND").ok(),
+        env::var("PASTIS_DASHBOARD_REFRESH_MS").ok(),
+        env::var("STARKNET_RPC_URL").ok(),
+    )
+}
+
+fn parse_dashboard_config_from(
+    args: Vec<String>,
+    env_mode: Option<String>,
+    env_bind: Option<String>,
+    env_refresh: Option<String>,
+    env_rpc: Option<String>,
+) -> Result<DashboardConfig, String> {
+    let mode = env_mode
+        .as_deref()
+        .map(DashboardModeKind::parse)
+        .transpose()?
+        .unwrap_or(DashboardModeKind::Demo);
+    let refresh_ms = env_refresh
+        .as_deref()
+        .map(parse_refresh_ms)
+        .transpose()?
+        .unwrap_or(DEFAULT_REFRESH_MS);
+    let mut config = DashboardConfig {
+        mode,
+        bind_addr: env_bind.unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string()),
+        refresh_ms,
+        rpc_url: env_rpc,
+    };
+
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--mode" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--mode requires `demo` or `real`".to_string())?;
+                config.mode = DashboardModeKind::parse(&raw)?;
+            }
+            "--rpc-url" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--rpc-url requires a value".to_string())?;
+                config.rpc_url = Some(raw);
+            }
+            "--bind" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--bind requires a value".to_string())?;
+                config.bind_addr = raw;
+            }
+            "--refresh-ms" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--refresh-ms requires a value".to_string())?;
+                config.refresh_ms = parse_refresh_ms(&raw)?;
+            }
+            "--help" | "-h" => {
+                return Err(help_text());
+            }
+            unknown => {
+                return Err(format!("unknown flag `{unknown}`\n\n{}", help_text()));
+            }
+        }
+    }
+
+    if config.mode == DashboardModeKind::Real && config.rpc_url.is_none() {
+        return Err(
+            "real mode requires --rpc-url <url> or STARKNET_RPC_URL environment variable"
+                .to_string(),
+        );
+    }
+    Ok(config)
+}
+
+fn parse_refresh_ms(raw: &str) -> Result<u64, String> {
+    raw.parse::<u64>()
+        .map_err(|error| format!("invalid refresh value `{raw}`: {error}"))
+}
+
+fn parse_real_btcfi_config_from_env() -> Result<Option<RealBtcfiConfig>, String> {
+    let Some(strkbtc_pool) = env::var("PASTIS_MONITOR_STRKBTC_SHIELDED_POOL").ok() else {
+        return Ok(None);
+    };
+
+    let mut wrappers = Vec::new();
+    if let Ok(wbtc_contract) = env::var("PASTIS_MONITOR_WBTC_CONTRACT") {
+        wrappers.push(StandardWrapperConfig {
+            wrapper: StandardWrapper::Wbtc,
+            token_contract: ContractAddress::from(wbtc_contract),
+            total_supply_key: env::var("PASTIS_MONITOR_WBTC_TOTAL_SUPPLY_KEY")
+                .unwrap_or_else(|_| "0x1".to_string()),
+            expected_supply_sats: parse_env_u128(
+                "PASTIS_MONITOR_WBTC_EXPECTED_SUPPLY_SATS",
+                1_000_000,
+            )?,
+            allowed_deviation_bps: parse_env_u64("PASTIS_MONITOR_WBTC_ALLOWED_DEVIATION_BPS", 50)?,
+        });
+    }
+
+    let strkbtc = StrkBtcMonitorConfig {
+        shielded_pool_contract: ContractAddress::from(strkbtc_pool),
+        merkle_root_key: env::var("PASTIS_MONITOR_STRKBTC_MERKLE_ROOT_KEY")
+            .unwrap_or_else(|_| STRKBTC_MERKLE_ROOT_KEY.to_string()),
+        commitment_count_key: env::var("PASTIS_MONITOR_STRKBTC_COMMITMENT_COUNT_KEY")
+            .unwrap_or_else(|_| STRKBTC_COMMITMENT_COUNT_KEY.to_string()),
+        nullifier_count_key: env::var("PASTIS_MONITOR_STRKBTC_NULLIFIER_COUNT_KEY")
+            .unwrap_or_else(|_| STRKBTC_NULLIFIER_COUNT_KEY.to_string()),
+        nullifier_key_prefix: env::var("PASTIS_MONITOR_STRKBTC_NULLIFIER_PREFIX")
+            .unwrap_or_else(|_| STRKBTC_NULLIFIER_PREFIX.to_string()),
+        commitment_flood_threshold: parse_env_u64(
+            "PASTIS_MONITOR_STRKBTC_COMMITMENT_FLOOD_THRESHOLD",
+            8,
+        )?,
+        unshield_cluster_threshold: parse_env_u64(
+            "PASTIS_MONITOR_STRKBTC_UNSHIELD_CLUSTER_THRESHOLD",
+            4,
+        )?,
+        unshield_cluster_window_blocks: parse_env_u64(
+            "PASTIS_MONITOR_STRKBTC_UNSHIELD_CLUSTER_WINDOW_BLOCKS",
+            3,
+        )?,
+        light_client_max_lag_blocks: parse_env_u64(
+            "PASTIS_MONITOR_STRKBTC_LIGHT_CLIENT_MAX_LAG_BLOCKS",
+            6,
+        )?,
+        bridge_timeout_blocks: parse_env_u64("PASTIS_MONITOR_STRKBTC_BRIDGE_TIMEOUT_BLOCKS", 20)?,
+        max_tracked_nullifiers: parse_env_usize(
+            "PASTIS_MONITOR_STRKBTC_MAX_TRACKED_NULLIFIERS",
+            10_000,
+        )?,
+    };
+
+    Ok(Some(RealBtcfiConfig {
+        wrappers,
+        strkbtc,
+        max_retained_anomalies: parse_env_usize(
+            "PASTIS_MONITOR_MAX_RETAINED_ANOMALIES",
+            MAX_RECENT_ANOMALIES,
+        )?,
+    }))
+}
+
+fn parse_env_u64(name: &str, default: u64) -> Result<u64, String> {
+    match env::var(name) {
+        Ok(raw) => raw
+            .parse::<u64>()
+            .map_err(|error| format!("invalid {name} value `{raw}`: {error}")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn parse_env_u128(name: &str, default: u128) -> Result<u128, String> {
+    match env::var(name) {
+        Ok(raw) => raw
+            .parse::<u128>()
+            .map_err(|error| format!("invalid {name} value `{raw}`: {error}")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn parse_env_usize(name: &str, default: usize) -> Result<usize, String> {
+    match env::var(name) {
+        Ok(raw) => raw
+            .parse::<usize>()
+            .map_err(|error| format!("invalid {name} value `{raw}`: {error}")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn state_update_to_diff(state_update: &Value) -> Result<(StarknetStateDiff, Vec<String>), String> {
+    let mut diff = StarknetStateDiff::default();
+    let mut warnings = Vec::new();
+    let state_diff = state_update
+        .get("state_diff")
+        .ok_or_else(|| format!("state_update is missing state_diff: {state_update}"))?;
+
+    if let Some(storage_diffs) = state_diff.get("storage_diffs") {
+        parse_storage_diffs(storage_diffs, &mut diff, &mut warnings);
+    }
+    if let Some(nonces) = state_diff.get("nonces") {
+        parse_nonces(nonces, &mut diff, &mut warnings);
+    }
+    if let Some(declared_classes) = state_diff.get("declared_classes") {
+        parse_declared_classes(declared_classes, &mut diff, &mut warnings);
+    }
+    if let Some(deprecated_declared_classes) = state_diff.get("deprecated_declared_classes") {
+        parse_deprecated_declared_classes(deprecated_declared_classes, &mut diff, &mut warnings);
+    }
+
+    diff.validate()
+        .map_err(|error| format!("converted state diff is invalid: {error}"))?;
+    Ok((diff, warnings))
+}
+
+fn parse_storage_diffs(raw: &Value, diff: &mut StarknetStateDiff, warnings: &mut Vec<String>) {
+    match raw {
+        Value::Array(items) => {
+            for item in items {
+                let Some(address_raw) = item
+                    .get("address")
+                    .or_else(|| item.get("contract_address"))
+                    .and_then(Value::as_str)
+                else {
+                    warnings.push(format!("storage diff entry missing address: {item}"));
+                    continue;
+                };
+                let Some(contract) = parse_contract_address(address_raw, warnings) else {
+                    continue;
+                };
+                let Some(entries) = item
+                    .get("storage_entries")
+                    .or_else(|| item.get("entries"))
+                    .and_then(Value::as_array)
+                else {
+                    warnings.push(format!(
+                        "storage diff entry missing storage_entries array for {address_raw}"
+                    ));
+                    continue;
+                };
+                let writes = diff.storage_diffs.entry(contract).or_default();
+                for entry in entries {
+                    parse_storage_entry(entry, writes, warnings);
+                }
+            }
+        }
+        Value::Object(object) => {
+            for (address_raw, entries) in object {
+                let Some(contract) = parse_contract_address(address_raw, warnings) else {
+                    continue;
+                };
+                let writes = diff.storage_diffs.entry(contract).or_default();
+                match entries {
+                    Value::Array(items) => {
+                        for entry in items {
+                            parse_storage_entry(entry, writes, warnings);
+                        }
+                    }
+                    Value::Object(map_entries) => {
+                        for (key_raw, value_raw) in map_entries {
+                            parse_storage_kv(key_raw, value_raw, writes, warnings);
+                        }
+                    }
+                    other => warnings.push(format!(
+                        "unsupported storage_diffs payload for {address_raw}: {other}"
+                    )),
+                }
+            }
+        }
+        other => warnings.push(format!("unsupported storage_diffs shape: {other}")),
+    }
+}
+
+fn parse_storage_entry(
+    entry: &Value,
+    writes: &mut BTreeMap<String, StarknetFelt>,
+    warnings: &mut Vec<String>,
+) {
+    let Some(key_raw) = entry.get("key").and_then(Value::as_str) else {
+        warnings.push(format!("storage entry missing key: {entry}"));
+        return;
+    };
+    let Some(value_raw) = entry.get("value") else {
+        warnings.push(format!(
+            "storage entry missing value for key {key_raw}: {entry}"
+        ));
+        return;
+    };
+    parse_storage_kv(key_raw, value_raw, writes, warnings);
+}
+
+fn parse_storage_kv(
+    key_raw: &str,
+    value_raw: &Value,
+    writes: &mut BTreeMap<String, StarknetFelt>,
+    warnings: &mut Vec<String>,
+) {
+    let Some(storage_key) = canonicalize_hex_felt(key_raw, "storage key", warnings) else {
+        return;
+    };
+    let Some(value) = value_as_felt(value_raw, "storage value", warnings) else {
+        return;
+    };
+    writes.insert(storage_key, value);
+}
+
+fn parse_nonces(raw: &Value, diff: &mut StarknetStateDiff, warnings: &mut Vec<String>) {
+    match raw {
+        Value::Array(items) => {
+            for item in items {
+                let Some(address_raw) = item
+                    .get("contract_address")
+                    .or_else(|| item.get("address"))
+                    .and_then(Value::as_str)
+                else {
+                    warnings.push(format!("nonce entry missing contract_address: {item}"));
+                    continue;
+                };
+                let Some(contract) = parse_contract_address(address_raw, warnings) else {
+                    continue;
+                };
+                let Some(nonce_raw) = item.get("nonce") else {
+                    warnings.push(format!(
+                        "nonce entry missing nonce for {address_raw}: {item}"
+                    ));
+                    continue;
+                };
+                let Some(nonce) = value_as_felt(nonce_raw, "nonce", warnings) else {
+                    continue;
+                };
+                diff.nonces.insert(contract, nonce);
+            }
+        }
+        Value::Object(object) => {
+            for (address_raw, nonce_raw) in object {
+                let Some(contract) = parse_contract_address(address_raw, warnings) else {
+                    continue;
+                };
+                let Some(nonce) = value_as_felt(nonce_raw, "nonce", warnings) else {
+                    continue;
+                };
+                diff.nonces.insert(contract, nonce);
+            }
+        }
+        other => warnings.push(format!("unsupported nonces shape: {other}")),
+    }
+}
+
+fn parse_declared_classes(raw: &Value, diff: &mut StarknetStateDiff, warnings: &mut Vec<String>) {
+    let Some(items) = raw.as_array() else {
+        warnings.push(format!("unsupported declared_classes shape: {raw}"));
+        return;
+    };
+    for item in items {
+        let class_hash_raw = if let Some(hash) = item.as_str() {
+            hash
+        } else if let Some(hash) = item.get("class_hash").and_then(Value::as_str) {
+            hash
+        } else {
+            warnings.push(format!("declared class entry missing class_hash: {item}"));
+            continue;
+        };
+        if let Some(class_hash) = canonicalize_hex_felt(class_hash_raw, "class hash", warnings) {
+            diff.declared_classes.push(class_hash.into());
+        }
+    }
+}
+
+fn parse_deprecated_declared_classes(
+    raw: &Value,
+    diff: &mut StarknetStateDiff,
+    warnings: &mut Vec<String>,
+) {
+    let Some(items) = raw.as_array() else {
+        warnings.push(format!(
+            "unsupported deprecated_declared_classes shape: {raw}"
+        ));
+        return;
+    };
+    for item in items {
+        let Some(class_hash_raw) = item.as_str() else {
+            warnings.push(format!(
+                "deprecated declared class must be string hash, got: {item}"
+            ));
+            continue;
+        };
+        if let Some(class_hash) = canonicalize_hex_felt(class_hash_raw, "class hash", warnings) {
+            diff.declared_classes.push(class_hash.into());
+        }
+    }
+}
+
+fn parse_contract_address(raw: &str, warnings: &mut Vec<String>) -> Option<ContractAddress> {
+    canonicalize_hex_felt(raw, "contract address", warnings).map(ContractAddress::from)
+}
+
+fn canonicalize_hex_felt(raw: &str, field: &str, warnings: &mut Vec<String>) -> Option<String> {
+    match StarknetFelt::from_str(raw) {
+        Ok(value) => Some(format!("{:#x}", value)),
+        Err(error) => {
+            warnings.push(format!("invalid {field} `{raw}`: {error}"));
+            None
+        }
+    }
+}
+
+fn value_as_felt(raw: &Value, field: &str, warnings: &mut Vec<String>) -> Option<StarknetFelt> {
+    match raw {
+        Value::String(value) => match StarknetFelt::from_str(value) {
+            Ok(felt) => Some(felt),
+            Err(error) => {
+                warnings.push(format!("invalid {field} `{value}`: {error}"));
+                None
+            }
+        },
+        Value::Number(number) => {
+            if let Some(value) = number.as_u64() {
+                Some(StarknetFelt::from(value))
+            } else {
+                warnings.push(format!("non-u64 numeric {field} is unsupported: {number}"));
+                None
+            }
+        }
+        other => {
+            warnings.push(format!("unsupported {field} type: {other}"));
+            None
+        }
+    }
+}
+
+fn help_text() -> String {
+    "usage: demo-dashboard [--mode demo|real] [--rpc-url <url>] [--bind <addr>] [--refresh-ms <ms>]
+environment:
+  PASTIS_DASHBOARD_MODE=demo|real
+  STARKNET_RPC_URL=https://...
+  PASTIS_DASHBOARD_BIND=127.0.0.1:8080
+  PASTIS_DASHBOARD_REFRESH_MS=2000
+  PASTIS_MONITOR_STRKBTC_SHIELDED_POOL=0x...
+  PASTIS_MONITOR_WBTC_CONTRACT=0x..."
+        .to_string()
+}
+
+fn value_as_u64(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(raw) => {
+            if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+                u64::from_str_radix(hex, 16).ok()
+            } else {
+                raw.parse::<u64>().ok()
+            }
+        }
+        _ => None,
+    }
+}
+
+fn saturating_u128_to_u64(value: u128) -> u64 {
+    value.try_into().unwrap_or(u64::MAX)
+}
+
+fn push_recent_error(errors: &mut VecDeque<String>, message: String) {
+    if errors.len() >= MAX_RECENT_ERRORS {
+        let _ = errors.pop_front();
+    }
+    errors.push_back(message);
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+const INDEX_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Pastis Live Dashboard</title>
+  <style>
+    :root {
+      --bg: #f8f7f2;
+      --panel: #ffffff;
+      --ink: #0f172a;
+      --muted: #64748b;
+      --accent: #0f766e;
+      --warn: #b45309;
+      --danger: #b91c1c;
+      --border: #d6d3d1;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --sans: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
+    }
+    body {
+      margin: 0;
+      color: var(--ink);
+      font-family: var(--sans);
+      background:
+        radial-gradient(800px 320px at 5% 0%, #d9f99d 0%, transparent 60%),
+        radial-gradient(900px 380px at 100% 0%, #bfdbfe 0%, transparent 64%),
+        var(--bg);
+    }
+    .wrap {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    .hero {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 18px;
+    }
+    .title {
+      margin: 0;
+      font-size: 34px;
+      letter-spacing: 0.2px;
+    }
+    .subtitle {
+      margin: 8px 0 0 0;
+      color: var(--muted);
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--border);
+      background: #fff;
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px 14px;
+      box-shadow: 0 4px 10px rgba(15, 23, 42, 0.05);
+    }
+    .card h3 {
+      margin: 0 0 7px 0;
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .value {
+      font-size: 25px;
+      line-height: 1.2;
+      font-weight: 650;
+    }
+    .mono {
+      font-family: var(--mono);
+      font-size: 14px;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+    .ok { color: var(--accent); }
+    .warn { color: var(--warn); }
+    .danger { color: var(--danger); }
+    .stack {
+      display: grid;
+      gap: 12px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+    }
+    .panel h2 {
+      margin: 0 0 10px 0;
+      font-size: 18px;
+    }
+    .spark {
+      font-family: var(--mono);
+      font-size: 18px;
+      letter-spacing: 1px;
+      color: #334155;
+      margin-bottom: 8px;
+    }
+    .list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: grid;
+      gap: 8px;
+      max-height: 360px;
+      overflow: auto;
+    }
+    .item {
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-family: var(--mono);
+      font-size: 12px;
+      background: #fafafa;
+      word-break: break-word;
+    }
+    .meta {
+      margin-top: 12px;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--muted);
+    }
+    @media (max-width: 700px) {
+      .hero {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+      .title { font-size: 28px; }
+      .value { font-size: 21px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero">
+      <div>
+        <h1 class="title">Pastis Boss Dashboard</h1>
+        <p class="subtitle">Live Starknet visibility with mode-aware data source and anomaly stream.</p>
+      </div>
+      <div class="badge">Mode: <strong id="modeBadge">-</strong></div>
+    </div>
+
+    <div class="grid">
+      <div class="card"><h3>Latest Block</h3><div class="value" id="latestBlock">-</div></div>
+      <div class="card"><h3>Block Tx Count</h3><div class="value" id="txCount">-</div></div>
+      <div class="card"><h3>RPC Latency (ms)</h3><div class="value" id="rpcLatency">-</div></div>
+      <div class="card"><h3>Chain ID</h3><div class="value mono" id="chainId">-</div></div>
+      <div class="card"><h3>State Root</h3><div class="value mono" id="stateRoot">-</div></div>
+      <div class="card"><h3>MCP Roundtrip</h3><div class="value" id="mcpStatus">-</div></div>
+      <div class="card"><h3>Anomaly Source</h3><div class="value mono" id="anomalySource">-</div></div>
+      <div class="card"><h3>Recent Anomalies</h3><div class="value warn" id="anomalyCount">-</div></div>
+      <div class="card"><h3>Data Age (s)</h3><div class="value" id="dataAge">-</div></div>
+      <div class="card"><h3>Failures</h3><div class="value" id="failureCount">-</div></div>
+    </div>
+
+    <div class="stack">
+      <section class="panel">
+        <h2>Block Progression Sparkline</h2>
+        <div class="spark" id="blockSpark">-</div>
+      </section>
+
+      <section class="panel">
+        <h2>Recent Anomalies</h2>
+        <ul class="list" id="anomalyList"></ul>
+        <div class="meta" id="meta"></div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    const blockHistory = [];
+    const sparkChars = ['.', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+    function toSeverityClass(text) {
+      const lower = text.toLowerCase();
+      if (lower.includes('critical') || lower.includes('reuse') || lower.includes('divergence')) return 'danger';
+      if (lower.includes('flood') || lower.includes('timeout') || lower.includes('cluster')) return 'warn';
+      return '';
+    }
+
+    function renderSparkline() {
+      if (blockHistory.length < 2) {
+        document.getElementById('blockSpark').textContent = '-';
+        return;
+      }
+      const deltas = [];
+      for (let i = 1; i < blockHistory.length; i += 1) {
+        deltas.push(Math.max(0, blockHistory[i] - blockHistory[i - 1]));
+      }
+      const maxDelta = Math.max(...deltas, 1);
+      const line = deltas.map((delta) => {
+        const ratio = delta / maxDelta;
+        const idx = Math.max(0, Math.min(sparkChars.length - 1, Math.round(ratio * (sparkChars.length - 1))));
+        return sparkChars[idx];
+      }).join('');
+      document.getElementById('blockSpark').textContent = line || '-';
+    }
+
+    async function load() {
+      const started = performance.now();
+      const [statusRes, anomaliesRes, debugRes] = await Promise.all([
+        fetch('/api/status'),
+        fetch('/api/anomalies'),
+        fetch('/api/debug'),
+      ]);
+      if (!statusRes.ok || !anomaliesRes.ok || !debugRes.ok) {
+        document.getElementById('meta').textContent = 'Failed to load dashboard data';
+        return;
+      }
+
+      const status = await statusRes.json();
+      const anomalies = await anomaliesRes.json();
+      const debug = await debugRes.json();
+
+      blockHistory.push(status.latest_block);
+      if (blockHistory.length > 24) {
+        blockHistory.shift();
+      }
+      renderSparkline();
+
+      document.getElementById('modeBadge').textContent = String(status.mode || '-').toUpperCase();
+      document.getElementById('modeBadge').className = status.mode === 'real' ? 'ok' : 'warn';
+      document.getElementById('latestBlock').textContent = status.latest_block;
+      document.getElementById('txCount').textContent = status.tx_count;
+      document.getElementById('rpcLatency').textContent = status.rpc_latency_ms;
+      document.getElementById('chainId').textContent = status.chain_id;
+      document.getElementById('stateRoot').textContent = status.state_root;
+      document.getElementById('anomalySource').textContent = status.anomaly_source;
+      document.getElementById('anomalyCount').textContent = status.recent_anomaly_count;
+      document.getElementById('dataAge').textContent =
+        status.data_age_seconds === null ? 'n/a' : String(status.data_age_seconds);
+      document.getElementById('failureCount').textContent =
+        `${status.failure_count} (${status.consecutive_failures}c)`;
+
+      const mcp = document.getElementById('mcpStatus');
+      if (status.mcp_roundtrip_ok) {
+        mcp.textContent = 'OK';
+        mcp.className = 'value ok';
+      } else {
+        mcp.textContent = status.mode === 'real' ? 'N/A' : 'FAIL';
+        mcp.className = 'value ' + (status.mode === 'real' ? 'warn' : 'danger');
+      }
+
+      const list = document.getElementById('anomalyList');
+      list.innerHTML = '';
+      if (!anomalies.anomalies.length) {
+        const li = document.createElement('li');
+        li.className = 'item';
+        li.textContent = 'No anomalies currently.';
+        list.appendChild(li);
+      } else {
+        for (const item of anomalies.anomalies) {
+          const li = document.createElement('li');
+          li.className = 'item ' + toSeverityClass(item);
+          li.textContent = item;
+          list.appendChild(li);
+        }
+      }
+
+      const fetchMs = Math.round(performance.now() - started);
+      const lastError = debug.last_error ? ` | last_error=${debug.last_error}` : '';
+      document.getElementById('meta').textContent =
+        `Refreshed in ${fetchMs}ms | API refresh=${status.refresh_ms}ms | anomaly source=${anomalies.source}${lastError}`;
+    }
+
+    load();
+    setInterval(load, 2000);
+  </script>
+</body>
+</html>
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_dashboard_config_requires_rpc_in_real_mode() {
+        let err = parse_dashboard_config_from(
+            vec!["--mode".to_string(), "real".to_string()],
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("real mode without rpc must fail");
+        assert!(err.contains("real mode requires --rpc-url"));
+    }
+
+    #[test]
+    fn parse_dashboard_config_allows_real_mode_with_env_rpc() {
+        let config = parse_dashboard_config_from(
+            vec!["--mode".to_string(), "real".to_string()],
+            None,
+            None,
+            None,
+            Some("https://rpc.example".to_string()),
+        )
+        .expect("config should parse");
+        assert_eq!(config.mode, DashboardModeKind::Real);
+        assert_eq!(config.rpc_url.as_deref(), Some("https://rpc.example"));
+    }
+
+    #[test]
+    fn parse_dashboard_config_cli_overrides_env() {
+        let config = parse_dashboard_config_from(
+            vec![
+                "--mode".to_string(),
+                "real".to_string(),
+                "--bind".to_string(),
+                "0.0.0.0:9999".to_string(),
+                "--refresh-ms".to_string(),
+                "1500".to_string(),
+                "--rpc-url".to_string(),
+                "https://cli.rpc".to_string(),
+            ],
+            Some("demo".to_string()),
+            Some("127.0.0.1:8080".to_string()),
+            Some("2000".to_string()),
+            Some("https://env.rpc".to_string()),
+        )
+        .expect("config should parse");
+
+        assert_eq!(config.mode, DashboardModeKind::Real);
+        assert_eq!(config.bind_addr, "0.0.0.0:9999");
+        assert_eq!(config.refresh_ms, 1500);
+        assert_eq!(config.rpc_url.as_deref(), Some("https://cli.rpc"));
+    }
+
+    #[test]
+    fn value_as_u64_parses_decimal_and_hex() {
+        assert_eq!(value_as_u64(&Value::String("42".to_string())), Some(42));
+        assert_eq!(value_as_u64(&Value::String("0x2a".to_string())), Some(42));
+        assert_eq!(value_as_u64(&Value::String("0X2A".to_string())), Some(42));
+        assert_eq!(
+            value_as_u64(&Value::Number(serde_json::Number::from(7))),
+            Some(7)
+        );
+        assert_eq!(
+            value_as_u64(&Value::String("not-a-number".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn push_recent_error_caps_history() {
+        let mut errors = VecDeque::new();
+        for idx in 0..(MAX_RECENT_ERRORS + 4) {
+            push_recent_error(&mut errors, format!("error-{idx}"));
+        }
+
+        assert_eq!(errors.len(), MAX_RECENT_ERRORS);
+        assert_eq!(errors.front().map(String::as_str), Some("error-4"));
+        assert_eq!(errors.back().map(String::as_str), Some("error-19"));
+    }
+
+    #[test]
+    fn state_update_to_diff_parses_array_shape() {
+        let update = json!({
+            "state_diff": {
+                "storage_diffs": [{
+                    "address": "0x111",
+                    "storage_entries": [
+                        {"key": "0x1", "value": "0x2"},
+                        {"key": "0x2", "value": "0x3"}
+                    ]
+                }],
+                "nonces": [{
+                    "contract_address": "0x111",
+                    "nonce": "0x9"
+                }],
+                "declared_classes": [{"class_hash": "0xabc"}],
+                "deprecated_declared_classes": ["0xdef"]
+            }
+        });
+
+        let (diff, warnings) = state_update_to_diff(&update).expect("diff should parse");
+        assert!(warnings.is_empty());
+        assert_eq!(
+            diff.storage_diffs
+                .get(&ContractAddress::from("0x111"))
+                .and_then(|writes| writes.get("0x1"))
+                .copied(),
+            Some(StarknetFelt::from(2_u64))
+        );
+        assert_eq!(
+            diff.nonces.get(&ContractAddress::from("0x111")).copied(),
+            Some(StarknetFelt::from(9_u64))
+        );
+        assert_eq!(diff.declared_classes.len(), 2);
+    }
+
+    #[test]
+    fn state_update_to_diff_parses_object_shape_with_warnings() {
+        let update = json!({
+            "state_diff": {
+                "storage_diffs": {
+                    "0x222": {
+                        "0x10": "0x20",
+                        "bad-key": "0x30"
+                    }
+                },
+                "nonces": {
+                    "0x222": "0x5"
+                },
+                "declared_classes": ["0x123", {"class_hash": "bad-hash"}]
+            }
+        });
+
+        let (diff, warnings) = state_update_to_diff(&update).expect("diff should parse");
+        assert!(!warnings.is_empty());
+        assert_eq!(
+            diff.storage_diffs
+                .get(&ContractAddress::from("0x222"))
+                .and_then(|writes| writes.get("0x10"))
+                .copied(),
+            Some(StarknetFelt::from(0x20_u64))
+        );
+        assert_eq!(
+            diff.nonces.get(&ContractAddress::from("0x222")).copied(),
+            Some(StarknetFelt::from(5_u64))
+        );
+    }
+
+    #[test]
+    fn ingest_block_from_snapshot_builds_valid_block() {
+        let block = ingest_block_from_snapshot(3, 7_000_123, "0x123", 11);
+        assert_eq!(block.number, 3);
+        assert_eq!(block.parent_hash, format!("0x{:x}", 7_000_122_u64));
+        assert_eq!(block.state_root, "0x123");
+        block.validate().expect("ingested block must be valid");
+
+        let invalid_root = ingest_block_from_snapshot(4, 7_000_124, "bad-root", 12);
+        assert_eq!(invalid_root.state_root, "0x0");
+        invalid_root
+            .validate()
+            .expect("fallback state root keeps block valid");
+    }
+}

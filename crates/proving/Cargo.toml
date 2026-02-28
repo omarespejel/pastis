@@ -1,0 +1,8 @@
+[package]
+name = "starknet-node-proving"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+starknet-node-execution = { path = "../execution" }
+thiserror = { workspace = true }

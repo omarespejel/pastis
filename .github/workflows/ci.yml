@@ -1,0 +1,47 @@
+name: Rust CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+      - codex/**
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5
+
+      - name: Verify storage adapter dependencies
+        run: ./scripts/check-storage-adapter-deps.sh
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Workspace tests
+        run: cargo test --workspace
+
+      - name: Apollo adapter tests
+        run: cargo test -p starknet-node-storage --features apollo-adapter
+
+      - name: Blockifier adapter tests
+        run: cargo test -p starknet-node-execution --features blockifier-adapter
+
+      - name: Production adapter wiring build
+        run: cargo test -p starknet-node --features production-adapters
+
+      - name: Performance budget check
+        run: ./scripts/perf-budget-check.sh

@@ -1,0 +1,22 @@
+[package]
+name = "starknet-node-storage"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+apollo-adapter = ["dep:apollo_storage", "dep:starknet_api"]
+
+[dependencies]
+semver = { workspace = true }
+starknet-node-types = { path = "../types" }
+thiserror = { workspace = true }
+
+# Keep adapter crates pinned to sequencer monorepo to avoid archived/frozen storage sources.
+apollo_storage = { git = "https://github.com/starkware-libs/sequencer", rev = "69b4c8d378580a1aec345f23dadd4766e036fe3b", package = "apollo_storage", optional = true }
+starknet_api = { git = "https://github.com/starkware-libs/sequencer", rev = "69b4c8d378580a1aec345f23dadd4766e036fe3b", package = "starknet_api", optional = true }
+
+[dev-dependencies]
+serde = { workspace = true }
+serde_json = "1.0"
+tempfile = "3.10"

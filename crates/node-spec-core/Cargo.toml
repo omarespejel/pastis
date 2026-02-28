@@ -1,0 +1,14 @@
+[package]
+name = "node-spec-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+argon2 = "0.5"
+bincode = { workspace = true }
+pbkdf2 = "0.12"
+rand = "0.8"
+semver = { workspace = true }
+serde = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }
