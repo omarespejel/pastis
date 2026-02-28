@@ -38,6 +38,8 @@ use tokio::time::interval;
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
 const DEFAULT_REFRESH_MS: u64 = 2_000;
+const DEFAULT_REPLAY_WINDOW: u64 = 64;
+const DEFAULT_MAX_REPLAY_PER_POLL: u64 = 16;
 const DEMO_API_KEY: &str = "boss-demo-key";
 const MAX_RECENT_ERRORS: usize = 16;
 const MAX_RECENT_ANOMALIES: usize = 512;
@@ -80,6 +82,8 @@ struct DashboardConfig {
     bind_addr: String,
     refresh_ms: u64,
     rpc_url: Option<String>,
+    replay_window: u64,
+    max_replay_per_poll: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -164,13 +168,7 @@ struct DemoRuntime {
 
 impl DemoRuntime {
     fn new() -> Self {
-        let storage = InMemoryStorage::new(InMemoryState::default());
-        let node = StarknetNodeBuilder::new(NodeConfig::default())
-            .with_storage(storage)
-            .with_execution(build_dashboard_execution_backend())
-            .with_rpc(true)
-            .with_mcp(true)
-            .build();
+        let node = build_dashboard_node();
 
         let wrapper = StandardWrapperMonitor::new(StandardWrapperConfig {
             wrapper: StandardWrapper::Wbtc,
@@ -375,6 +373,16 @@ impl DemoRuntime {
     }
 }
 
+fn build_dashboard_node() -> StarknetNode<InMemoryStorage, DualExecutionBackend> {
+    let storage = InMemoryStorage::new(InMemoryState::default());
+    StarknetNodeBuilder::new(NodeConfig::default())
+        .with_storage(storage)
+        .with_execution(build_dashboard_execution_backend())
+        .with_rpc(true)
+        .with_mcp(true)
+        .build()
+}
+
 #[derive(Clone)]
 struct RealRpcClient {
     http: reqwest::Client,
@@ -394,6 +402,7 @@ struct RealSnapshot {
 #[derive(Debug, Clone)]
 struct RealBlockReplay {
     external_block_number: u64,
+    block_hash: String,
     parent_hash: String,
     sequencer_address: String,
     timestamp: u64,
@@ -406,6 +415,67 @@ struct RealFetch {
     replay: RealBlockReplay,
     state_diff: StarknetStateDiff,
     parse_warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ReplayCursor {
+    next_external_block: Option<u64>,
+    expected_parent_hash: Option<String>,
+    replay_window: u64,
+    max_replay_per_poll: u64,
+}
+
+impl ReplayCursor {
+    fn new(replay_window: u64, max_replay_per_poll: u64) -> Self {
+        Self {
+            next_external_block: None,
+            expected_parent_hash: None,
+            replay_window: replay_window.max(1),
+            max_replay_per_poll: max_replay_per_poll.max(1),
+        }
+    }
+
+    fn plan(&mut self, external_head_block: u64) -> Vec<u64> {
+        if self.next_external_block.is_none() {
+            let start = external_head_block.saturating_sub(self.replay_window.saturating_sub(1));
+            self.next_external_block = Some(start);
+        }
+        let Some(start) = self.next_external_block else {
+            return Vec::new();
+        };
+        if start > external_head_block {
+            return Vec::new();
+        }
+        let end = start
+            .saturating_add(self.max_replay_per_poll.saturating_sub(1))
+            .min(external_head_block);
+        (start..=end).collect()
+    }
+
+    fn parent_hash_matches(&self, observed_parent_hash: &str) -> bool {
+        match &self.expected_parent_hash {
+            Some(expected) => expected == observed_parent_hash,
+            None => true,
+        }
+    }
+
+    fn mark_processed(&mut self, external_block_number: u64, block_hash: &str) {
+        self.next_external_block = Some(external_block_number.saturating_add(1));
+        self.expected_parent_hash = Some(block_hash.to_string());
+    }
+
+    fn reset_for_reorg(&mut self, conflicting_external_block: u64) {
+        let start = conflicting_external_block.saturating_sub(self.replay_window.saturating_sub(1));
+        self.next_external_block = Some(start);
+        self.expected_parent_hash = None;
+    }
+
+    fn replay_lag_blocks(&self, external_head_block: u64) -> u64 {
+        match self.next_external_block {
+            Some(next) if next <= external_head_block => external_head_block - next + 1,
+            _ => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -421,6 +491,10 @@ struct RuntimeDiagnostics {
     last_failure_unix_seconds: Option<u64>,
     last_processed_block: Option<u64>,
     last_local_block: Option<u64>,
+    external_head_block: Option<u64>,
+    last_external_replayed_block: Option<u64>,
+    replay_lag_blocks: Option<u64>,
+    reorg_events: u64,
     last_error: Option<String>,
     last_replay_error: Option<String>,
     recent_errors: Vec<String>,
@@ -445,6 +519,10 @@ impl RuntimeDiagnostics {
             last_failure_unix_seconds: None,
             last_processed_block: None,
             last_local_block: None,
+            external_head_block: None,
+            last_external_replayed_block: None,
+            replay_lag_blocks: None,
+            reorg_events: 0,
             last_error: None,
             last_replay_error: None,
             recent_errors: Vec::new(),
@@ -461,6 +539,7 @@ struct RealRuntimeState {
     node: StarknetNode<InMemoryStorage, DualExecutionBackend>,
     execution_state: InMemoryState,
     snapshot: Option<RealSnapshot>,
+    replay_cursor: ReplayCursor,
     diagnostics: RuntimeDiagnostics,
     recent_errors: VecDeque<String>,
     next_local_block: u64,
@@ -474,14 +553,12 @@ struct RealRuntime {
 }
 
 impl RealRuntime {
-    fn new(client: RealRpcClient, btcfi_config: Option<RealBtcfiConfig>) -> Self {
-        let storage = InMemoryStorage::new(InMemoryState::default());
-        let node = StarknetNodeBuilder::new(NodeConfig::default())
-            .with_storage(storage)
-            .with_execution(build_dashboard_execution_backend())
-            .with_rpc(true)
-            .with_mcp(true)
-            .build();
+    fn new(
+        client: RealRpcClient,
+        btcfi_config: Option<RealBtcfiConfig>,
+        replay_window: u64,
+        max_replay_per_poll: u64,
+    ) -> Self {
         let btcfi = btcfi_config.map(|cfg| {
             let wrappers = cfg
                 .wrappers
@@ -500,9 +577,10 @@ impl RealRuntime {
             client: Arc::new(client),
             btcfi,
             state: Arc::new(Mutex::new(RealRuntimeState {
-                node,
+                node: build_dashboard_node(),
                 execution_state: InMemoryState::default(),
                 snapshot: None,
+                replay_cursor: ReplayCursor::new(replay_window, max_replay_per_poll),
                 diagnostics,
                 recent_errors: VecDeque::new(),
                 next_local_block: 1,
@@ -511,154 +589,184 @@ impl RealRuntime {
     }
 
     async fn poll_once(&self) -> Result<RealSnapshot, String> {
-        match self.client.fetch_status().await {
-            Ok(fetch) => {
-                let mut guard = self
-                    .state
-                    .lock()
-                    .map_err(|_| "real runtime lock poisoned".to_string())?;
-                guard.snapshot = Some(fetch.snapshot.clone());
-                for warning in &fetch.parse_warnings {
-                    push_recent_error(&mut guard.recent_errors, format!("warning: {warning}"));
-                }
-
-                let should_process = guard
-                    .diagnostics
-                    .last_processed_block
-                    .map(|last| fetch.snapshot.latest_block > last)
-                    .unwrap_or(true);
-
-                if should_process {
-                    let local_block = ingest_block_from_fetch(guard.next_local_block, &fetch)
-                        .map_err(|error| {
-                            let message = format!(
-                                "failed to build replay block {}: {error}",
-                                guard.next_local_block
-                            );
-                            guard.diagnostics.failure_count =
-                                guard.diagnostics.failure_count.saturating_add(1);
-                            guard.diagnostics.replay_failures =
-                                guard.diagnostics.replay_failures.saturating_add(1);
-                            guard.diagnostics.consecutive_failures =
-                                guard.diagnostics.consecutive_failures.saturating_add(1);
-                            guard.diagnostics.last_failure_unix_seconds = Some(unix_now());
-                            guard.diagnostics.last_error = Some(message.clone());
-                            guard.diagnostics.last_replay_error = Some(message.clone());
-                            push_recent_error(&mut guard.recent_errors, message.clone());
-                            guard.diagnostics.recent_errors =
-                                guard.recent_errors.iter().cloned().collect();
-                            message
-                        })?;
-                    let mut execution_state = std::mem::take(&mut guard.execution_state);
-                    let execution_result = guard
-                        .node
-                        .execution
-                        .execute_block(&local_block, &mut execution_state);
-                    guard.execution_state = execution_state;
-                    if let Err(error) = execution_result {
-                        let message = format!(
-                            "failed to execute local ingest block {}: {error}",
-                            guard.next_local_block
-                        );
-                        guard.diagnostics.failure_count =
-                            guard.diagnostics.failure_count.saturating_add(1);
-                        guard.diagnostics.execution_failure_count =
-                            guard.diagnostics.execution_failure_count.saturating_add(1);
-                        guard.diagnostics.replay_failures =
-                            guard.diagnostics.replay_failures.saturating_add(1);
-                        guard.diagnostics.consecutive_failures =
-                            guard.diagnostics.consecutive_failures.saturating_add(1);
-                        guard.diagnostics.last_failure_unix_seconds = Some(unix_now());
-                        guard.diagnostics.last_error = Some(message.clone());
-                        guard.diagnostics.last_replay_error = Some(message.clone());
-                        push_recent_error(&mut guard.recent_errors, message.clone());
-                        guard.diagnostics.recent_errors =
-                            guard.recent_errors.iter().cloned().collect();
-                        return Err(message);
-                    }
-                    guard.diagnostics.replayed_tx_count = guard
-                        .diagnostics
-                        .replayed_tx_count
-                        .saturating_add(local_block.transactions.len() as u64);
-                    guard.diagnostics.last_replay_error = None;
-                    if let Err(error) = guard
-                        .node
-                        .storage
-                        .insert_block(local_block, fetch.state_diff.clone())
-                    {
-                        let message = format!(
-                            "failed to commit local ingest block {}: {error}",
-                            guard.next_local_block
-                        );
-                        guard.diagnostics.failure_count =
-                            guard.diagnostics.failure_count.saturating_add(1);
-                        guard.diagnostics.commit_failure_count =
-                            guard.diagnostics.commit_failure_count.saturating_add(1);
-                        guard.diagnostics.consecutive_failures =
-                            guard.diagnostics.consecutive_failures.saturating_add(1);
-                        guard.diagnostics.last_failure_unix_seconds = Some(unix_now());
-                        guard.diagnostics.last_error = Some(message.clone());
-                        push_recent_error(&mut guard.recent_errors, message.clone());
-                        guard.diagnostics.recent_errors =
-                            guard.recent_errors.iter().cloned().collect();
-                        return Err(message);
-                    }
-                    guard.diagnostics.last_local_block = Some(guard.next_local_block);
-                    guard.next_local_block = guard.next_local_block.saturating_add(1);
-                    guard.diagnostics.last_processed_block = Some(fetch.snapshot.latest_block);
-                }
-                match guard.node.execution.metrics() {
-                    Ok(metrics) => {
-                        guard.diagnostics.dual_mismatches = metrics.mismatches;
-                        guard.diagnostics.dual_fast_executions = metrics.fast_executions;
-                        guard.diagnostics.dual_canonical_executions = metrics.canonical_executions;
-                    }
-                    Err(error) => push_recent_error(
-                        &mut guard.recent_errors,
-                        format!("warning: failed to read dual execution metrics: {error}"),
-                    ),
-                }
-
-                if let Some(btcfi) = &self.btcfi {
-                    match btcfi.lock() {
-                        Ok(mut monitor) => {
-                            if should_process {
-                                let _ = monitor
-                                    .process_block(fetch.snapshot.latest_block, &fetch.state_diff);
-                            }
-                            guard.diagnostics.retained_anomaly_count =
-                                monitor.recent_anomalies(MAX_RECENT_ANOMALIES).len();
-                        }
-                        Err(_) => {
-                            let message = "btcfi monitor lock poisoned".to_string();
-                            guard.diagnostics.last_error = Some(message.clone());
-                            push_recent_error(&mut guard.recent_errors, message);
-                        }
-                    }
-                }
-
-                guard.diagnostics.success_count = guard.diagnostics.success_count.saturating_add(1);
-                guard.diagnostics.consecutive_failures = 0;
-                guard.diagnostics.last_success_unix_seconds = Some(unix_now());
-                guard.diagnostics.last_error = None;
-                guard.diagnostics.recent_errors = guard.recent_errors.iter().cloned().collect();
-                Ok(fetch.snapshot)
-            }
+        let external_head_block = match self.client.fetch_latest_block_number().await {
+            Ok(number) => number,
             Err(error) => {
                 let mut guard = self
                     .state
                     .lock()
                     .map_err(|_| "real runtime lock poisoned".to_string())?;
-                guard.diagnostics.failure_count = guard.diagnostics.failure_count.saturating_add(1);
-                guard.diagnostics.consecutive_failures =
-                    guard.diagnostics.consecutive_failures.saturating_add(1);
-                guard.diagnostics.last_failure_unix_seconds = Some(unix_now());
-                guard.diagnostics.last_error = Some(error.clone());
-                push_recent_error(&mut guard.recent_errors, error.clone());
-                guard.diagnostics.recent_errors = guard.recent_errors.iter().cloned().collect();
-                Err(error)
+                record_real_runtime_failure(&mut guard, error.clone());
+                return Err(error);
             }
+        };
+
+        let replay_plan = {
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|_| "real runtime lock poisoned".to_string())?;
+            guard.diagnostics.external_head_block = Some(external_head_block);
+            let plan = guard.replay_cursor.plan(external_head_block);
+            guard.diagnostics.replay_lag_blocks =
+                Some(guard.replay_cursor.replay_lag_blocks(external_head_block));
+            plan
+        };
+
+        for external_block in replay_plan {
+            let fetch = match self.client.fetch_block(external_block).await {
+                Ok(fetch) => fetch,
+                Err(error) => {
+                    let mut guard = self
+                        .state
+                        .lock()
+                        .map_err(|_| "real runtime lock poisoned".to_string())?;
+                    let message =
+                        format!("failed to fetch external block {external_block}: {error}");
+                    record_real_runtime_failure(&mut guard, message.clone());
+                    return Err(message);
+                }
+            };
+
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|_| "real runtime lock poisoned".to_string())?;
+            guard.snapshot = Some(fetch.snapshot.clone());
+            for warning in &fetch.parse_warnings {
+                push_recent_error(&mut guard.recent_errors, format!("warning: {warning}"));
+            }
+
+            if !guard
+                .replay_cursor
+                .parent_hash_matches(&fetch.replay.parent_hash)
+            {
+                let message = format!(
+                    "reorg detected at external block {external_block}: parent {} did not match expected parent",
+                    fetch.replay.parent_hash
+                );
+                guard.diagnostics.reorg_events = guard.diagnostics.reorg_events.saturating_add(1);
+                guard.diagnostics.replay_failures =
+                    guard.diagnostics.replay_failures.saturating_add(1);
+                guard.diagnostics.last_replay_error = Some(message.clone());
+                guard.diagnostics.last_error = Some(message.clone());
+                push_recent_error(&mut guard.recent_errors, message);
+                guard.node = build_dashboard_node();
+                guard.execution_state = InMemoryState::default();
+                guard.next_local_block = 1;
+                guard.diagnostics.last_local_block = None;
+                guard.diagnostics.last_external_replayed_block = None;
+                guard.replay_cursor.reset_for_reorg(external_block);
+                guard.diagnostics.replay_lag_blocks =
+                    Some(guard.replay_cursor.replay_lag_blocks(external_head_block));
+                guard.diagnostics.recent_errors = guard.recent_errors.iter().cloned().collect();
+                break;
+            }
+
+            let local_block =
+                ingest_block_from_fetch(guard.next_local_block, &fetch).map_err(|error| {
+                    let message = format!(
+                        "failed to build replay block local={} external={external_block}: {error}",
+                        guard.next_local_block
+                    );
+                    guard.diagnostics.replay_failures =
+                        guard.diagnostics.replay_failures.saturating_add(1);
+                    guard.diagnostics.last_replay_error = Some(message.clone());
+                    record_real_runtime_failure(&mut guard, message.clone());
+                    message
+                })?;
+
+            let mut execution_state = std::mem::take(&mut guard.execution_state);
+            let execution_result = guard
+                .node
+                .execution
+                .execute_block(&local_block, &mut execution_state);
+            guard.execution_state = execution_state;
+            if let Err(error) = execution_result {
+                let message = format!(
+                    "failed to execute local replay block local={} external={external_block}: {error}",
+                    guard.next_local_block
+                );
+                guard.diagnostics.execution_failure_count =
+                    guard.diagnostics.execution_failure_count.saturating_add(1);
+                guard.diagnostics.replay_failures =
+                    guard.diagnostics.replay_failures.saturating_add(1);
+                guard.diagnostics.last_replay_error = Some(message.clone());
+                record_real_runtime_failure(&mut guard, message.clone());
+                return Err(message);
+            }
+
+            guard.diagnostics.replayed_tx_count = guard
+                .diagnostics
+                .replayed_tx_count
+                .saturating_add(local_block.transactions.len() as u64);
+            guard.diagnostics.last_replay_error = None;
+            if let Err(error) = guard
+                .node
+                .storage
+                .insert_block(local_block, fetch.state_diff.clone())
+            {
+                let message = format!(
+                    "failed to commit local replay block local={} external={external_block}: {error}",
+                    guard.next_local_block
+                );
+                guard.diagnostics.commit_failure_count =
+                    guard.diagnostics.commit_failure_count.saturating_add(1);
+                record_real_runtime_failure(&mut guard, message.clone());
+                return Err(message);
+            }
+
+            if let Some(btcfi) = &self.btcfi {
+                match btcfi.lock() {
+                    Ok(mut monitor) => {
+                        let _ = monitor.process_block(external_block, &fetch.state_diff);
+                        guard.diagnostics.retained_anomaly_count =
+                            monitor.recent_anomalies(MAX_RECENT_ANOMALIES).len();
+                    }
+                    Err(_) => {
+                        let message = "btcfi monitor lock poisoned".to_string();
+                        guard.diagnostics.last_error = Some(message.clone());
+                        push_recent_error(&mut guard.recent_errors, message);
+                    }
+                }
+            }
+
+            match guard.node.execution.metrics() {
+                Ok(metrics) => {
+                    guard.diagnostics.dual_mismatches = metrics.mismatches;
+                    guard.diagnostics.dual_fast_executions = metrics.fast_executions;
+                    guard.diagnostics.dual_canonical_executions = metrics.canonical_executions;
+                }
+                Err(error) => push_recent_error(
+                    &mut guard.recent_errors,
+                    format!("warning: failed to read dual execution metrics: {error}"),
+                ),
+            }
+
+            guard.diagnostics.last_local_block = Some(guard.next_local_block);
+            guard.next_local_block = guard.next_local_block.saturating_add(1);
+            guard.diagnostics.last_processed_block = Some(external_block);
+            guard.diagnostics.last_external_replayed_block = Some(external_block);
+            guard
+                .replay_cursor
+                .mark_processed(external_block, &fetch.replay.block_hash);
+            guard.diagnostics.replay_lag_blocks =
+                Some(guard.replay_cursor.replay_lag_blocks(external_head_block));
         }
+
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| "real runtime lock poisoned".to_string())?;
+        guard.diagnostics.success_count = guard.diagnostics.success_count.saturating_add(1);
+        guard.diagnostics.consecutive_failures = 0;
+        guard.diagnostics.last_success_unix_seconds = Some(unix_now());
+        guard.diagnostics.last_error = None;
+        guard.diagnostics.recent_errors = guard.recent_errors.iter().cloned().collect();
+        guard
+            .snapshot
+            .clone()
+            .ok_or_else(|| "real runtime has no snapshot after poll".to_string())
     }
 
     fn snapshot(&self) -> Result<Option<RealSnapshot>, String> {
@@ -794,31 +902,34 @@ impl RealRpcClient {
         Ok(Self { http, rpc_url })
     }
 
-    async fn fetch_status(&self) -> Result<RealFetch, String> {
-        let started = Instant::now();
-        let mut parse_warnings = Vec::new();
+    async fn fetch_latest_block_number(&self) -> Result<u64, String> {
+        let block_head = self.call("starknet_blockHashAndNumber", json!([])).await?;
+        value_as_u64(block_head.get("block_number").unwrap_or(&Value::Null)).ok_or_else(|| {
+            format!("starknet_blockHashAndNumber missing block_number: {block_head}")
+        })
+    }
 
+    async fn fetch_chain_id(&self) -> Result<String, String> {
         let chain_id_raw = self.call("starknet_chainId", json!([])).await?;
-        let chain_id = chain_id_raw
+        Ok(chain_id_raw
             .as_str()
             .map(std::string::ToString::to_string)
-            .unwrap_or_else(|| chain_id_raw.to_string());
+            .unwrap_or_else(|| chain_id_raw.to_string()))
+    }
 
-        let block_head = self.call("starknet_blockHashAndNumber", json!([])).await?;
-        let latest_block = value_as_u64(block_head.get("block_number").unwrap_or(&Value::Null))
-            .ok_or_else(|| {
-                format!("starknet_blockHashAndNumber missing block_number: {block_head}")
-            })?;
+    async fn fetch_block(&self, block_number: u64) -> Result<RealFetch, String> {
+        let started = Instant::now();
+        let mut parse_warnings = Vec::new();
+        let chain_id = self.fetch_chain_id().await?;
 
-        let block_selector = json!([{ "block_number": latest_block }]);
+        let block_selector = json!([{ "block_number": block_number }]);
         let block_with_txs = self
             .call("starknet_getBlockWithTxs", block_selector.clone())
             .await?;
         let replay = parse_block_with_txs(&block_with_txs, &mut parse_warnings)?;
-        if replay.external_block_number != latest_block {
+        if replay.external_block_number != block_number {
             parse_warnings.push(format!(
-                "block number mismatch between blockHashAndNumber ({latest_block}) and \
-                 getBlockWithTxs ({})",
+                "block number mismatch between request ({block_number}) and getBlockWithTxs ({})",
                 replay.external_block_number
             ));
         }
@@ -857,7 +968,7 @@ impl RealRpcClient {
         Ok(RealFetch {
             snapshot: RealSnapshot {
                 chain_id,
-                latest_block,
+                latest_block: block_number,
                 state_root,
                 tx_count: tx_count_from_replay,
                 rpc_latency_ms: saturating_u128_to_u64(started.elapsed().as_millis()),
@@ -910,6 +1021,10 @@ struct StatusPayload {
     mode: String,
     chain_id: String,
     latest_block: u64,
+    external_head_block: Option<u64>,
+    local_replayed_block: Option<u64>,
+    replay_lag_blocks: Option<u64>,
+    reorg_events: u64,
     state_root: String,
     tx_count: u64,
     rpc_latency_ms: u64,
@@ -947,6 +1062,10 @@ struct DebugPayload {
     last_failure_unix_seconds: Option<u64>,
     last_processed_block: Option<u64>,
     last_local_block: Option<u64>,
+    external_head_block: Option<u64>,
+    last_external_replayed_block: Option<u64>,
+    replay_lag_blocks: Option<u64>,
+    reorg_events: u64,
     anomaly_monitor_enabled: bool,
     retained_anomaly_count: usize,
     dual_mismatches: u64,
@@ -987,7 +1106,12 @@ async fn main() -> Result<(), String> {
                 "real mode requires --rpc-url <url> or STARKNET_RPC_URL".to_string()
             })?;
             let btcfi_config = parse_real_btcfi_config_from_env()?;
-            let runtime = Arc::new(RealRuntime::new(RealRpcClient::new(rpc_url)?, btcfi_config));
+            let runtime = Arc::new(RealRuntime::new(
+                RealRpcClient::new(rpc_url)?,
+                btcfi_config,
+                config.replay_window,
+                config.max_replay_per_poll,
+            ));
             let poll_runtime = Arc::clone(&runtime);
             tokio::spawn(async move {
                 let mut ticker = interval(Duration::from_millis(refresh_ms));
@@ -1100,6 +1224,10 @@ fn demo_status(
         mode: DashboardModeKind::Demo.as_str().to_string(),
         chain_id: guard.node.config.chain_id.as_str().to_string(),
         latest_block,
+        external_head_block: Some(latest_block),
+        local_replayed_block: Some(latest_block),
+        replay_lag_blocks: Some(0),
+        reorg_events: 0,
         state_root,
         tx_count: 1,
         rpc_latency_ms: saturating_u128_to_u64(started.elapsed().as_millis()),
@@ -1150,6 +1278,10 @@ fn demo_debug(runtime: &Arc<Mutex<DemoRuntime>>, refresh_ms: u64) -> Result<Debu
         last_failure_unix_seconds: None,
         last_processed_block: Some(guard.next_block.saturating_sub(1)),
         last_local_block: Some(guard.next_block.saturating_sub(1)),
+        external_head_block: Some(guard.next_block.saturating_sub(1)),
+        last_external_replayed_block: Some(guard.next_block.saturating_sub(1)),
+        replay_lag_blocks: Some(0),
+        reorg_events: 0,
         anomaly_monitor_enabled: true,
         retained_anomaly_count: guard
             .query_anomalies_via_mcp(MAX_RECENT_ANOMALIES as u64)?
@@ -1180,6 +1312,10 @@ async fn real_status(runtime: &Arc<RealRuntime>, refresh_ms: u64) -> Result<Stat
         mode: DashboardModeKind::Real.as_str().to_string(),
         chain_id: snapshot.chain_id,
         latest_block: snapshot.latest_block,
+        external_head_block: diagnostics.external_head_block,
+        local_replayed_block: diagnostics.last_local_block,
+        replay_lag_blocks: diagnostics.replay_lag_blocks,
+        reorg_events: diagnostics.reorg_events,
         state_root: snapshot.state_root,
         tx_count: snapshot.tx_count,
         rpc_latency_ms: snapshot.rpc_latency_ms,
@@ -1221,6 +1357,10 @@ fn real_debug(runtime: &Arc<RealRuntime>, refresh_ms: u64) -> Result<DebugPayloa
         last_failure_unix_seconds: diagnostics.last_failure_unix_seconds,
         last_processed_block: diagnostics.last_processed_block,
         last_local_block: diagnostics.last_local_block,
+        external_head_block: diagnostics.external_head_block,
+        last_external_replayed_block: diagnostics.last_external_replayed_block,
+        replay_lag_blocks: diagnostics.replay_lag_blocks,
+        reorg_events: diagnostics.reorg_events,
         anomaly_monitor_enabled: diagnostics.anomaly_monitor_enabled,
         retained_anomaly_count: diagnostics.retained_anomaly_count,
         dual_mismatches: diagnostics.dual_mismatches,
@@ -1330,6 +1470,8 @@ fn parse_dashboard_config() -> Result<DashboardConfig, String> {
         env::var("PASTIS_DASHBOARD_BIND").ok(),
         env::var("PASTIS_DASHBOARD_REFRESH_MS").ok(),
         env::var("STARKNET_RPC_URL").ok(),
+        env::var("PASTIS_DASHBOARD_REPLAY_WINDOW").ok(),
+        env::var("PASTIS_DASHBOARD_MAX_REPLAY_PER_POLL").ok(),
     )
 }
 
@@ -1339,6 +1481,8 @@ fn parse_dashboard_config_from(
     env_bind: Option<String>,
     env_refresh: Option<String>,
     env_rpc: Option<String>,
+    env_replay_window: Option<String>,
+    env_max_replay_per_poll: Option<String>,
 ) -> Result<DashboardConfig, String> {
     let mode = env_mode
         .as_deref()
@@ -1350,11 +1494,23 @@ fn parse_dashboard_config_from(
         .map(parse_refresh_ms)
         .transpose()?
         .unwrap_or(DEFAULT_REFRESH_MS);
+    let replay_window = env_replay_window
+        .as_deref()
+        .map(parse_positive_u64)
+        .transpose()?
+        .unwrap_or(DEFAULT_REPLAY_WINDOW);
+    let max_replay_per_poll = env_max_replay_per_poll
+        .as_deref()
+        .map(parse_positive_u64)
+        .transpose()?
+        .unwrap_or(DEFAULT_MAX_REPLAY_PER_POLL);
     let mut config = DashboardConfig {
         mode,
         bind_addr: env_bind.unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string()),
         refresh_ms,
         rpc_url: env_rpc,
+        replay_window,
+        max_replay_per_poll,
     };
 
     let mut args = args.into_iter();
@@ -1384,6 +1540,18 @@ fn parse_dashboard_config_from(
                     .ok_or_else(|| "--refresh-ms requires a value".to_string())?;
                 config.refresh_ms = parse_refresh_ms(&raw)?;
             }
+            "--replay-window" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--replay-window requires a value".to_string())?;
+                config.replay_window = parse_positive_u64(&raw)?;
+            }
+            "--max-replay-per-poll" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--max-replay-per-poll requires a value".to_string())?;
+                config.max_replay_per_poll = parse_positive_u64(&raw)?;
+            }
             "--help" | "-h" => {
                 return Err(help_text());
             }
@@ -1405,6 +1573,16 @@ fn parse_dashboard_config_from(
 fn parse_refresh_ms(raw: &str) -> Result<u64, String> {
     raw.parse::<u64>()
         .map_err(|error| format!("invalid refresh value `{raw}`: {error}"))
+}
+
+fn parse_positive_u64(raw: &str) -> Result<u64, String> {
+    let parsed = raw
+        .parse::<u64>()
+        .map_err(|error| format!("invalid positive integer `{raw}`: {error}"))?;
+    if parsed == 0 {
+        return Err(format!("value must be > 0, got `{raw}`"));
+    }
+    Ok(parsed)
 }
 
 fn parse_real_btcfi_config_from_env() -> Result<Option<RealBtcfiConfig>, String> {
@@ -1507,6 +1685,15 @@ fn parse_block_with_txs(
             .ok_or_else(|| format!("getBlockWithTxs missing block_number: {block_with_txs}"))?,
     )
     .ok_or_else(|| format!("invalid getBlockWithTxs block_number: {block_with_txs}"))?;
+    let block_hash_raw = block_with_txs
+        .get("block_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("getBlockWithTxs missing block_hash: {block_with_txs}"))?;
+    let block_hash = StarknetFelt::from_str(block_hash_raw)
+        .map(|felt| format!("{:#x}", felt))
+        .map_err(|error| {
+            format!("invalid getBlockWithTxs block_hash `{block_hash_raw}`: {error}")
+        })?;
     let parent_hash_raw = block_with_txs
         .get("parent_hash")
         .and_then(Value::as_str)
@@ -1563,6 +1750,7 @@ fn parse_block_with_txs(
     }
     Ok(RealBlockReplay {
         external_block_number,
+        block_hash,
         parent_hash,
         sequencer_address,
         timestamp,
@@ -1811,12 +1999,14 @@ fn value_as_felt(raw: &Value, field: &str, warnings: &mut Vec<String>) -> Option
 }
 
 fn help_text() -> String {
-    "usage: demo-dashboard [--mode demo|real] [--rpc-url <url>] [--bind <addr>] [--refresh-ms <ms>]
+    "usage: demo-dashboard [--mode demo|real] [--rpc-url <url>] [--bind <addr>] [--refresh-ms <ms>] [--replay-window <blocks>] [--max-replay-per-poll <blocks>]
 environment:
   PASTIS_DASHBOARD_MODE=demo|real
   STARKNET_RPC_URL=https://...
   PASTIS_DASHBOARD_BIND=127.0.0.1:8080
   PASTIS_DASHBOARD_REFRESH_MS=2000
+  PASTIS_DASHBOARD_REPLAY_WINDOW=64
+  PASTIS_DASHBOARD_MAX_REPLAY_PER_POLL=16
   PASTIS_MONITOR_STRKBTC_SHIELDED_POOL=0x...
   PASTIS_MONITOR_WBTC_CONTRACT=0x..."
         .to_string()
@@ -1845,6 +2035,16 @@ fn push_recent_error(errors: &mut VecDeque<String>, message: String) {
         let _ = errors.pop_front();
     }
     errors.push_back(message);
+}
+
+fn record_real_runtime_failure(state: &mut RealRuntimeState, message: String) {
+    state.diagnostics.failure_count = state.diagnostics.failure_count.saturating_add(1);
+    state.diagnostics.consecutive_failures =
+        state.diagnostics.consecutive_failures.saturating_add(1);
+    state.diagnostics.last_failure_unix_seconds = Some(unix_now());
+    state.diagnostics.last_error = Some(message.clone());
+    push_recent_error(&mut state.recent_errors, message);
+    state.diagnostics.recent_errors = state.recent_errors.iter().cloned().collect();
 }
 
 fn nonfatal_anomaly_query(
@@ -2041,6 +2241,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
     <div class="grid">
       <div class="card"><h3>Latest Block</h3><div class="value" id="latestBlock">-</div></div>
+      <div class="card"><h3>External Head</h3><div class="value" id="externalHead">-</div></div>
+      <div class="card"><h3>Local Replayed</h3><div class="value" id="localReplayed">-</div></div>
+      <div class="card"><h3>Replay Lag (blocks)</h3><div class="value" id="replayLag">-</div></div>
+      <div class="card"><h3>Reorg Events</h3><div class="value warn" id="reorgEvents">-</div></div>
       <div class="card"><h3>Block Tx Count</h3><div class="value" id="txCount">-</div></div>
       <div class="card"><h3>RPC Latency (ms)</h3><div class="value" id="rpcLatency">-</div></div>
       <div class="card"><h3>Chain ID</h3><div class="value mono" id="chainId">-</div></div>
@@ -2125,6 +2329,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
       document.getElementById('modeBadge').textContent = String(status.mode || '-').toUpperCase();
       document.getElementById('modeBadge').className = status.mode === 'real' ? 'ok' : 'warn';
       document.getElementById('latestBlock').textContent = status.latest_block;
+      document.getElementById('externalHead').textContent =
+        status.external_head_block === null ? 'n/a' : String(status.external_head_block);
+      document.getElementById('localReplayed').textContent =
+        status.local_replayed_block === null ? 'n/a' : String(status.local_replayed_block);
+      document.getElementById('replayLag').textContent =
+        status.replay_lag_blocks === null ? 'n/a' : String(status.replay_lag_blocks);
+      document.getElementById('reorgEvents').textContent = String(status.reorg_events || 0);
       document.getElementById('txCount').textContent = status.tx_count;
       document.getElementById('rpcLatency').textContent = status.rpc_latency_ms;
       document.getElementById('chainId').textContent = status.chain_id;
@@ -2197,6 +2408,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .expect_err("real mode without rpc must fail");
         assert!(err.contains("real mode requires --rpc-url"));
@@ -2210,6 +2423,8 @@ mod tests {
             None,
             None,
             Some("https://rpc.example".to_string()),
+            None,
+            None,
         )
         .expect("config should parse");
         assert_eq!(config.mode, DashboardModeKind::Real);
@@ -2228,11 +2443,17 @@ mod tests {
                 "1500".to_string(),
                 "--rpc-url".to_string(),
                 "https://cli.rpc".to_string(),
+                "--replay-window".to_string(),
+                "96".to_string(),
+                "--max-replay-per-poll".to_string(),
+                "12".to_string(),
             ],
             Some("demo".to_string()),
             Some("127.0.0.1:8080".to_string()),
             Some("2000".to_string()),
             Some("https://env.rpc".to_string()),
+            Some("72".to_string()),
+            Some("8".to_string()),
         )
         .expect("config should parse");
 
@@ -2240,6 +2461,28 @@ mod tests {
         assert_eq!(config.bind_addr, "0.0.0.0:9999");
         assert_eq!(config.refresh_ms, 1500);
         assert_eq!(config.rpc_url.as_deref(), Some("https://cli.rpc"));
+        assert_eq!(config.replay_window, 96);
+        assert_eq!(config.max_replay_per_poll, 12);
+    }
+
+    #[test]
+    fn replay_cursor_bootstraps_window_and_tracks_lag() {
+        let mut cursor = ReplayCursor::new(4, 3);
+        assert_eq!(cursor.plan(10), vec![7, 8, 9]);
+        cursor.mark_processed(7, "0xa");
+        assert_eq!(cursor.replay_lag_blocks(10), 3);
+        assert!(cursor.parent_hash_matches("0xa"));
+        assert!(!cursor.parent_hash_matches("0xb"));
+    }
+
+    #[test]
+    fn replay_cursor_reset_for_reorg_rewinds_window() {
+        let mut cursor = ReplayCursor::new(5, 2);
+        let _ = cursor.plan(20);
+        cursor.mark_processed(18, "0x18");
+        cursor.reset_for_reorg(19);
+        assert_eq!(cursor.plan(20), vec![15, 16]);
+        assert!(cursor.parent_hash_matches("anything"));
     }
 
     #[test]
@@ -2350,6 +2593,7 @@ mod tests {
             },
             replay: RealBlockReplay {
                 external_block_number: 7_000_123,
+                block_hash: "0x7000123".to_string(),
                 parent_hash: format!("0x{:x}", 7_000_122_u64),
                 sequencer_address: "0x1".to_string(),
                 timestamp: 1_700_000_000,
@@ -2375,6 +2619,7 @@ mod tests {
         let mut warnings = Vec::new();
         let block = json!({
             "block_number": 44,
+            "block_hash": "0x2c",
             "parent_hash": "0xabc",
             "sequencer_address": "0x123",
             "timestamp": 1_701_000_000u64,
@@ -2387,6 +2632,7 @@ mod tests {
 
         let replay = parse_block_with_txs(&block, &mut warnings).expect("block should parse");
         assert_eq!(replay.external_block_number, 44);
+        assert_eq!(replay.block_hash, "0x2c");
         assert_eq!(replay.parent_hash, "0xabc");
         assert_eq!(replay.sequencer_address, "0x123");
         assert_eq!(replay.timestamp, 1_701_000_000);
@@ -2404,6 +2650,7 @@ mod tests {
         let mut warnings = Vec::new();
         let block = json!({
             "block_number": 44,
+            "block_hash": "0x2c",
             "parent_hash": "0xabc",
             "sequencer_address": "0x123",
             "timestamp": 1_701_000_000u64,
@@ -2430,6 +2677,7 @@ mod tests {
             },
             replay: RealBlockReplay {
                 external_block_number: 99,
+                block_hash: "0x99".to_string(),
                 parent_hash: "0x777".to_string(),
                 sequencer_address: "0x123".to_string(),
                 timestamp: 1_701_000_000,
