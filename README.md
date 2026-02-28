@@ -30,6 +30,7 @@ This repository currently ships core, tested building blocks:
 - Dual execution orchestration with canonical fallback/mismatch handling
 - ExEx manager with bounded WAL replay and failing-sink circuit breaker
 - MCP server request handler with authenticated tool execution and bounded batch support
+- JSON-RPC server request handler with strict JSON-RPC 2.0 validation and Starknet core method coverage
 - Type-state node builder that enforces composition order
 
 Source entry points:
@@ -42,6 +43,7 @@ Source entry points:
 - [crates/execution/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/execution/src/lib.rs)
 - [crates/exex-manager/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/exex-manager/src/lib.rs)
 - [crates/mcp-server/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/mcp-server/src/lib.rs)
+- [crates/rpc/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/rpc/src/lib.rs)
 - [crates/node/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/node/src/lib.rs)
 
 ## External Integration Boundaries
@@ -82,9 +84,10 @@ Custom IDs are intentionally supported for private networks/appchains and test e
    - `FastOnly`
    - `DualWithVerification`
 3. State is committed via storage backend behavior (Apollo storage for canonical Starknet semantics).
-4. ExEx notifications are WAL-persisted before delivery.
-5. ExEx manager delivers notifications in deterministic dependency tiers.
-6. Agent-facing surfaces (e.g., MCP) consume notifications and read state without mutating consensus-critical paths.
+4. RPC requests are handled synchronously against committed storage state.
+5. ExEx notifications are WAL-persisted before delivery.
+6. ExEx manager delivers notifications in deterministic dependency tiers.
+7. Agent-facing surfaces (e.g., MCP) consume notifications and read state without mutating consensus-critical paths.
 
 ## Local Development
 
@@ -129,8 +132,9 @@ Near-term implementation sequence:
 1. Expand Apollo-backed adapters and fixture coverage
 2. Continue hardening Blockifier adapter semantics across protocol versions
 3. Extend ExEx manager recovery and failure isolation behavior
-4. Extend MCP server surface beyond control-plane tools (state query params, simulation, submit)
-5. Add BTCFi/strkBTC monitoring ExEx implementations
+4. Extend RPC method coverage and map full Starknet error taxonomy
+5. Extend MCP server surface beyond control-plane tools (state query params, simulation, submit)
+6. Add BTCFi/strkBTC monitoring ExEx implementations
 
 Long-term:
 

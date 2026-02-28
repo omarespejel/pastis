@@ -5,6 +5,7 @@ use node_spec_core::mcp::{McpAccessController, ValidationLimits};
 use starknet_node_execution::BlockifierVmBackend;
 use starknet_node_execution::ExecutionBackend;
 use starknet_node_mcp_server::McpServer;
+use starknet_node_rpc::StarknetRpcServer;
 #[cfg(feature = "production-adapters")]
 use starknet_node_storage::ApolloStorageAdapter;
 use starknet_node_storage::StorageBackend;
@@ -91,6 +92,10 @@ pub struct StarknetNode<S, E> {
 }
 
 impl<S: StorageBackend, E> StarknetNode<S, E> {
+    pub fn new_rpc_server(&self) -> StarknetRpcServer<'_> {
+        StarknetRpcServer::new(&self.storage, self.config.chain_id.as_str())
+    }
+
     pub fn new_mcp_server(
         &self,
         access_controller: McpAccessController,
@@ -270,6 +275,7 @@ mod tests {
     use semver::Version;
     use starknet_node_execution::ExecutionError;
     use starknet_node_mcp_server::{McpRequest, McpResponse};
+    use starknet_node_rpc::JsonRpcRequest;
     use starknet_node_storage::InMemoryStorage;
     #[cfg(feature = "production-adapters")]
     use starknet_node_storage::StorageError;
@@ -365,6 +371,26 @@ mod tests {
             .expect("request should succeed");
         assert_eq!(response.agent_id, "agent-a");
         assert!(matches!(response.response, McpResponse::QueryState(_)));
+    }
+
+    #[test]
+    fn node_can_construct_rpc_server_bound_to_storage() {
+        let storage = InMemoryStorage::new(InMemoryState::default());
+        let node = StarknetNodeBuilder::new(NodeConfig {
+            chain_id: ChainId::parse("SN_SEPOLIA").expect("chain id"),
+        })
+        .with_storage(storage)
+        .with_execution(DummyExecution)
+        .with_rpc(true)
+        .build();
+        let rpc = node.new_rpc_server();
+        let response = rpc.handle_request(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "starknet_chainId".to_string(),
+            params: serde_json::json!([]),
+            id: serde_json::json!(7),
+        });
+        assert_eq!(response.result, Some(serde_json::json!("SN_SEPOLIA")));
     }
 
     #[test]

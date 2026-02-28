@@ -188,6 +188,7 @@ The repository currently includes core and phase-aligned scaffolding crates that
 - Blockifier adapter fail-fast guard for account transactions when class-provider integration is unavailable
 - ExEx registration hardening: per-ExEx credentials, allowlisted identities, trusted in-process sink enforcement, and sink recovery cooldown/re-enable
 - Node config hardening with validated `ChainId` parsing (mainnet/sepolia/custom strict format)
+- JSON-RPC server request handling with strict JSON-RPC envelope validation and deterministic error mapping
 - Type-state node builder enforcing storage-before-execution composition
 - ExEx manager behavior (registration DAG validation, bounded queue, WAL replay compatibility)
 
@@ -201,5 +202,6 @@ See code in:
 - `crates/storage/src/lib.rs`
 - `crates/execution/src/lib.rs`
 - `crates/mcp-server/src/lib.rs`
+- `crates/rpc/src/lib.rs`
 - `crates/node/src/lib.rs`
 - `crates/exex-manager/src/lib.rs`

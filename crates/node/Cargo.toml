@@ -16,6 +16,10 @@ node-spec-core = { path = "../node-spec-core" }
 semver = { workspace = true }
 starknet-node-execution = { path = "../execution" }
 starknet-node-mcp-server = { path = "../mcp-server" }
+starknet-node-rpc = { path = "../rpc" }
 starknet-node-storage = { path = "../storage" }
 starknet-node-types = { path = "../types" }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1.0"
