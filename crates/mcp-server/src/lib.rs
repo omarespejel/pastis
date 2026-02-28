@@ -5,7 +5,8 @@ use std::sync::Mutex;
 use node_spec_core::mcp::{
     AccessError, McpAccessController, McpTool, ValidationError, ValidationLimits, validate_tool,
 };
-use starknet_node_exex_btcfi::{BtcfiAnomaly, BtcfiExEx};
+pub use starknet_node_exex_btcfi::BtcfiAnomaly;
+use starknet_node_exex_btcfi::BtcfiExEx;
 use starknet_node_storage::{StateRootSemantics, StorageBackend, StorageError};
 use starknet_node_types::{BlockNumber, ComponentHealth};
 

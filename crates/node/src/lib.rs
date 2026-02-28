@@ -4,7 +4,7 @@ use node_spec_core::mcp::{McpAccessController, ValidationLimits};
 #[cfg(feature = "production-adapters")]
 use starknet_node_execution::BlockifierVmBackend;
 use starknet_node_execution::ExecutionBackend;
-use starknet_node_mcp_server::McpServer;
+use starknet_node_mcp_server::{AnomalySource, McpServer};
 use starknet_node_proving::ProvingBackend;
 use starknet_node_rpc::StarknetRpcServer;
 #[cfg(feature = "production-adapters")]
@@ -104,6 +104,16 @@ impl<S: StorageBackend, E> StarknetNode<S, E> {
         validation_limits: ValidationLimits,
     ) -> McpServer<'_> {
         McpServer::new(&self.storage, access_controller, validation_limits)
+    }
+
+    pub fn new_mcp_server_with_anomalies<'a>(
+        &'a self,
+        access_controller: McpAccessController,
+        validation_limits: ValidationLimits,
+        anomaly_source: &'a dyn AnomalySource,
+    ) -> McpServer<'a> {
+        McpServer::new(&self.storage, access_controller, validation_limits)
+            .with_anomaly_source(anomaly_source)
     }
 
     pub fn proving_backend(&self) -> Option<&dyn ProvingBackend> {
@@ -290,7 +300,7 @@ mod tests {
     #[cfg(feature = "production-adapters")]
     use semver::Version;
     use starknet_node_execution::ExecutionError;
-    use starknet_node_mcp_server::{McpRequest, McpResponse};
+    use starknet_node_mcp_server::{AnomalySource, BtcfiAnomaly, McpRequest, McpResponse};
     use starknet_node_proving::{ProvingError, StarkProof};
     use starknet_node_rpc::JsonRpcRequest;
     use starknet_node_storage::InMemoryStorage;
@@ -351,6 +361,18 @@ mod tests {
     impl ProvingBackend for DummyProving {
         fn verify_proof(&self, proof: &StarkProof) -> Result<bool, ProvingError> {
             Ok(!proof.proof_bytes.is_empty())
+        }
+    }
+
+    struct DummyAnomalySource;
+
+    impl AnomalySource for DummyAnomalySource {
+        fn recent_anomalies(&self, _limit: usize) -> Result<Vec<BtcfiAnomaly>, String> {
+            Ok(vec![BtcfiAnomaly::StrkBtcCommitmentFlood {
+                block_number: 7,
+                delta: 12,
+                threshold: 8,
+            }])
         }
     }
 
@@ -425,6 +447,40 @@ mod tests {
             .expect("request should succeed");
         assert_eq!(response.agent_id, "agent-a");
         assert!(matches!(response.response, McpResponse::QueryState(_)));
+    }
+
+    #[test]
+    fn node_can_construct_mcp_server_with_anomaly_source() {
+        let storage = InMemoryStorage::new(InMemoryState::default());
+        let node = StarknetNodeBuilder::new(NodeConfig::default())
+            .with_storage(storage)
+            .with_execution(DummyExecution)
+            .with_mcp(true)
+            .build();
+        let policies = [(
+            "agent-a".to_string(),
+            AgentPolicy::new("api-key", BTreeSet::from([ToolPermission::GetAnomalies]), 5),
+        )];
+        let limits = ValidationLimits {
+            max_batch_size: 8,
+            max_depth: 2,
+            max_total_tools: 16,
+        };
+        let source = DummyAnomalySource;
+        let server =
+            node.new_mcp_server_with_anomalies(McpAccessController::new(policies), limits, &source);
+        let response = server
+            .handle_request(McpRequest {
+                api_key: "api-key".to_string(),
+                tool: McpTool::GetAnomalies { limit: 10 },
+                now_unix_seconds: 1_000,
+            })
+            .expect("request should succeed");
+        assert_eq!(response.agent_id, "agent-a");
+        assert!(matches!(
+            response.response,
+            McpResponse::GetAnomalies { ref anomalies } if anomalies.len() == 1
+        ));
     }
 
     #[test]
