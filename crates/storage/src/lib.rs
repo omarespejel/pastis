@@ -57,6 +57,12 @@ pub enum StorageError {
         value: String,
         error: String,
     },
+    #[error("invalid block: {0}")]
+    InvalidBlock(String),
+    #[error("invalid state diff: {0}")]
+    InvalidStateDiff(String),
+    #[error("state limits exceeded while applying diff: {0}")]
+    StateLimitExceeded(String),
     #[cfg(feature = "papyrus-adapter")]
     #[error("papyrus storage error: {0}")]
     Papyrus(String),
@@ -277,8 +283,14 @@ impl StorageBackend for InMemoryStorage {
     }
 
     fn apply_state_diff(&mut self, diff: &StarknetStateDiff) -> Result<(), StorageError> {
+        diff.validate()
+            .map_err(|error| StorageError::InvalidStateDiff(error.to_string()))?;
         let tip = self.latest_block_number()?;
-        self.states.entry(tip).or_default().apply_state_diff(diff);
+        self.states
+            .entry(tip)
+            .or_default()
+            .apply_state_diff(diff)
+            .map_err(|error| StorageError::StateLimitExceeded(error.to_string()))?;
         Ok(())
     }
 
@@ -287,6 +299,13 @@ impl StorageBackend for InMemoryStorage {
         block: StarknetBlock,
         state_diff: StarknetStateDiff,
     ) -> Result<(), StorageError> {
+        block
+            .validate()
+            .map_err(|error| StorageError::InvalidBlock(error.to_string()))?;
+        state_diff
+            .validate()
+            .map_err(|error| StorageError::InvalidStateDiff(error.to_string()))?;
+
         let tip = self.latest_block_number()?;
         let expected = tip
             .checked_add(1)
@@ -299,7 +318,9 @@ impl StorageBackend for InMemoryStorage {
             .checked_sub(1)
             .ok_or(StorageError::BlockNumberOverflow { tip })?;
         let mut next_state = self.states.get(&parent).cloned().unwrap_or_default();
-        next_state.apply_state_diff(&state_diff);
+        next_state
+            .apply_state_diff(&state_diff)
+            .map_err(|error| StorageError::StateLimitExceeded(error.to_string()))?;
 
         self.blocks.insert(block.number, block);
         self.state_diffs.insert(expected, state_diff);

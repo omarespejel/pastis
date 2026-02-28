@@ -17,6 +17,17 @@ pub trait NotificationSink: Send {
     fn on_notification(&mut self, notification: StarknetExExNotification) -> Result<(), String>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkTrust {
+    TrustedInProcess,
+    Untrusted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExExCredentials {
+    pub registration_token: String,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct InMemoryWal {
     entries: VecDeque<Vec<u8>>,
@@ -45,6 +56,7 @@ impl InMemoryWal {
 
 pub struct ExExRegistration {
     pub meta: ExExHandleMeta,
+    pub trust: SinkTrust,
     pub sink: Box<dyn NotificationSink>,
 }
 
@@ -70,6 +82,12 @@ pub enum ManagerError {
     WalTooManyEntries { entries: usize, max: usize },
     #[error("notification id counter overflowed")]
     NotificationIdOverflow,
+    #[error("registration authentication failed")]
+    RegistrationAuthFailed,
+    #[error("registration rejected for non-allowlisted exex '{name}'")]
+    RegistrationNotAllowed { name: String },
+    #[error("registration rejected for untrusted exex '{name}'")]
+    UntrustedExExRejected { name: String },
 }
 
 pub struct ExExManager {
@@ -82,6 +100,8 @@ pub struct ExExManager {
     max_capacity: usize,
     wal: InMemoryWal,
     delivery_pool: Option<ThreadPool>,
+    registration_token: String,
+    allowed_exex_names: HashSet<String>,
 }
 
 const MAX_PARALLEL_DELIVERY_WORKERS: usize = 32;
@@ -89,7 +109,11 @@ const MAX_WAL_REPLAY_ENTRIES: usize = 100_000;
 const MAX_CONSECUTIVE_SINK_FAILURES: u32 = 3;
 
 impl ExExManager {
-    pub fn new(max_capacity: usize) -> Self {
+    pub fn new(
+        max_capacity: usize,
+        registration_token: impl Into<String>,
+        allowed_exex_names: impl IntoIterator<Item = String>,
+    ) -> Self {
         Self {
             tiers: Vec::new(),
             sinks: HashMap::new(),
@@ -103,6 +127,8 @@ impl ExExManager {
                 .num_threads(MAX_PARALLEL_DELIVERY_WORKERS.max(1))
                 .build()
                 .ok(),
+            registration_token: registration_token.into(),
+            allowed_exex_names: allowed_exex_names.into_iter().collect(),
         }
     }
 
@@ -114,7 +140,26 @@ impl ExExManager {
         &mut self.wal
     }
 
-    pub fn register(&mut self, registrations: Vec<ExExRegistration>) -> Result<(), ManagerError> {
+    pub fn register(
+        &mut self,
+        registrations: Vec<ExExRegistration>,
+        credentials: &ExExCredentials,
+    ) -> Result<(), ManagerError> {
+        if credentials.registration_token != self.registration_token {
+            return Err(ManagerError::RegistrationAuthFailed);
+        }
+        for registration in &registrations {
+            if registration.trust != SinkTrust::TrustedInProcess {
+                return Err(ManagerError::UntrustedExExRejected {
+                    name: registration.meta.name.clone(),
+                });
+            }
+            if !self.allowed_exex_names.contains(&registration.meta.name) {
+                return Err(ManagerError::RegistrationNotAllowed {
+                    name: registration.meta.name.clone(),
+                });
+            }
+        }
         let metas: Vec<ExExHandleMeta> = registrations.iter().map(|r| r.meta.clone()).collect();
         self.tiers = build_delivery_tiers(&metas)?;
         self.sink_failures.clear();
@@ -440,8 +485,23 @@ mod tests {
                 depends_on: deps.iter().map(|d| d.to_string()).collect(),
                 priority: 1,
             },
+            trust: SinkTrust::TrustedInProcess,
             sink: Box::new(RecordingSink::new(name, log)),
         }
+    }
+
+    fn credentials() -> ExExCredentials {
+        ExExCredentials {
+            registration_token: "test-registration-token".to_string(),
+        }
+    }
+
+    fn manager(max_capacity: usize, allowed_names: &[&str]) -> ExExManager {
+        ExExManager::new(
+            max_capacity,
+            credentials().registration_token.clone(),
+            allowed_names.iter().map(|name| name.to_string()),
+        )
     }
 
     fn sample_notification() -> StarknetExExNotification {
@@ -455,12 +515,12 @@ mod tests {
     #[test]
     fn rejects_dependency_cycles_at_registration() {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let mut manager = ExExManager::new(16);
+        let mut manager = manager(16, &["a", "b"]);
         let err = manager
-            .register(vec![
-                reg("a", &["b"], log.clone()),
-                reg("b", &["a"], log.clone()),
-            ])
+            .register(
+                vec![reg("a", &["b"], log.clone()), reg("b", &["a"], log.clone())],
+                &credentials(),
+            )
             .expect_err("must fail");
 
         assert!(matches!(
@@ -470,11 +530,60 @@ mod tests {
     }
 
     #[test]
+    fn rejects_registration_with_invalid_token() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut manager = manager(8, &["otel"]);
+        let wrong = ExExCredentials {
+            registration_token: "wrong-token".to_string(),
+        };
+        let err = manager
+            .register(vec![reg("otel", &[], log)], &wrong)
+            .expect_err("must reject invalid token");
+        assert!(matches!(err, ManagerError::RegistrationAuthFailed));
+    }
+
+    #[test]
+    fn rejects_registration_for_non_allowlisted_exex() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut manager = manager(8, &["otel"]);
+        let err = manager
+            .register(vec![reg("btcfi", &[], log)], &credentials())
+            .expect_err("must reject non-allowlisted name");
+        assert!(matches!(
+            err,
+            ManagerError::RegistrationNotAllowed { name } if name == "btcfi"
+        ));
+    }
+
+    #[test]
+    fn rejects_untrusted_exex_registrations() {
+        let mut manager = manager(8, &["otel"]);
+        let err = manager
+            .register(
+                vec![ExExRegistration {
+                    meta: ExExHandleMeta {
+                        name: "otel".to_string(),
+                        depends_on: vec![],
+                        priority: 1,
+                    },
+                    trust: SinkTrust::Untrusted,
+                    sink: Box::new(PanickingSink),
+                }],
+                &credentials(),
+            )
+            .expect_err("must reject untrusted sinks");
+        assert!(matches!(
+            err,
+            ManagerError::UntrustedExExRejected { name } if name == "otel"
+        ));
+    }
+
+    #[test]
     fn enforces_notification_capacity() {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let mut manager = ExExManager::new(1);
+        let mut manager = manager(1, &["otel"]);
         manager
-            .register(vec![reg("otel", &[], log.clone())])
+            .register(vec![reg("otel", &[], log.clone())], &credentials())
             .expect("register");
 
         manager.enqueue(sample_notification()).expect("first");
@@ -487,13 +596,16 @@ mod tests {
     #[test]
     fn delivers_notifications_in_dependency_order() {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let mut manager = ExExManager::new(8);
+        let mut manager = manager(8, &["otel", "btcfi", "mcp"]);
         manager
-            .register(vec![
-                reg("otel", &[], log.clone()),
-                reg("btcfi", &["otel"], log.clone()),
-                reg("mcp", &["btcfi"], log.clone()),
-            ])
+            .register(
+                vec![
+                    reg("otel", &[], log.clone()),
+                    reg("btcfi", &["otel"], log.clone()),
+                    reg("mcp", &["btcfi"], log.clone()),
+                ],
+                &credentials(),
+            )
             .expect("register");
 
         manager.enqueue(sample_notification()).expect("enqueue");
@@ -508,7 +620,7 @@ mod tests {
 
     #[test]
     fn replays_wal_with_legacy_payloads() {
-        let mut manager = ExExManager::new(4);
+        let mut manager = manager(4, &[]);
         manager.enqueue(sample_notification()).expect("enqueue v2");
         manager
             .wal_mut()
@@ -532,46 +644,52 @@ mod tests {
     #[test]
     fn delivers_tiers_in_parallel_with_barrier_between_tiers() {
         let timeline = Arc::new(Mutex::new(HashMap::<String, (Instant, Instant)>::new()));
-        let mut manager = ExExManager::new(8);
+        let mut manager = manager(8, &["tier1-a", "tier1-b", "tier2"]);
         manager
-            .register(vec![
-                ExExRegistration {
-                    meta: ExExHandleMeta {
-                        name: "tier1-a".to_string(),
-                        depends_on: vec![],
-                        priority: 1,
+            .register(
+                vec![
+                    ExExRegistration {
+                        meta: ExExHandleMeta {
+                            name: "tier1-a".to_string(),
+                            depends_on: vec![],
+                            priority: 1,
+                        },
+                        trust: SinkTrust::TrustedInProcess,
+                        sink: Box::new(SlowSink::new(
+                            "tier1-a",
+                            Duration::from_millis(70),
+                            timeline.clone(),
+                        )),
                     },
-                    sink: Box::new(SlowSink::new(
-                        "tier1-a",
-                        Duration::from_millis(70),
-                        timeline.clone(),
-                    )),
-                },
-                ExExRegistration {
-                    meta: ExExHandleMeta {
-                        name: "tier1-b".to_string(),
-                        depends_on: vec![],
-                        priority: 1,
+                    ExExRegistration {
+                        meta: ExExHandleMeta {
+                            name: "tier1-b".to_string(),
+                            depends_on: vec![],
+                            priority: 1,
+                        },
+                        trust: SinkTrust::TrustedInProcess,
+                        sink: Box::new(SlowSink::new(
+                            "tier1-b",
+                            Duration::from_millis(70),
+                            timeline.clone(),
+                        )),
                     },
-                    sink: Box::new(SlowSink::new(
-                        "tier1-b",
-                        Duration::from_millis(70),
-                        timeline.clone(),
-                    )),
-                },
-                ExExRegistration {
-                    meta: ExExHandleMeta {
-                        name: "tier2".to_string(),
-                        depends_on: vec!["tier1-a".to_string(), "tier1-b".to_string()],
-                        priority: 1,
+                    ExExRegistration {
+                        meta: ExExHandleMeta {
+                            name: "tier2".to_string(),
+                            depends_on: vec!["tier1-a".to_string(), "tier1-b".to_string()],
+                            priority: 1,
+                        },
+                        trust: SinkTrust::TrustedInProcess,
+                        sink: Box::new(SlowSink::new(
+                            "tier2",
+                            Duration::from_millis(5),
+                            timeline.clone(),
+                        )),
                     },
-                    sink: Box::new(SlowSink::new(
-                        "tier2",
-                        Duration::from_millis(5),
-                        timeline.clone(),
-                    )),
-                },
-            ])
+                ],
+                &credentials(),
+            )
             .expect("register");
 
         let started = Instant::now();
@@ -591,32 +709,37 @@ mod tests {
 
     #[test]
     fn picks_failures_in_deterministic_tier_order() {
-        let mut manager = ExExManager::new(8);
+        let mut manager = manager(8, &["alpha", "zeta"]);
         manager
-            .register(vec![
-                ExExRegistration {
-                    meta: ExExHandleMeta {
-                        name: "alpha".to_string(),
-                        depends_on: vec![],
-                        priority: 1,
+            .register(
+                vec![
+                    ExExRegistration {
+                        meta: ExExHandleMeta {
+                            name: "alpha".to_string(),
+                            depends_on: vec![],
+                            priority: 1,
+                        },
+                        trust: SinkTrust::TrustedInProcess,
+                        sink: Box::new(FailingSink {
+                            message: "alpha-failure".to_string(),
+                            delay: Duration::from_millis(35),
+                        }),
                     },
-                    sink: Box::new(FailingSink {
-                        message: "alpha-failure".to_string(),
-                        delay: Duration::from_millis(35),
-                    }),
-                },
-                ExExRegistration {
-                    meta: ExExHandleMeta {
-                        name: "zeta".to_string(),
-                        depends_on: vec![],
-                        priority: 1,
+                    ExExRegistration {
+                        meta: ExExHandleMeta {
+                            name: "zeta".to_string(),
+                            depends_on: vec![],
+                            priority: 1,
+                        },
+                        trust: SinkTrust::TrustedInProcess,
+                        sink: Box::new(FailingSink {
+                            message: "zeta-failure".to_string(),
+                            delay: Duration::from_millis(1),
+                        }),
                     },
-                    sink: Box::new(FailingSink {
-                        message: "zeta-failure".to_string(),
-                        delay: Duration::from_millis(1),
-                    }),
-                },
-            ])
+                ],
+                &credentials(),
+            )
             .expect("register");
 
         manager.enqueue(sample_notification()).expect("enqueue");
@@ -637,19 +760,23 @@ mod tests {
 
     #[test]
     fn retains_notification_in_buffer_when_delivery_fails() {
-        let mut manager = ExExManager::new(8);
+        let mut manager = manager(8, &["failing"]);
         manager
-            .register(vec![ExExRegistration {
-                meta: ExExHandleMeta {
-                    name: "failing".to_string(),
-                    depends_on: vec![],
-                    priority: 1,
-                },
-                sink: Box::new(FailingSink {
-                    message: "boom".to_string(),
-                    delay: Duration::from_millis(1),
-                }),
-            }])
+            .register(
+                vec![ExExRegistration {
+                    meta: ExExHandleMeta {
+                        name: "failing".to_string(),
+                        depends_on: vec![],
+                        priority: 1,
+                    },
+                    trust: SinkTrust::TrustedInProcess,
+                    sink: Box::new(FailingSink {
+                        message: "boom".to_string(),
+                        delay: Duration::from_millis(1),
+                    }),
+                }],
+                &credentials(),
+            )
             .expect("register");
         manager.enqueue(sample_notification()).expect("enqueue");
 
@@ -665,22 +792,26 @@ mod tests {
     #[test]
     fn disables_sink_after_repeated_failures_to_unblock_delivery() {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let mut manager = ExExManager::new(8);
+        let mut manager = manager(8, &["always-fail", "healthy"]);
         manager
-            .register(vec![
-                ExExRegistration {
-                    meta: ExExHandleMeta {
-                        name: "always-fail".to_string(),
-                        depends_on: vec![],
-                        priority: 1,
+            .register(
+                vec![
+                    ExExRegistration {
+                        meta: ExExHandleMeta {
+                            name: "always-fail".to_string(),
+                            depends_on: vec![],
+                            priority: 1,
+                        },
+                        trust: SinkTrust::TrustedInProcess,
+                        sink: Box::new(FailingSink {
+                            message: "permanent-failure".to_string(),
+                            delay: Duration::from_millis(1),
+                        }),
                     },
-                    sink: Box::new(FailingSink {
-                        message: "permanent-failure".to_string(),
-                        delay: Duration::from_millis(1),
-                    }),
-                },
-                reg("healthy", &[], log.clone()),
-            ])
+                    reg("healthy", &[], log.clone()),
+                ],
+                &credentials(),
+            )
             .expect("register");
         manager.enqueue(sample_notification()).expect("enqueue");
 
@@ -710,9 +841,9 @@ mod tests {
     #[test]
     fn compacts_wal_after_successful_delivery() {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let mut manager = ExExManager::new(8);
+        let mut manager = manager(8, &["otel"]);
         manager
-            .register(vec![reg("otel", &[], log)])
+            .register(vec![reg("otel", &[], log)], &credentials())
             .expect("register");
         manager.enqueue(sample_notification()).expect("enqueue");
         assert_eq!(manager.wal().entries().len(), 1);
@@ -733,18 +864,22 @@ mod tests {
             }
         }
 
-        let manager = Arc::new(Mutex::new(ExExManager::new(1_024)));
+        let manager = Arc::new(Mutex::new(manager(1_024, &["noop"])));
         manager
             .lock()
             .expect("lock manager")
-            .register(vec![ExExRegistration {
-                meta: ExExHandleMeta {
-                    name: "noop".to_string(),
-                    depends_on: vec![],
-                    priority: 1,
-                },
-                sink: Box::new(NoopSink),
-            }])
+            .register(
+                vec![ExExRegistration {
+                    meta: ExExHandleMeta {
+                        name: "noop".to_string(),
+                        depends_on: vec![],
+                        priority: 1,
+                    },
+                    trust: SinkTrust::TrustedInProcess,
+                    sink: Box::new(NoopSink),
+                }],
+                &credentials(),
+            )
             .expect("register");
 
         let producers = 8usize;
@@ -777,16 +912,20 @@ mod tests {
 
     #[test]
     fn reports_panicking_sink_name_deterministically() {
-        let mut manager = ExExManager::new(8);
+        let mut manager = manager(8, &["panic-sink"]);
         manager
-            .register(vec![ExExRegistration {
-                meta: ExExHandleMeta {
-                    name: "panic-sink".to_string(),
-                    depends_on: vec![],
-                    priority: 1,
-                },
-                sink: Box::new(PanickingSink),
-            }])
+            .register(
+                vec![ExExRegistration {
+                    meta: ExExHandleMeta {
+                        name: "panic-sink".to_string(),
+                        depends_on: vec![],
+                        priority: 1,
+                    },
+                    trust: SinkTrust::TrustedInProcess,
+                    sink: Box::new(PanickingSink),
+                }],
+                &credentials(),
+            )
             .expect("register");
 
         manager.enqueue(sample_notification()).expect("enqueue");
@@ -800,7 +939,7 @@ mod tests {
 
     #[test]
     fn rejects_enqueue_when_notification_id_overflows() {
-        let mut manager = ExExManager::new(8);
+        let mut manager = manager(8, &[]);
         manager.next_id = u64::MAX;
 
         let err = manager

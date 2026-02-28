@@ -8,18 +8,67 @@ use starknet_node_storage::PapyrusStorageAdapter;
 use starknet_node_storage::StorageBackend;
 #[cfg(feature = "production-adapters")]
 use starknet_node_types::BlockId;
-#[cfg(feature = "production-adapters")]
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainId {
+    Mainnet,
+    Sepolia,
+    Custom(String),
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ChainIdError {
+    #[error("chain id cannot be empty")]
+    Empty,
+    #[error("invalid chain id format '{0}'")]
+    InvalidFormat(String),
+}
+
+impl ChainId {
+    pub fn parse(raw: impl Into<String>) -> Result<Self, ChainIdError> {
+        let raw = raw.into();
+        if raw.is_empty() {
+            return Err(ChainIdError::Empty);
+        }
+        match raw.as_str() {
+            "SN_MAIN" => Ok(Self::Mainnet),
+            "SN_SEPOLIA" => Ok(Self::Sepolia),
+            _ => {
+                let valid = raw.starts_with("SN_")
+                    && raw
+                        .chars()
+                        .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_');
+                if !valid {
+                    return Err(ChainIdError::InvalidFormat(raw));
+                }
+                Ok(Self::Custom(raw))
+            }
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Mainnet => "SN_MAIN",
+            Self::Sepolia => "SN_SEPOLIA",
+            Self::Custom(raw) => raw.as_str(),
+        }
+    }
+
+    pub fn is_mainnet(&self) -> bool {
+        matches!(self, Self::Mainnet)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeConfig {
-    pub chain_id: String,
+    pub chain_id: ChainId,
 }
 
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
-            chain_id: "SN_MAIN".to_string(),
+            chain_id: ChainId::Mainnet,
         }
     }
 }
@@ -86,7 +135,7 @@ fn validate_bootstrap_storage<S: StorageBackend>(
     storage
         .get_state_reader(0)
         .map_err(|error| NodeInitError::StorageIntegrity(error.to_string()))?;
-    if config.chain_id == "SN_MAIN"
+    if config.chain_id.is_mainnet()
         && let Some(genesis) = storage
             .get_block(BlockId::Number(0))
             .map_err(|error| NodeInitError::StorageIntegrity(error.to_string()))?
@@ -267,7 +316,7 @@ mod tests {
 
         assert!(node.rpc_enabled);
         assert!(node.mcp_enabled);
-        assert_eq!(node.config.chain_id, "SN_MAIN");
+        assert_eq!(node.config.chain_id, ChainId::Mainnet);
     }
 
     #[test]
@@ -275,13 +324,19 @@ mod tests {
         // This test validates runtime state after the type-state transitions complete.
         let storage = InMemoryStorage::new(InMemoryState::default());
         let node = StarknetNodeBuilder::new(NodeConfig {
-            chain_id: "SN_SEPOLIA".to_string(),
+            chain_id: ChainId::parse("SN_SEPOLIA").expect("valid chain id"),
         })
         .with_storage(storage)
         .with_execution(DummyExecution)
         .build();
 
-        assert_eq!(node.config.chain_id, "SN_SEPOLIA");
+        assert_eq!(node.config.chain_id, ChainId::Sepolia);
+    }
+
+    #[test]
+    fn rejects_invalid_chain_id_format() {
+        let err = ChainId::parse("sn_main").expect_err("must reject invalid casing");
+        assert!(matches!(err, ChainIdError::InvalidFormat(_)));
     }
 
     #[cfg(feature = "production-adapters")]

@@ -180,9 +180,13 @@ The repository currently includes core and phase-aligned scaffolding crates that
 - L1 finality gating and unfinalized reorg invalidation
 - MCP batch recursion/size validation
 - MCP access control hardened with Argon2id API-key derivation (legacy PBKDF2 fallback only on derivation failure)
+- Bounded block/state-diff validation (`MAX_TRANSACTIONS_PER_BLOCK`, bounded storage writes/nonces/classes) at ingest boundaries
+- In-memory state guardrails against contract/slot/entry explosion with explicit state-limit errors
 - Storage backend behavior (sequential inserts, block snapshots, deterministic state roots)
 - Dual execution mismatch handling with canonical-state safety
 - Blockifier adapter fail-fast guard for account transactions when class-provider integration is unavailable
+- ExEx registration hardening: credentialed registration token, allowlisted ExEx identities, and trusted in-process sink enforcement
+- Node config hardening with validated `ChainId` parsing (mainnet/sepolia/custom strict format)
 - Type-state node builder enforcing storage-before-execution composition
 - ExEx manager behavior (registration DAG validation, bounded queue, WAL replay compatibility)
 

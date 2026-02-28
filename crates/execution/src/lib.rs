@@ -970,6 +970,9 @@ impl ExecutionBackend for BlockifierVmBackend {
         block: &StarknetBlock,
         state: &mut dyn MutableState,
     ) -> Result<ExecutionOutput, ExecutionError> {
+        block
+            .validate()
+            .map_err(|error| ExecutionError::Backend(format!("invalid block input: {error}")))?;
         self.validate_sequential_block(block.number)?;
         let started_at = Instant::now();
         let block_context = self.build_block_context(block)?;
@@ -1055,6 +1058,9 @@ impl ExecutionBackend for BlockifierVmBackend {
                     .declared_classes
                     .push(format!("{:#x}", class_hash.0));
             }
+            state_diff.validate().map_err(|error| {
+                ExecutionError::Backend(format!("invalid blockifier state diff output: {error}"))
+            })?;
 
             for (contract, writes) in &state_diff.storage_diffs {
                 for (key, value) in writes {
@@ -1089,6 +1095,8 @@ impl ExecutionBackend for BlockifierVmBackend {
         state: &dyn StateReader,
         block_context: &BlockContext,
     ) -> Result<SimulationResult, ExecutionError> {
+        tx.validate_hash()
+            .map_err(|error| ExecutionError::Backend(format!("invalid tx hash: {error}")))?;
         let blockifier_context = self.build_simulation_context(block_context)?;
         let mapped_tx = self.map_transaction_for_block(block_context.block_number, tx)?;
         let mut executor = TransactionExecutor::pre_process_and_create(
