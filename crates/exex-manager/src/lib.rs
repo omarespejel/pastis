@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::thread;
+use std::time::{Duration, Instant};
 
 use node_spec_core::exex_delivery::{DeliveryPlanError, ExExHandleMeta, build_delivery_tiers};
 use node_spec_core::notification::{
@@ -14,6 +15,8 @@ use rayon::ThreadPool;
 use rayon::prelude::*;
 
 pub trait NotificationSink: Send {
+    // In-process sinks are trusted-only. Untrusted logic must run out-of-process and interact
+    // through authenticated APIs rather than direct in-process registration.
     fn on_notification(
         &mut self,
         notification: Arc<StarknetExExNotification>,
@@ -28,7 +31,7 @@ pub enum SinkTrust {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExExCredentials {
-    pub registration_token: String,
+    pub exex_tokens: HashMap<String, String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -87,6 +90,8 @@ pub enum ManagerError {
     NotificationIdOverflow,
     #[error("registration authentication failed")]
     RegistrationAuthFailed,
+    #[error("registration credentials missing for exex '{name}'")]
+    RegistrationCredentialsMissing { name: String },
     #[error("registration rejected for non-allowlisted exex '{name}'")]
     RegistrationNotAllowed { name: String },
     #[error("registration rejected for untrusted exex '{name}'")]
@@ -97,41 +102,50 @@ pub struct ExExManager {
     tiers: Vec<Vec<String>>,
     sinks: HashMap<String, SharedSink>,
     sink_failures: HashMap<String, u32>,
-    disabled_sinks: HashSet<String>,
-    buffer: VecDeque<(u64, StarknetExExNotification)>,
+    disabled_sinks_until: HashMap<String, Instant>,
+    buffer: VecDeque<(u64, Arc<StarknetExExNotification>)>,
     next_id: u64,
     max_capacity: usize,
     wal: InMemoryWal,
     delivery_pool: Option<ThreadPool>,
-    registration_token: String,
-    allowed_exex_names: HashSet<String>,
+    registration_tokens: HashMap<String, String>,
+    sink_failure_cooldown: Duration,
 }
 
 const MAX_PARALLEL_DELIVERY_WORKERS: usize = 32;
 const MAX_WAL_REPLAY_ENTRIES: usize = 100_000;
 const MAX_CONSECUTIVE_SINK_FAILURES: u32 = 3;
+const DEFAULT_SINK_FAILURE_COOLDOWN: Duration = Duration::from_secs(300);
 
 impl ExExManager {
     pub fn new(
         max_capacity: usize,
-        registration_token: impl Into<String>,
-        allowed_exex_names: impl IntoIterator<Item = String>,
+        registration_tokens: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
+        let delivery_pool = match rayon::ThreadPoolBuilder::new()
+            .num_threads(MAX_PARALLEL_DELIVERY_WORKERS.max(1))
+            .build()
+        {
+            Ok(pool) => Some(pool),
+            Err(error) => {
+                eprintln!(
+                    "warning: failed to initialize ExEx delivery threadpool; falling back to sequential delivery: {error}"
+                );
+                None
+            }
+        };
         Self {
             tiers: Vec::new(),
             sinks: HashMap::new(),
             sink_failures: HashMap::new(),
-            disabled_sinks: HashSet::new(),
+            disabled_sinks_until: HashMap::new(),
             buffer: VecDeque::new(),
             next_id: 1,
             max_capacity: max_capacity.min(MAX_WAL_REPLAY_ENTRIES),
             wal: InMemoryWal::default(),
-            delivery_pool: rayon::ThreadPoolBuilder::new()
-                .num_threads(MAX_PARALLEL_DELIVERY_WORKERS.max(1))
-                .build()
-                .ok(),
-            registration_token: registration_token.into(),
-            allowed_exex_names: allowed_exex_names.into_iter().collect(),
+            delivery_pool,
+            registration_tokens: registration_tokens.into_iter().collect(),
+            sink_failure_cooldown: DEFAULT_SINK_FAILURE_COOLDOWN,
         }
     }
 
@@ -148,17 +162,23 @@ impl ExExManager {
         registrations: Vec<ExExRegistration>,
         credentials: &ExExCredentials,
     ) -> Result<(), ManagerError> {
-        if credentials.registration_token != self.registration_token {
-            return Err(ManagerError::RegistrationAuthFailed);
-        }
         for registration in &registrations {
+            let expected_token = self
+                .registration_tokens
+                .get(&registration.meta.name)
+                .ok_or(ManagerError::RegistrationNotAllowed {
+                    name: registration.meta.name.clone(),
+                })?;
+            let provided_token = credentials.exex_tokens.get(&registration.meta.name).ok_or(
+                ManagerError::RegistrationCredentialsMissing {
+                    name: registration.meta.name.clone(),
+                },
+            )?;
+            if provided_token != expected_token {
+                return Err(ManagerError::RegistrationAuthFailed);
+            }
             if registration.trust != SinkTrust::TrustedInProcess {
                 return Err(ManagerError::UntrustedExExRejected {
-                    name: registration.meta.name.clone(),
-                });
-            }
-            if !self.allowed_exex_names.contains(&registration.meta.name) {
-                return Err(ManagerError::RegistrationNotAllowed {
                     name: registration.meta.name.clone(),
                 });
             }
@@ -166,7 +186,7 @@ impl ExExManager {
         let metas: Vec<ExExHandleMeta> = registrations.iter().map(|r| r.meta.clone()).collect();
         self.tiers = build_delivery_tiers(&metas)?;
         self.sink_failures.clear();
-        self.disabled_sinks.clear();
+        self.disabled_sinks_until.clear();
         self.sinks = registrations
             .into_iter()
             .map(|registration| {
@@ -196,7 +216,8 @@ impl ExExManager {
             .next_id
             .checked_add(1)
             .ok_or(ManagerError::NotificationIdOverflow)?;
-        let encoded = bincode::serialize(&notification).map_err(|error| {
+        let notification = Arc::new(notification);
+        let encoded = bincode::serialize(notification.as_ref()).map_err(|error| {
             ManagerError::WalEncode(format!("bincode serialize failed: {error}"))
         })?;
         self.wal.append(encoded);
@@ -206,10 +227,11 @@ impl ExExManager {
     }
 
     pub fn drain_one(&mut self) -> Result<Option<u64>, ManagerError> {
-        let Some((notification_id, notification)) = self.buffer.front().cloned() else {
+        let Some((notification_id, notification)) = self.buffer.front() else {
             return Ok(None);
         };
-        let notification = Arc::new(notification);
+        let notification_id = *notification_id;
+        let notification = Arc::clone(notification);
 
         if self.tiers.is_empty() {
             let mut names: Vec<String> = self.sinks.keys().cloned().collect();
@@ -245,14 +267,40 @@ impl ExExManager {
         Ok(notifications)
     }
 
+    fn refresh_reenabled_sinks(&mut self, now: Instant) {
+        let reenabled: Vec<String> = self
+            .disabled_sinks_until
+            .iter()
+            .filter_map(|(name, until)| {
+                if now >= *until {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for name in reenabled {
+            self.disabled_sinks_until.remove(&name);
+            self.sink_failures.insert(name.clone(), 0);
+            eprintln!("info: re-enabled ExEx sink after cooldown: {name}");
+        }
+    }
+
+    #[cfg(test)]
+    fn with_sink_failure_cooldown_for_tests(mut self, cooldown: Duration) -> Self {
+        self.sink_failure_cooldown = cooldown;
+        self
+    }
+
     fn deliver_tier(
         &mut self,
         tier: &[String],
         notification: &Arc<StarknetExExNotification>,
     ) -> Result<(), ManagerError> {
+        self.refresh_reenabled_sinks(Instant::now());
         let active_tier: Vec<String> = tier
             .iter()
-            .filter(|name| !self.disabled_sinks.contains(*name))
+            .filter(|name| !self.disabled_sinks_until.contains_key(*name))
             .cloned()
             .collect();
         if active_tier.is_empty() {
@@ -315,7 +363,11 @@ impl ExExManager {
                         let failures = self.sink_failures.entry(name.clone()).or_insert(0);
                         *failures = failures.saturating_add(1);
                         if *failures >= MAX_CONSECUTIVE_SINK_FAILURES {
-                            self.disabled_sinks.insert(name);
+                            self.disabled_sinks_until
+                                .insert(name.clone(), Instant::now() + self.sink_failure_cooldown);
+                            eprintln!(
+                                "warning: disabling ExEx sink '{name}' after {MAX_CONSECUTIVE_SINK_FAILURES} consecutive failures"
+                            );
                             continue;
                         }
                         match err {
@@ -370,7 +422,7 @@ impl ExExManager {
 
     #[cfg(test)]
     fn is_sink_disabled(&self, name: &str) -> bool {
-        self.disabled_sinks.contains(name)
+        self.disabled_sinks_until.contains_key(name)
     }
 }
 
@@ -471,6 +523,26 @@ mod tests {
         }
     }
 
+    struct FlakySink {
+        remaining_failures: u32,
+        success_count: Arc<Mutex<u32>>,
+    }
+
+    impl NotificationSink for FlakySink {
+        fn on_notification(
+            &mut self,
+            _notification: Arc<StarknetExExNotification>,
+        ) -> Result<(), String> {
+            if self.remaining_failures > 0 {
+                self.remaining_failures -= 1;
+                return Err("flaky-failure".to_string());
+            }
+            let mut count = self.success_count.lock().expect("lock success count");
+            *count += 1;
+            Ok(())
+        }
+    }
+
     struct PanickingSink;
 
     impl NotificationSink for PanickingSink {
@@ -494,17 +566,25 @@ mod tests {
         }
     }
 
-    fn credentials() -> ExExCredentials {
+    fn token_for(name: &str) -> String {
+        format!("token-{name}")
+    }
+
+    fn credentials_for(names: &[&str]) -> ExExCredentials {
         ExExCredentials {
-            registration_token: "test-registration-token".to_string(),
+            exex_tokens: names
+                .iter()
+                .map(|name| ((*name).to_string(), token_for(name)))
+                .collect(),
         }
     }
 
     fn manager(max_capacity: usize, allowed_names: &[&str]) -> ExExManager {
         ExExManager::new(
             max_capacity,
-            credentials().registration_token.clone(),
-            allowed_names.iter().map(|name| name.to_string()),
+            allowed_names
+                .iter()
+                .map(|name| ((*name).to_string(), token_for(name))),
         )
     }
 
@@ -520,10 +600,11 @@ mod tests {
     fn rejects_dependency_cycles_at_registration() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut manager = manager(16, &["a", "b"]);
+        let creds = credentials_for(&["a", "b"]);
         let err = manager
             .register(
                 vec![reg("a", &["b"], log.clone()), reg("b", &["a"], log.clone())],
-                &credentials(),
+                &creds,
             )
             .expect_err("must fail");
 
@@ -538,7 +619,7 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut manager = manager(8, &["otel"]);
         let wrong = ExExCredentials {
-            registration_token: "wrong-token".to_string(),
+            exex_tokens: HashMap::from([("otel".to_string(), "wrong-token".to_string())]),
         };
         let err = manager
             .register(vec![reg("otel", &[], log)], &wrong)
@@ -547,11 +628,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_registration_when_credentials_missing_for_exex() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut manager = manager(8, &["otel"]);
+        let creds = ExExCredentials {
+            exex_tokens: HashMap::new(),
+        };
+        let err = manager
+            .register(vec![reg("otel", &[], log)], &creds)
+            .expect_err("must reject missing per-exex credential");
+        assert!(matches!(
+            err,
+            ManagerError::RegistrationCredentialsMissing { name } if name == "otel"
+        ));
+    }
+
+    #[test]
     fn rejects_registration_for_non_allowlisted_exex() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut manager = manager(8, &["otel"]);
+        let creds = credentials_for(&["btcfi"]);
         let err = manager
-            .register(vec![reg("btcfi", &[], log)], &credentials())
+            .register(vec![reg("btcfi", &[], log)], &creds)
             .expect_err("must reject non-allowlisted name");
         assert!(matches!(
             err,
@@ -562,6 +660,7 @@ mod tests {
     #[test]
     fn rejects_untrusted_exex_registrations() {
         let mut manager = manager(8, &["otel"]);
+        let creds = credentials_for(&["otel"]);
         let err = manager
             .register(
                 vec![ExExRegistration {
@@ -573,7 +672,7 @@ mod tests {
                     trust: SinkTrust::Untrusted,
                     sink: Box::new(PanickingSink),
                 }],
-                &credentials(),
+                &creds,
             )
             .expect_err("must reject untrusted sinks");
         assert!(matches!(
@@ -586,8 +685,9 @@ mod tests {
     fn enforces_notification_capacity() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut manager = manager(1, &["otel"]);
+        let creds = credentials_for(&["otel"]);
         manager
-            .register(vec![reg("otel", &[], log.clone())], &credentials())
+            .register(vec![reg("otel", &[], log.clone())], &creds)
             .expect("register");
 
         manager.enqueue(sample_notification()).expect("first");
@@ -601,6 +701,7 @@ mod tests {
     fn delivers_notifications_in_dependency_order() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut manager = manager(8, &["otel", "btcfi", "mcp"]);
+        let creds = credentials_for(&["otel", "btcfi", "mcp"]);
         manager
             .register(
                 vec![
@@ -608,7 +709,7 @@ mod tests {
                     reg("btcfi", &["otel"], log.clone()),
                     reg("mcp", &["btcfi"], log.clone()),
                 ],
-                &credentials(),
+                &creds,
             )
             .expect("register");
 
@@ -649,6 +750,7 @@ mod tests {
     fn delivers_tiers_in_parallel_with_barrier_between_tiers() {
         let timeline = Arc::new(Mutex::new(HashMap::<String, (Instant, Instant)>::new()));
         let mut manager = manager(8, &["tier1-a", "tier1-b", "tier2"]);
+        let creds = credentials_for(&["tier1-a", "tier1-b", "tier2"]);
         manager
             .register(
                 vec![
@@ -692,7 +794,7 @@ mod tests {
                         )),
                     },
                 ],
-                &credentials(),
+                &creds,
             )
             .expect("register");
 
@@ -714,6 +816,7 @@ mod tests {
     #[test]
     fn picks_failures_in_deterministic_tier_order() {
         let mut manager = manager(8, &["alpha", "zeta"]);
+        let creds = credentials_for(&["alpha", "zeta"]);
         manager
             .register(
                 vec![
@@ -742,7 +845,7 @@ mod tests {
                         }),
                     },
                 ],
-                &credentials(),
+                &creds,
             )
             .expect("register");
 
@@ -765,6 +868,7 @@ mod tests {
     #[test]
     fn retains_notification_in_buffer_when_delivery_fails() {
         let mut manager = manager(8, &["failing"]);
+        let creds = credentials_for(&["failing"]);
         manager
             .register(
                 vec![ExExRegistration {
@@ -779,7 +883,7 @@ mod tests {
                         delay: Duration::from_millis(1),
                     }),
                 }],
-                &credentials(),
+                &creds,
             )
             .expect("register");
         manager.enqueue(sample_notification()).expect("enqueue");
@@ -797,6 +901,7 @@ mod tests {
     fn disables_sink_after_repeated_failures_to_unblock_delivery() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut manager = manager(8, &["always-fail", "healthy"]);
+        let creds = credentials_for(&["always-fail", "healthy"]);
         manager
             .register(
                 vec![
@@ -814,7 +919,7 @@ mod tests {
                     },
                     reg("healthy", &[], log.clone()),
                 ],
-                &credentials(),
+                &creds,
             )
             .expect("register");
         manager.enqueue(sample_notification()).expect("enqueue");
@@ -843,11 +948,62 @@ mod tests {
     }
 
     #[test]
+    fn re_enables_sink_after_cooldown_and_successful_retry() {
+        let success_count = Arc::new(Mutex::new(0_u32));
+        let mut manager =
+            manager(8, &["flaky"]).with_sink_failure_cooldown_for_tests(Duration::from_millis(5));
+        let creds = credentials_for(&["flaky"]);
+        manager
+            .register(
+                vec![ExExRegistration {
+                    meta: ExExHandleMeta {
+                        name: "flaky".to_string(),
+                        depends_on: vec![],
+                        priority: 1,
+                    },
+                    trust: SinkTrust::TrustedInProcess,
+                    sink: Box::new(FlakySink {
+                        remaining_failures: 3,
+                        success_count: Arc::clone(&success_count),
+                    }),
+                }],
+                &creds,
+            )
+            .expect("register");
+
+        manager.enqueue(sample_notification()).expect("enqueue 1");
+        manager.drain_one().expect_err("failure 1");
+        manager.drain_one().expect_err("failure 2");
+        let third = manager
+            .drain_one()
+            .expect("third failure should disable sink");
+        assert_eq!(third, Some(1));
+        assert!(manager.is_sink_disabled("flaky"));
+
+        manager.enqueue(sample_notification()).expect("enqueue 2");
+        let fourth = manager
+            .drain_one()
+            .expect("disabled sink should allow progress");
+        assert_eq!(fourth, Some(2));
+        assert!(manager.is_sink_disabled("flaky"));
+
+        std::thread::sleep(Duration::from_millis(10));
+        manager.enqueue(sample_notification()).expect("enqueue 3");
+        let fifth = manager
+            .drain_one()
+            .expect("sink should recover after cooldown");
+        assert_eq!(fifth, Some(3));
+        assert!(!manager.is_sink_disabled("flaky"));
+        assert_eq!(*success_count.lock().expect("lock success count"), 1);
+    }
+
+    #[test]
     fn compacts_wal_after_successful_delivery() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut manager = manager(8, &["otel"]);
+        let creds = credentials_for(&["otel"]);
         manager
-            .register(vec![reg("otel", &[], log)], &credentials())
+            .register(vec![reg("otel", &[], log)], &creds)
             .expect("register");
         manager.enqueue(sample_notification()).expect("enqueue");
         assert_eq!(manager.wal().entries().len(), 1);
@@ -869,6 +1025,7 @@ mod tests {
         }
 
         let manager = Arc::new(Mutex::new(manager(1_024, &["noop"])));
+        let creds = credentials_for(&["noop"]);
         manager
             .lock()
             .expect("lock manager")
@@ -882,7 +1039,7 @@ mod tests {
                     trust: SinkTrust::TrustedInProcess,
                     sink: Box::new(NoopSink),
                 }],
-                &credentials(),
+                &creds,
             )
             .expect("register");
 
@@ -917,6 +1074,7 @@ mod tests {
     #[test]
     fn reports_panicking_sink_name_deterministically() {
         let mut manager = manager(8, &["panic-sink"]);
+        let creds = credentials_for(&["panic-sink"]);
         manager
             .register(
                 vec![ExExRegistration {
@@ -928,7 +1086,7 @@ mod tests {
                     trust: SinkTrust::TrustedInProcess,
                     sink: Box::new(PanickingSink),
                 }],
-                &credentials(),
+                &creds,
             )
             .expect("register");
 

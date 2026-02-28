@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,15 +16,74 @@ use starknet_types_core::felt::Felt;
 pub type BlockNumber = u64;
 pub type BlockHash = String;
 pub type StateRoot = String;
-pub type TxHash = String;
-pub type ClassHash = String;
-pub type ContractAddress = String;
 pub type StarknetFelt = Felt;
+
+macro_rules! felt_identifier {
+    ($name:ident) => {
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn parse(raw: impl AsRef<str>) -> Result<Self, IdentifierValidationError> {
+                let canonical = canonicalize_felt_hex(stringify!($name), raw.as_ref())?;
+                Ok(Self(canonical))
+            }
+
+            pub fn into_inner(self) -> String {
+                self.0
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl Deref for $name {
+            type Target = str;
+
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+
+        impl From<&str> for $name {
+            fn from(value: &str) -> Self {
+                Self(value.to_string())
+            }
+        }
+
+        impl From<String> for $name {
+            fn from(value: String) -> Self {
+                Self(value)
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+    };
+}
+
+felt_identifier!(TxHash);
+felt_identifier!(ClassHash);
+felt_identifier!(ContractAddress);
 
 pub const MAX_TRANSACTIONS_PER_BLOCK: usize = 100_000;
 pub const MAX_STORAGE_WRITES_PER_STATE_DIFF: usize = 500_000;
 pub const MAX_NONCE_UPDATES_PER_STATE_DIFF: usize = 100_000;
 pub const MAX_DECLARED_CLASSES_PER_STATE_DIFF: usize = 50_000;
+pub const MAX_REASONABLE_BLOCK_TIMESTAMP: u64 = 4_000_000_000;
 pub const MAX_CONTRACTS_IN_MEMORY_STATE: usize = 100_000;
 pub const MAX_STORAGE_SLOTS_PER_CONTRACT: usize = 1_000_000;
 pub const MAX_TOTAL_STORAGE_ENTRIES: usize = 10_000_000;
@@ -50,6 +111,17 @@ pub enum BlockValidationError {
         number: BlockNumber,
         field: &'static str,
         source: IdentifierValidationError,
+    },
+    #[error("invalid timestamp {timestamp} for block {number}: {reason}")]
+    InvalidTimestamp {
+        number: BlockNumber,
+        timestamp: u64,
+        reason: &'static str,
+    },
+    #[error("invalid zero gas price for {field} in block {number}")]
+    ZeroGasPrice {
+        number: BlockNumber,
+        field: &'static str,
     },
 }
 
@@ -86,6 +158,12 @@ pub enum StateLimitError {
     TooManyStorageEntries { count: usize, max: usize },
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum StateReadError {
+    #[error("state read backend failure: {0}")]
+    Backend(String),
+}
+
 #[cfg(feature = "blockifier-adapter")]
 pub type ExecutableStarknetTransaction = starknet_api::executable_transaction::Transaction;
 
@@ -109,21 +187,27 @@ pub struct StarknetTransaction {
     pub executable: Option<ExecutableStarknetTransaction>,
 }
 
-fn validate_hex_felt(field: &'static str, value: &str) -> Result<(), IdentifierValidationError> {
+fn canonicalize_felt_hex(
+    field: &'static str,
+    value: &str,
+) -> Result<String, IdentifierValidationError> {
     let normalized = value.trim();
     let prefixed = if normalized.starts_with("0x") || normalized.starts_with("0X") {
         normalized.to_string()
     } else {
         format!("0x{normalized}")
     };
-    StarknetFelt::from_str(&prefixed).map_err(|error| {
-        IdentifierValidationError::InvalidHexFelt {
+    StarknetFelt::from_str(&prefixed)
+        .map(|felt| format!("{:#x}", felt))
+        .map_err(|error| IdentifierValidationError::InvalidHexFelt {
             field,
             value: value.to_string(),
             error: error.to_string(),
-        }
-    })?;
-    Ok(())
+        })
+}
+
+fn validate_hex_felt(field: &'static str, value: &str) -> Result<(), IdentifierValidationError> {
+    canonicalize_felt_hex(field, value).map(|_| ())
 }
 
 impl StarknetTransaction {
@@ -136,7 +220,7 @@ impl StarknetTransaction {
     }
 
     pub fn validate_hash(&self) -> Result<(), IdentifierValidationError> {
-        validate_hex_felt("tx_hash", &self.hash)
+        validate_hex_felt("tx_hash", self.hash.as_ref())
     }
 
     #[cfg(feature = "blockifier-adapter")]
@@ -154,9 +238,9 @@ impl StarknetTransaction {
         executable: ExecutableStarknetTransaction,
     ) -> Result<Self, TransactionValidationError> {
         let hash = hash.into();
-        let declared = ExecutableFelt::from_str(&hash).map_err(|error| {
+        let declared = ExecutableFelt::from_str(hash.as_ref()).map_err(|error| {
             TransactionValidationError::InvalidHash {
-                hash: hash.clone(),
+                hash: hash.to_string(),
                 error: error.to_string(),
             }
         })?;
@@ -211,6 +295,14 @@ impl StarknetStateDiff {
                     source,
                 }
             })?;
+            for key in writes.keys() {
+                validate_hex_felt("storage_key", key).map_err(|source| {
+                    StateDiffValidationError::InvalidIdentifier {
+                        field: "storage_key",
+                        source,
+                    }
+                })?;
+            }
             total_storage_writes = total_storage_writes.checked_add(writes.len()).ok_or(
                 StateDiffValidationError::TooManyStorageWrites {
                     count: usize::MAX,
@@ -285,6 +377,32 @@ pub struct StarknetBlock {
 }
 
 impl StarknetBlock {
+    fn validate_non_zero_gas_prices(&self) -> Result<(), BlockValidationError> {
+        let checks = [
+            ("l1_gas.price_in_fri", self.gas_prices.l1_gas.price_in_fri),
+            ("l1_gas.price_in_wei", self.gas_prices.l1_gas.price_in_wei),
+            (
+                "l1_data_gas.price_in_fri",
+                self.gas_prices.l1_data_gas.price_in_fri,
+            ),
+            (
+                "l1_data_gas.price_in_wei",
+                self.gas_prices.l1_data_gas.price_in_wei,
+            ),
+            ("l2_gas.price_in_fri", self.gas_prices.l2_gas.price_in_fri),
+            ("l2_gas.price_in_wei", self.gas_prices.l2_gas.price_in_wei),
+        ];
+        for (field, value) in checks {
+            if value == 0 {
+                return Err(BlockValidationError::ZeroGasPrice {
+                    number: self.number,
+                    field,
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), BlockValidationError> {
         if self.transactions.len() > MAX_TRANSACTIONS_PER_BLOCK {
             return Err(BlockValidationError::TooManyTransactions {
@@ -293,6 +411,23 @@ impl StarknetBlock {
                 max: MAX_TRANSACTIONS_PER_BLOCK,
             });
         }
+
+        if self.timestamp == 0 {
+            return Err(BlockValidationError::InvalidTimestamp {
+                number: self.number,
+                timestamp: self.timestamp,
+                reason: "timestamp cannot be zero",
+            });
+        }
+        if self.timestamp > MAX_REASONABLE_BLOCK_TIMESTAMP {
+            return Err(BlockValidationError::InvalidTimestamp {
+                number: self.number,
+                timestamp: self.timestamp,
+                reason: "timestamp exceeds sane upper bound",
+            });
+        }
+
+        self.validate_non_zero_gas_prices()?;
 
         validate_hex_felt("parent_hash", &self.parent_hash).map_err(|source| {
             BlockValidationError::InvalidIdentifier {
@@ -308,13 +443,13 @@ impl StarknetBlock {
                 source,
             }
         })?;
-        validate_hex_felt("sequencer_address", &self.sequencer_address).map_err(|source| {
-            BlockValidationError::InvalidIdentifier {
+        validate_hex_felt("sequencer_address", self.sequencer_address.as_ref()).map_err(
+            |source| BlockValidationError::InvalidIdentifier {
                 number: self.number,
                 field: "sequencer_address",
                 source,
-            }
-        })?;
+            },
+        )?;
 
         for tx in &self.transactions {
             tx.validate_hash()
@@ -372,8 +507,12 @@ impl StarknetNodeTypes for StarknetMainnet {
 }
 
 pub trait StateReader: Send + Sync {
-    fn get_storage(&self, contract: &ContractAddress, key: &str) -> Option<StarknetFelt>;
-    fn nonce_of(&self, contract: &ContractAddress) -> Option<StarknetFelt>;
+    fn get_storage(
+        &self,
+        contract: &ContractAddress,
+        key: &str,
+    ) -> Result<Option<StarknetFelt>, StateReadError>;
+    fn nonce_of(&self, contract: &ContractAddress) -> Result<Option<StarknetFelt>, StateReadError>;
 }
 
 pub trait MutableState: StateReader {
@@ -408,7 +547,7 @@ impl InMemoryState {
             std::collections::BTreeSet::new();
 
         for (contract, writes) in &diff.storage_diffs {
-            let normalized_contract = normalize_felt_hex(contract);
+            let normalized_contract = ContractAddress::from(normalize_felt_hex(contract));
             if !self.storage.contains_key(&normalized_contract)
                 && !new_slots_by_contract.contains_key(&normalized_contract)
             {
@@ -472,23 +611,28 @@ impl InMemoryState {
 }
 
 impl StateReader for InMemoryState {
-    fn get_storage(&self, contract: &ContractAddress, key: &str) -> Option<StarknetFelt> {
-        let contract = normalize_felt_hex(contract);
+    fn get_storage(
+        &self,
+        contract: &ContractAddress,
+        key: &str,
+    ) -> Result<Option<StarknetFelt>, StateReadError> {
+        let contract = ContractAddress::from(normalize_felt_hex(contract));
         let key = normalize_felt_hex(key);
-        self.storage
+        Ok(self
+            .storage
             .get(&contract)
-            .and_then(|slots| slots.get(&key).copied())
+            .and_then(|slots| slots.get(&key).copied()))
     }
 
-    fn nonce_of(&self, contract: &ContractAddress) -> Option<StarknetFelt> {
-        let contract = normalize_felt_hex(contract);
-        self.nonces.get(&contract).copied()
+    fn nonce_of(&self, contract: &ContractAddress) -> Result<Option<StarknetFelt>, StateReadError> {
+        let contract = ContractAddress::from(normalize_felt_hex(contract));
+        Ok(self.nonces.get(&contract).copied())
     }
 }
 
 impl MutableState for InMemoryState {
     fn set_storage(&mut self, contract: ContractAddress, key: String, value: StarknetFelt) {
-        let contract = normalize_felt_hex(&contract);
+        let contract = ContractAddress::from(normalize_felt_hex(&contract));
         let key = normalize_felt_hex(&key);
         Arc::make_mut(&mut self.storage)
             .entry(contract)
@@ -497,7 +641,7 @@ impl MutableState for InMemoryState {
     }
 
     fn set_nonce(&mut self, contract: ContractAddress, nonce: StarknetFelt) {
-        let contract = normalize_felt_hex(&contract);
+        let contract = ContractAddress::from(normalize_felt_hex(&contract));
         Arc::make_mut(&mut self.nonces).insert(contract, nonce);
     }
 
@@ -544,21 +688,21 @@ mod tests {
         let mut state = InMemoryState::default();
         let mut diff = StarknetStateDiff::default();
         diff.storage_diffs
-            .entry("0xabc".to_string())
+            .entry(ContractAddress::from("0xabc"))
             .or_default()
-            .insert("balance".to_string(), StarknetFelt::from(7_u64));
+            .insert("0x2".to_string(), StarknetFelt::from(7_u64));
         diff.nonces
-            .insert("0xabc".to_string(), StarknetFelt::from(2_u64));
+            .insert(ContractAddress::from("0xabc"), StarknetFelt::from(2_u64));
 
         state.apply_state_diff(&diff).expect("valid state diff");
 
         assert_eq!(
-            state.get_storage(&"0xabc".to_string(), "balance"),
-            Some(StarknetFelt::from(7_u64))
+            state.get_storage(&ContractAddress::from("0xabc"), "0x2"),
+            Ok(Some(StarknetFelt::from(7_u64)))
         );
         assert_eq!(
-            state.nonce_of(&"0xabc".to_string()),
-            Some(StarknetFelt::from(2_u64))
+            state.nonce_of(&ContractAddress::from("0xabc")),
+            Ok(Some(StarknetFelt::from(2_u64)))
         );
     }
 
@@ -566,19 +710,19 @@ mod tests {
     fn normalizes_equivalent_hex_encodings_for_state_keys() {
         let mut state = InMemoryState::default();
         state.set_storage(
-            "0x01".to_string(),
+            ContractAddress::from("0x01"),
             "0x0002".to_string(),
             StarknetFelt::from(9_u64),
         );
-        state.set_nonce("0x0001".to_string(), StarknetFelt::from(3_u64));
+        state.set_nonce(ContractAddress::from("0x0001"), StarknetFelt::from(3_u64));
 
         assert_eq!(
-            state.get_storage(&"0x1".to_string(), "0x2"),
-            Some(StarknetFelt::from(9_u64))
+            state.get_storage(&ContractAddress::from("0x1"), "0x2"),
+            Ok(Some(StarknetFelt::from(9_u64)))
         );
         assert_eq!(
-            state.nonce_of(&"0x1".to_string()),
-            Some(StarknetFelt::from(3_u64))
+            state.nonce_of(&ContractAddress::from("0x1")),
+            Ok(Some(StarknetFelt::from(3_u64)))
         );
     }
 
@@ -586,18 +730,18 @@ mod tests {
     fn clone_shares_maps_until_first_mutation() {
         let mut state = InMemoryState::default();
         state.set_storage(
-            "0x1".to_string(),
+            ContractAddress::from("0x1"),
             "0x2".to_string(),
             StarknetFelt::from(9_u64),
         );
-        state.set_nonce("0x1".to_string(), StarknetFelt::from(3_u64));
+        state.set_nonce(ContractAddress::from("0x1"), StarknetFelt::from(3_u64));
 
         let snapshot = state.clone();
         assert_eq!(Arc::as_ptr(&state.storage), Arc::as_ptr(&snapshot.storage));
         assert_eq!(Arc::as_ptr(&state.nonces), Arc::as_ptr(&snapshot.nonces));
 
         state.set_storage(
-            "0x1".to_string(),
+            ContractAddress::from("0x1"),
             "0x3".to_string(),
             StarknetFelt::from(11_u64),
         );
@@ -616,7 +760,7 @@ mod tests {
             parent_hash: "0x0".to_string(),
             state_root: "0x1".to_string(),
             timestamp: 1_700_000_001,
-            sequencer_address: "0x1".to_string(),
+            sequencer_address: ContractAddress::from("0x1"),
             gas_prices: BlockGasPrices {
                 l1_gas: GasPricePerToken {
                     price_in_fri: 1,
@@ -647,9 +791,10 @@ mod tests {
         let mut diff = StarknetStateDiff::default();
         let mut writes = BTreeMap::new();
         for i in 0..(MAX_STORAGE_WRITES_PER_STATE_DIFF + 1) {
-            writes.insert(format!("k{i}"), StarknetFelt::from(i as u64));
+            writes.insert(format!("0x{:x}", i + 1), StarknetFelt::from(i as u64));
         }
-        diff.storage_diffs.insert("0x1".to_string(), writes);
+        diff.storage_diffs
+            .insert(ContractAddress::from("0x1"), writes);
 
         let err = diff
             .validate()
@@ -661,12 +806,104 @@ mod tests {
     }
 
     #[test]
+    fn rejects_state_diffs_with_invalid_storage_keys() {
+        let mut diff = StarknetStateDiff::default();
+        diff.storage_diffs
+            .entry(ContractAddress::from("0x1"))
+            .or_default()
+            .insert("not-a-felt".to_string(), StarknetFelt::from(1_u64));
+
+        let err = diff
+            .validate()
+            .expect_err("must reject invalid storage key");
+        assert!(matches!(
+            err,
+            StateDiffValidationError::InvalidIdentifier {
+                field: "storage_key",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn rejects_invalid_transaction_hashes() {
         let tx = StarknetTransaction::new("not-a-hash");
         let err = tx.validate_hash().expect_err("must reject invalid felt");
         assert!(matches!(
             err,
             IdentifierValidationError::InvalidHexFelt { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_blocks_with_zero_gas_prices() {
+        let block = StarknetBlock {
+            number: 1,
+            parent_hash: "0x0".to_string(),
+            state_root: "0x1".to_string(),
+            timestamp: 1_700_000_001,
+            sequencer_address: ContractAddress::from("0x1"),
+            gas_prices: BlockGasPrices {
+                l1_gas: GasPricePerToken {
+                    price_in_fri: 0,
+                    price_in_wei: 1,
+                },
+                l1_data_gas: GasPricePerToken {
+                    price_in_fri: 1,
+                    price_in_wei: 1,
+                },
+                l2_gas: GasPricePerToken {
+                    price_in_fri: 1,
+                    price_in_wei: 1,
+                },
+            },
+            protocol_version: Version::parse("0.14.2").expect("valid version"),
+            transactions: vec![StarknetTransaction::new("0x1")],
+        };
+
+        let err = block.validate().expect_err("must reject zero gas prices");
+        assert!(matches!(err, BlockValidationError::ZeroGasPrice { .. }));
+    }
+
+    #[test]
+    fn rejects_blocks_with_invalid_timestamps() {
+        let gas_prices = BlockGasPrices {
+            l1_gas: GasPricePerToken {
+                price_in_fri: 1,
+                price_in_wei: 1,
+            },
+            l1_data_gas: GasPricePerToken {
+                price_in_fri: 1,
+                price_in_wei: 1,
+            },
+            l2_gas: GasPricePerToken {
+                price_in_fri: 1,
+                price_in_wei: 1,
+            },
+        };
+
+        let zero = StarknetBlock {
+            number: 1,
+            parent_hash: "0x0".to_string(),
+            state_root: "0x1".to_string(),
+            timestamp: 0,
+            sequencer_address: ContractAddress::from("0x1"),
+            gas_prices,
+            protocol_version: Version::parse("0.14.2").expect("valid version"),
+            transactions: vec![StarknetTransaction::new("0x1")],
+        };
+        assert!(matches!(
+            zero.validate().expect_err("zero timestamp must fail"),
+            BlockValidationError::InvalidTimestamp { .. }
+        ));
+
+        let future = StarknetBlock {
+            timestamp: MAX_REASONABLE_BLOCK_TIMESTAMP + 1,
+            ..zero
+        };
+        assert!(matches!(
+            future.validate().expect_err("future timestamp must fail"),
+            BlockValidationError::InvalidTimestamp { .. }
         ));
     }
 

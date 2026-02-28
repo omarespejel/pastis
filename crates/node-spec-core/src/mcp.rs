@@ -51,6 +51,7 @@ impl McpTool {
 pub struct ValidationLimits {
     pub max_batch_size: usize,
     pub max_depth: usize,
+    pub max_total_tools: usize,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -59,6 +60,11 @@ pub enum ValidationError {
     BatchDepthExceeded { depth: usize, max_depth: usize },
     #[error("batch query size {size} exceeds max size {max_batch_size}")]
     BatchSizeExceeded { size: usize, max_batch_size: usize },
+    #[error("batch query total tool count {count} exceeds max total {max_total_tools}")]
+    BatchTotalToolsExceeded {
+        count: usize,
+        max_total_tools: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,14 +84,21 @@ impl AgentPolicy {
     ) -> Self {
         let mut api_key_salt = [0_u8; 16];
         OsRng.fill_bytes(&mut api_key_salt);
-        let (api_key_kdf, api_key_hash) =
-            match hash_api_key_argon2id(api_key.as_ref(), &api_key_salt) {
-                Ok(hash) => (ApiKeyKdf::Argon2id, hash),
-                Err(_) => (
+        let (api_key_kdf, api_key_hash) = match hash_api_key_argon2id(
+            api_key.as_ref(),
+            &api_key_salt,
+        ) {
+            Ok(hash) => (ApiKeyKdf::Argon2id, hash),
+            Err(error) => {
+                eprintln!(
+                    "warning: argon2id api-key derivation failed; using legacy PBKDF2 fallback: {error}"
+                );
+                (
                     ApiKeyKdf::LegacyPbkdf2Sha256,
                     hash_api_key_legacy_pbkdf2(api_key.as_ref(), &api_key_salt),
-                ),
-            };
+                )
+            }
+        };
         Self {
             api_key_salt,
             api_key_hash,
@@ -109,10 +122,10 @@ impl AgentPolicy {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AccessError {
-    #[error("unknown agent '{agent_id}'")]
-    UnknownAgent { agent_id: String },
-    #[error("invalid api key for agent '{agent_id}'")]
-    InvalidApiKey { agent_id: String },
+    #[error("invalid api key")]
+    InvalidApiKey,
+    #[error("api key maps to multiple agents: {matching_agents:?}")]
+    AmbiguousApiKey { matching_agents: Vec<String> },
     #[error("agent '{agent_id}' lacks permission '{permission:?}'")]
     PermissionDenied {
         agent_id: String,
@@ -127,6 +140,15 @@ pub enum AccessError {
     NonMonotonicTime { agent_id: String },
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PolicyValidationError {
+    #[error("duplicate api key salt detected between '{first_agent}' and '{second_agent}'")]
+    DuplicateApiKeySalt {
+        first_agent: String,
+        second_agent: String,
+    },
+}
+
 #[derive(Debug, Default)]
 pub struct McpAccessController {
     policies: BTreeMap<String, AgentPolicy>,
@@ -136,54 +158,85 @@ pub struct McpAccessController {
 
 impl McpAccessController {
     pub fn new(policies: impl IntoIterator<Item = (String, AgentPolicy)>) -> Self {
-        Self {
-            policies: policies.into_iter().collect(),
+        Self::try_new(policies).expect("mcp policy construction must reject duplicate api salts")
+    }
+
+    pub fn try_new(
+        policies: impl IntoIterator<Item = (String, AgentPolicy)>,
+    ) -> Result<Self, PolicyValidationError> {
+        let mut salts: BTreeMap<[u8; 16], String> = BTreeMap::new();
+        let mut policy_map = BTreeMap::new();
+        for (agent_id, policy) in policies {
+            if let Some(first_agent) = salts.get(&policy.api_key_salt) {
+                return Err(PolicyValidationError::DuplicateApiKeySalt {
+                    first_agent: first_agent.clone(),
+                    second_agent: agent_id,
+                });
+            }
+            salts.insert(policy.api_key_salt, agent_id.clone());
+            policy_map.insert(agent_id, policy);
+        }
+        Ok(Self {
+            policies: policy_map,
             requests: BTreeMap::new(),
             latest_request_time: BTreeMap::new(),
+        })
+    }
+
+    fn resolve_agent_id_for_api_key(&self, api_key: &str) -> Result<String, AccessError> {
+        let mut matching_agents: Vec<String> = self
+            .policies
+            .iter()
+            .filter_map(|(agent_id, policy)| {
+                if policy.verify_api_key(api_key) {
+                    Some(agent_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        matching_agents.sort();
+        match matching_agents.len() {
+            0 => Err(AccessError::InvalidApiKey),
+            1 => Ok(matching_agents.remove(0)),
+            _ => Err(AccessError::AmbiguousApiKey { matching_agents }),
         }
     }
 
     pub fn authorize(
         &mut self,
-        agent_id: &str,
         api_key: &str,
         tool: &McpTool,
         now_unix_seconds: u64,
-    ) -> Result<(), AccessError> {
+    ) -> Result<String, AccessError> {
+        let agent_id = self.resolve_agent_id_for_api_key(api_key)?;
         let policy = self
             .policies
-            .get(agent_id)
-            .ok_or_else(|| AccessError::UnknownAgent {
-                agent_id: agent_id.to_string(),
-            })?;
-        if !policy.verify_api_key(api_key) {
-            return Err(AccessError::InvalidApiKey {
-                agent_id: agent_id.to_string(),
-            });
-        }
+            .get(&agent_id)
+            .ok_or(AccessError::InvalidApiKey)?;
 
         let mut required = BTreeSet::new();
         tool.collect_required_permissions(&mut required);
         for permission in required {
             if !policy.permissions.contains(&permission) {
                 return Err(AccessError::PermissionDenied {
-                    agent_id: agent_id.to_string(),
+                    agent_id: agent_id.clone(),
                     permission,
                 });
             }
         }
 
-        if let Some(latest_seen) = self.latest_request_time.get(agent_id)
+        if let Some(latest_seen) = self.latest_request_time.get(&agent_id)
             && now_unix_seconds < *latest_seen
         {
             return Err(AccessError::NonMonotonicTime {
-                agent_id: agent_id.to_string(),
+                agent_id: agent_id.clone(),
             });
         }
         self.latest_request_time
-            .insert(agent_id.to_string(), now_unix_seconds);
+            .insert(agent_id.clone(), now_unix_seconds);
 
-        let requests = self.requests.entry(agent_id.to_string()).or_default();
+        let requests = self.requests.entry(agent_id.clone()).or_default();
         while let Some(ts) = requests.front() {
             if now_unix_seconds.saturating_sub(*ts) < 60 {
                 break;
@@ -193,12 +246,12 @@ impl McpAccessController {
 
         if requests.len() as u32 >= policy.max_requests_per_minute {
             return Err(AccessError::RateLimited {
-                agent_id: agent_id.to_string(),
+                agent_id: agent_id.clone(),
                 limit_per_minute: policy.max_requests_per_minute,
             });
         }
         requests.push_back(now_unix_seconds);
-        Ok(())
+        Ok(agent_id)
     }
 }
 
@@ -223,14 +276,21 @@ fn hash_api_key_legacy_pbkdf2(api_key: &str, salt: &[u8; 16]) -> [u8; 32] {
 }
 
 pub fn validate_tool(tool: &McpTool, limits: ValidationLimits) -> Result<(), ValidationError> {
-    validate_tool_inner(tool, limits, 0)
+    let total = validate_tool_inner(tool, limits, 0)?;
+    if total > limits.max_total_tools {
+        return Err(ValidationError::BatchTotalToolsExceeded {
+            count: total,
+            max_total_tools: limits.max_total_tools,
+        });
+    }
+    Ok(())
 }
 
 fn validate_tool_inner(
     tool: &McpTool,
     limits: ValidationLimits,
     depth: usize,
-) -> Result<(), ValidationError> {
+) -> Result<usize, ValidationError> {
     match tool {
         McpTool::BatchQuery { queries } => {
             let batch_depth = depth + 1;
@@ -246,12 +306,20 @@ fn validate_tool_inner(
                     max_batch_size: limits.max_batch_size,
                 });
             }
+            let mut total = 1usize;
             for query in queries {
-                validate_tool_inner(query, limits, batch_depth)?;
+                let nested = validate_tool_inner(query, limits, batch_depth)?;
+                total = total.saturating_add(nested);
+                if total > limits.max_total_tools {
+                    return Err(ValidationError::BatchTotalToolsExceeded {
+                        count: total,
+                        max_total_tools: limits.max_total_tools,
+                    });
+                }
             }
-            Ok(())
+            Ok(total)
         }
-        McpTool::QueryState | McpTool::GetNodeStatus => Ok(()),
+        McpTool::QueryState | McpTool::GetNodeStatus => Ok(1),
     }
 }
 
@@ -270,6 +338,7 @@ mod tests {
             ValidationLimits {
                 max_batch_size: 10,
                 max_depth: 1,
+                max_total_tools: 10,
             },
         )
         .expect("valid");
@@ -288,6 +357,7 @@ mod tests {
             ValidationLimits {
                 max_batch_size: 10,
                 max_depth: 1,
+                max_total_tools: 10,
             },
         )
         .expect_err("must fail");
@@ -316,6 +386,7 @@ mod tests {
             ValidationLimits {
                 max_batch_size: 2,
                 max_depth: 1,
+                max_total_tools: 10,
             },
         )
         .expect_err("must fail");
@@ -329,6 +400,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn enforces_total_tool_count_across_nested_batches() {
+        let nested = McpTool::BatchQuery {
+            queries: vec![
+                McpTool::BatchQuery {
+                    queries: vec![
+                        McpTool::QueryState,
+                        McpTool::GetNodeStatus,
+                        McpTool::QueryState,
+                    ],
+                },
+                McpTool::BatchQuery {
+                    queries: vec![
+                        McpTool::GetNodeStatus,
+                        McpTool::QueryState,
+                        McpTool::GetNodeStatus,
+                    ],
+                },
+            ],
+        };
+
+        let err = validate_tool(
+            &nested,
+            ValidationLimits {
+                max_batch_size: 10,
+                max_depth: 3,
+                max_total_tools: 5,
+            },
+        )
+        .expect_err("must fail");
+        assert!(matches!(
+            err,
+            ValidationError::BatchTotalToolsExceeded {
+                max_total_tools: 5,
+                ..
+            }
+        ));
+    }
+
     fn read_only_policy(limit: u32) -> AgentPolicy {
         AgentPolicy::new(
             "secret",
@@ -338,23 +448,60 @@ mod tests {
     }
 
     #[test]
+    fn rejects_duplicate_policy_salts_in_controller_config() {
+        let first = read_only_policy(1);
+        let duplicate = AgentPolicy {
+            api_key_salt: first.api_key_salt,
+            api_key_hash: first.api_key_hash,
+            api_key_kdf: first.api_key_kdf,
+            permissions: first.permissions.clone(),
+            max_requests_per_minute: first.max_requests_per_minute,
+        };
+        let err = McpAccessController::try_new([
+            ("agent-a".to_string(), first),
+            ("agent-b".to_string(), duplicate),
+        ])
+        .expect_err("must fail");
+        assert_eq!(
+            err,
+            PolicyValidationError::DuplicateApiKeySalt {
+                first_agent: "agent-a".to_string(),
+                second_agent: "agent-b".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn authorizes_valid_agent_with_permission_and_rate_budget() {
         let mut access = McpAccessController::new([("agent-a".to_string(), read_only_policy(2))]);
-        access
-            .authorize("agent-a", "secret", &McpTool::QueryState, 1_000)
+        let resolved = access
+            .authorize("secret", &McpTool::QueryState, 1_000)
             .expect("authorized");
+        assert_eq!(resolved, "agent-a");
     }
 
     #[test]
     fn rejects_invalid_api_key() {
         let mut access = McpAccessController::new([("agent-a".to_string(), read_only_policy(2))]);
         let err = access
-            .authorize("agent-a", "wrong-key", &McpTool::QueryState, 1_000)
+            .authorize("wrong-key", &McpTool::QueryState, 1_000)
             .expect_err("must reject");
+        assert_eq!(err, AccessError::InvalidApiKey);
+    }
+
+    #[test]
+    fn rejects_ambiguous_api_keys_shared_across_agents() {
+        let mut access = McpAccessController::new([
+            ("agent-a".to_string(), read_only_policy(2)),
+            ("agent-b".to_string(), read_only_policy(2)),
+        ]);
+        let err = access
+            .authorize("secret", &McpTool::QueryState, 1_000)
+            .expect_err("must reject ambiguous credential identity");
         assert_eq!(
             err,
-            AccessError::InvalidApiKey {
-                agent_id: "agent-a".to_string(),
+            AccessError::AmbiguousApiKey {
+                matching_agents: vec!["agent-a".to_string(), "agent-b".to_string()],
             }
         );
     }
@@ -366,7 +513,7 @@ mod tests {
             queries: vec![McpTool::QueryState, McpTool::GetNodeStatus],
         };
         let err = access
-            .authorize("agent-a", "secret", &tool, 1_000)
+            .authorize("secret", &tool, 1_000)
             .expect_err("must reject");
         assert_eq!(
             err,
@@ -381,13 +528,13 @@ mod tests {
     fn enforces_per_agent_rate_limits() {
         let mut access = McpAccessController::new([("agent-a".to_string(), read_only_policy(2))]);
         access
-            .authorize("agent-a", "secret", &McpTool::QueryState, 1_000)
+            .authorize("secret", &McpTool::QueryState, 1_000)
             .expect("first");
         access
-            .authorize("agent-a", "secret", &McpTool::QueryState, 1_010)
+            .authorize("secret", &McpTool::QueryState, 1_010)
             .expect("second");
         let err = access
-            .authorize("agent-a", "secret", &McpTool::QueryState, 1_020)
+            .authorize("secret", &McpTool::QueryState, 1_020)
             .expect_err("must rate-limit");
         assert_eq!(
             err,
@@ -398,7 +545,7 @@ mod tests {
         );
 
         access
-            .authorize("agent-a", "secret", &McpTool::QueryState, 1_061)
+            .authorize("secret", &McpTool::QueryState, 1_061)
             .expect("window advanced");
     }
 
@@ -406,10 +553,10 @@ mod tests {
     fn rejects_non_monotonic_request_times() {
         let mut access = McpAccessController::new([("agent-a".to_string(), read_only_policy(2))]);
         access
-            .authorize("agent-a", "secret", &McpTool::QueryState, 1_000)
+            .authorize("secret", &McpTool::QueryState, 1_000)
             .expect("first");
         let err = access
-            .authorize("agent-a", "secret", &McpTool::QueryState, 999)
+            .authorize("secret", &McpTool::QueryState, 999)
             .expect_err("must reject backwards time");
         assert_eq!(
             err,
@@ -423,10 +570,10 @@ mod tests {
     fn allows_requests_with_same_timestamp() {
         let mut access = McpAccessController::new([("agent-a".to_string(), read_only_policy(3))]);
         access
-            .authorize("agent-a", "secret", &McpTool::QueryState, 1_000)
+            .authorize("secret", &McpTool::QueryState, 1_000)
             .expect("first");
         access
-            .authorize("agent-a", "secret", &McpTool::QueryState, 1_000)
+            .authorize("secret", &McpTool::QueryState, 1_000)
             .expect("same timestamp should be accepted");
     }
 

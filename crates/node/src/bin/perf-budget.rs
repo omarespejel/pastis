@@ -13,9 +13,9 @@ use starknet_node_execution::{
     DualExecutionBackend, ExecutionBackend, ExecutionError, ExecutionMode, MismatchPolicy,
 };
 use starknet_node_types::{
-    BlockContext, BlockGasPrices, BuiltinStats, ExecutionOutput, GasPricePerToken, InMemoryState,
-    MutableState, SimulationResult, StarknetBlock, StarknetReceipt, StarknetStateDiff,
-    StarknetTransaction, StateReader,
+    BlockContext, BlockGasPrices, BuiltinStats, ContractAddress, ExecutionOutput, GasPricePerToken,
+    InMemoryState, MutableState, SimulationResult, StarknetBlock, StarknetReceipt,
+    StarknetStateDiff, StarknetTransaction, StateReader,
 };
 
 const DEFAULT_ITERATIONS: usize = 5_000;
@@ -126,7 +126,7 @@ impl ExecutionBackend for NoopBackend {
                     .transactions
                     .first()
                     .map(|tx| tx.hash.clone())
-                    .unwrap_or_else(|| "0x0".to_string()),
+                    .unwrap_or_else(|| "0x0".into()),
                 execution_status: true,
                 events: 0,
                 gas_consumed: 1,
@@ -161,7 +161,7 @@ fn sample_block(number: u64) -> StarknetBlock {
         parent_hash: format!("0x{:x}", number.saturating_sub(1)),
         state_root: format!("0x{number:x}"),
         timestamp: 1_700_000_000 + number,
-        sequencer_address: "0x1".to_string(),
+        sequencer_address: ContractAddress::from("0x1"),
         gas_prices: BlockGasPrices {
             l1_gas: GasPricePerToken {
                 price_in_fri: 2,
@@ -249,6 +249,7 @@ fn run_mcp_validation_benchmark(iterations: usize) -> Result<MetricResult, Strin
     let limits = ValidationLimits {
         max_batch_size: 32,
         max_depth: 1,
+        max_total_tools: 64,
     };
 
     let mut samples_us = Vec::with_capacity(iterations);

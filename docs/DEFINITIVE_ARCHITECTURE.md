@@ -92,7 +92,8 @@ ExEx manager uses bounded buffering, persistence, and backpressure semantics.
 
 Enforcement note:
 - `unsafe` prohibition is compile-time enforced in first-party crates.
-- ExEx read-only behavior is enforced by API surface (`Arc` payloads, no mutable consensus handles), not by process sandboxing. Deployments should still isolate untrusted ExEx code at the process/container boundary.
+- In-process ExEx execution is explicitly `trusted-only`; untrusted ExEx registrations are rejected by policy.
+- Untrusted third-party logic must run out-of-process (WASM or process/container isolation) and interact through authenticated MCP/notification surfaces.
 
 ## 6. Hardening Clauses (P1/P2 Gaps Closed)
 
@@ -127,9 +128,8 @@ This allows rolling upgrades without bricking old WAL segments.
 ### 6.3 Protocol Version Negotiation
 
 Execution must select versioned constants from bundled protocol constants:
-- Exact match first.
-- If exact missing, allow fallback only to highest known patch in the same major.minor line.
-- Fail closed on unknown major/minor.
+- Exact match only.
+- Missing patch/minor/major versions fail closed.
 
 This prevents silent semantic mismatches during protocol transitions.
 
@@ -176,7 +176,7 @@ Targets are enforced by repeatable measurement rather than aspiration:
 The repository currently includes core and phase-aligned scaffolding crates that codify and test the hardening clauses:
 - WAL versioned notification decoding with legacy fallback
 - Dependency-aware ExEx delivery planning with cycle/unknown checks
-- Protocol constants resolver with exact-match-first and same-line patch fallback (`major.minor`), fail-closed on unknown protocol lines
+- Protocol constants resolver with exact-match fail-closed semantics (no patch fallback)
 - L1 finality gating and unfinalized reorg invalidation
 - MCP batch recursion/size validation
 - MCP access control hardened with Argon2id API-key derivation (legacy PBKDF2 fallback only on derivation failure)
@@ -185,7 +185,7 @@ The repository currently includes core and phase-aligned scaffolding crates that
 - Storage backend behavior (sequential inserts, block snapshots, deterministic state roots)
 - Dual execution mismatch handling with canonical-state safety
 - Blockifier adapter fail-fast guard for account transactions when class-provider integration is unavailable
-- ExEx registration hardening: credentialed registration token, allowlisted ExEx identities, and trusted in-process sink enforcement
+- ExEx registration hardening: per-ExEx credentials, allowlisted identities, trusted in-process sink enforcement, and sink recovery cooldown/re-enable
 - Node config hardening with validated `ChainId` parsing (mainnet/sepolia/custom strict format)
 - Type-state node builder enforcing storage-before-execution composition
 - ExEx manager behavior (registration DAG validation, bounded queue, WAL replay compatibility)

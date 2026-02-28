@@ -217,6 +217,8 @@ impl DualExecutionBackend {
             return Ok(true);
         }
 
+        // `verification_depth` counts blocks including the tip.
+        // depth=1 verifies only tip; depth=2 verifies tip and tip-1.
         let window = verification_depth.saturating_sub(1);
         let window_start = tip.saturating_sub(window);
         Ok(block_number >= window_start)
@@ -340,8 +342,13 @@ impl DualExecutionBackend {
                 })?;
 
                 let outputs_match = fast_output.receipts == canonical_output.receipts
-                    && fast_output.state_diff == canonical_output.state_diff
-                    && fast_output.builtin_stats == canonical_output.builtin_stats;
+                    && fast_output.state_diff == canonical_output.state_diff;
+                if fast_output.builtin_stats != canonical_output.builtin_stats {
+                    eprintln!(
+                        "warning: dual verification observed differing builtin stats at block {}",
+                        block.number
+                    );
+                }
                 if outputs_match {
                     self.store_shadow(fast_state)?;
                     return Ok(canonical_output);
@@ -431,17 +438,9 @@ impl BlockifierProtocolVersionResolver {
         &self,
         requested: &Version,
     ) -> Result<BlockifierProtocolVersion, ExecutionError> {
-        if let Some(exact) = self.versions.get(requested).copied() {
-            return Ok(exact);
-        }
-
         self.versions
-            .iter()
-            .filter(|(version, _)| {
-                version.major == requested.major && version.minor == requested.minor
-            })
-            .max_by(|(left, _), (right, _)| left.cmp(right))
-            .map(|(_, protocol)| *protocol)
+            .get(requested)
+            .copied()
             .ok_or_else(|| ExecutionError::MissingConstants(requested.clone()))
     }
 }
@@ -520,14 +519,74 @@ fn map_block_gas_prices(prices: &BlockGasPrices) -> Result<BlockifierGasPrices, 
 type SharedStateSnapshot = Arc<Mutex<Box<dyn MutableState>>>;
 
 #[cfg(feature = "blockifier-adapter")]
+pub trait BlockifierClassProvider: Send + Sync {
+    fn supports_account_execution(&self) -> bool {
+        false
+    }
+
+    fn get_class_hash_at(
+        &self,
+        contract_address: BlockifierContractAddress,
+    ) -> Result<BlockifierClassHash, StateError>;
+
+    fn get_compiled_class(
+        &self,
+        class_hash: BlockifierClassHash,
+    ) -> Result<RunnableCompiledClass, StateError>;
+
+    fn get_compiled_class_hash(
+        &self,
+        class_hash: BlockifierClassHash,
+    ) -> Result<BlockifierCompiledClassHash, StateError>;
+}
+
+#[cfg(feature = "blockifier-adapter")]
+#[derive(Default)]
+struct UnsupportedBlockifierClassProvider;
+
+#[cfg(feature = "blockifier-adapter")]
+impl BlockifierClassProvider for UnsupportedBlockifierClassProvider {
+    fn get_class_hash_at(
+        &self,
+        _contract_address: BlockifierContractAddress,
+    ) -> Result<BlockifierClassHash, StateError> {
+        Err(StateError::StateReadError(
+            "class hash lookup requires a configured BlockifierClassProvider".to_string(),
+        ))
+    }
+
+    fn get_compiled_class(
+        &self,
+        _class_hash: BlockifierClassHash,
+    ) -> Result<RunnableCompiledClass, StateError> {
+        Err(StateError::StateReadError(
+            "compiled class lookup requires a configured BlockifierClassProvider".to_string(),
+        ))
+    }
+
+    fn get_compiled_class_hash(
+        &self,
+        _class_hash: BlockifierClassHash,
+    ) -> Result<BlockifierCompiledClassHash, StateError> {
+        Err(StateError::StateReadError(
+            "compiled class hash lookup requires a configured BlockifierClassProvider".to_string(),
+        ))
+    }
+}
+
+#[cfg(feature = "blockifier-adapter")]
 struct BlockifierStateReaderAdapter {
     state: SharedStateSnapshot,
+    class_provider: Arc<dyn BlockifierClassProvider>,
 }
 
 #[cfg(feature = "blockifier-adapter")]
 impl BlockifierStateReaderAdapter {
-    fn new(state: SharedStateSnapshot) -> Self {
-        Self { state }
+    fn new(state: SharedStateSnapshot, class_provider: Arc<dyn BlockifierClassProvider>) -> Self {
+        Self {
+            state,
+            class_provider,
+        }
     }
 }
 
@@ -544,11 +603,10 @@ impl BlockifierStateReader for BlockifierStateReaderAdapter {
             .map_err(|_| StateError::StateReadError("state snapshot mutex poisoned".to_string()))?;
         let contract_felt: BlockifierFelt = contract_address.into();
         let key_felt: BlockifierFelt = key.into();
+        let contract = starknet_node_types::ContractAddress::from(format!("{:#x}", contract_felt));
         let value = state
-            .get_storage(
-                &format!("{:#x}", contract_felt),
-                &format!("{:#x}", key_felt),
-            )
+            .get_storage(&contract, &format!("{:#x}", key_felt))
+            .map_err(|error| StateError::StateReadError(error.to_string()))?
             .unwrap_or_default();
         node_felt_to_blockifier(value, "state.storage")
     }
@@ -562,8 +620,10 @@ impl BlockifierStateReader for BlockifierStateReaderAdapter {
             .lock()
             .map_err(|_| StateError::StateReadError("state snapshot mutex poisoned".to_string()))?;
         let contract_felt: BlockifierFelt = contract_address.into();
+        let contract = starknet_node_types::ContractAddress::from(format!("{:#x}", contract_felt));
         let nonce = state
-            .nonce_of(&format!("{:#x}", contract_felt))
+            .nonce_of(&contract)
+            .map_err(|error| StateError::StateReadError(error.to_string()))?
             .unwrap_or_default();
         Ok(BlockifierNonce(node_felt_to_blockifier(
             nonce,
@@ -573,41 +633,39 @@ impl BlockifierStateReader for BlockifierStateReaderAdapter {
 
     fn get_class_hash_at(
         &self,
-        _contract_address: BlockifierContractAddress,
+        contract_address: BlockifierContractAddress,
     ) -> Result<BlockifierClassHash, StateError> {
-        Err(StateError::StateReadError(
-            "class hash lookup unsupported by generic MutableState adapter".to_string(),
-        ))
+        self.class_provider.get_class_hash_at(contract_address)
     }
 
     fn get_compiled_class(
         &self,
-        _class_hash: BlockifierClassHash,
+        class_hash: BlockifierClassHash,
     ) -> Result<RunnableCompiledClass, StateError> {
-        Err(StateError::StateReadError(
-            "compiled class lookup unsupported by generic MutableState adapter".to_string(),
-        ))
+        self.class_provider.get_compiled_class(class_hash)
     }
 
     fn get_compiled_class_hash(
         &self,
-        _class_hash: BlockifierClassHash,
+        class_hash: BlockifierClassHash,
     ) -> Result<BlockifierCompiledClassHash, StateError> {
-        Err(StateError::StateReadError(
-            "compiled class hash lookup unsupported by generic MutableState adapter".to_string(),
-        ))
+        self.class_provider.get_compiled_class_hash(class_hash)
     }
 }
 
 #[cfg(feature = "blockifier-adapter")]
 struct BlockifierReadOnlyStateAdapter<'a> {
     state: &'a dyn StateReader,
+    class_provider: Arc<dyn BlockifierClassProvider>,
 }
 
 #[cfg(feature = "blockifier-adapter")]
 impl<'a> BlockifierReadOnlyStateAdapter<'a> {
-    fn new(state: &'a dyn StateReader) -> Self {
-        Self { state }
+    fn new(state: &'a dyn StateReader, class_provider: Arc<dyn BlockifierClassProvider>) -> Self {
+        Self {
+            state,
+            class_provider,
+        }
     }
 }
 
@@ -620,12 +678,11 @@ impl BlockifierStateReader for BlockifierReadOnlyStateAdapter<'_> {
     ) -> Result<BlockifierFelt, StateError> {
         let contract_felt: BlockifierFelt = contract_address.into();
         let key_felt: BlockifierFelt = key.into();
+        let contract = starknet_node_types::ContractAddress::from(format!("{:#x}", contract_felt));
         let value = self
             .state
-            .get_storage(
-                &format!("{:#x}", contract_felt),
-                &format!("{:#x}", key_felt),
-            )
+            .get_storage(&contract, &format!("{:#x}", key_felt))
+            .map_err(|error| StateError::StateReadError(error.to_string()))?
             .unwrap_or_default();
         node_felt_to_blockifier(value, "state.storage")
     }
@@ -635,9 +692,11 @@ impl BlockifierStateReader for BlockifierReadOnlyStateAdapter<'_> {
         contract_address: BlockifierContractAddress,
     ) -> Result<BlockifierNonce, StateError> {
         let contract_felt: BlockifierFelt = contract_address.into();
+        let contract = starknet_node_types::ContractAddress::from(format!("{:#x}", contract_felt));
         let nonce = self
             .state
-            .nonce_of(&format!("{:#x}", contract_felt))
+            .nonce_of(&contract)
+            .map_err(|error| StateError::StateReadError(error.to_string()))?
             .unwrap_or_default();
         Ok(BlockifierNonce(node_felt_to_blockifier(
             nonce,
@@ -647,29 +706,23 @@ impl BlockifierStateReader for BlockifierReadOnlyStateAdapter<'_> {
 
     fn get_class_hash_at(
         &self,
-        _contract_address: BlockifierContractAddress,
+        contract_address: BlockifierContractAddress,
     ) -> Result<BlockifierClassHash, StateError> {
-        Err(StateError::StateReadError(
-            "class hash lookup unsupported by generic StateReader adapter".to_string(),
-        ))
+        self.class_provider.get_class_hash_at(contract_address)
     }
 
     fn get_compiled_class(
         &self,
-        _class_hash: BlockifierClassHash,
+        class_hash: BlockifierClassHash,
     ) -> Result<RunnableCompiledClass, StateError> {
-        Err(StateError::StateReadError(
-            "compiled class lookup unsupported by generic StateReader adapter".to_string(),
-        ))
+        self.class_provider.get_compiled_class(class_hash)
     }
 
     fn get_compiled_class_hash(
         &self,
-        _class_hash: BlockifierClassHash,
+        class_hash: BlockifierClassHash,
     ) -> Result<BlockifierCompiledClassHash, StateError> {
-        Err(StateError::StateReadError(
-            "compiled class hash lookup unsupported by generic StateReader adapter".to_string(),
-        ))
+        self.class_provider.get_compiled_class_hash(class_hash)
     }
 }
 
@@ -708,6 +761,7 @@ pub struct BlockifierVmBackend {
     chain_info: BlockifierChainInfo,
     executor_config: TransactionExecutorConfig,
     tx_resolver: Arc<dyn ExecutableTransactionResolver>,
+    class_provider: Arc<dyn BlockifierClassProvider>,
     execution_timeout: StdDuration,
     last_executed_block: Mutex<Option<u64>>,
     state_snapshot: Mutex<Option<SharedStateSnapshot>>,
@@ -725,6 +779,7 @@ impl BlockifierVmBackend {
             chain_info,
             executor_config,
             tx_resolver: Arc::new(EmbeddedExecutablePayloadResolver),
+            class_provider: Arc::new(UnsupportedBlockifierClassProvider),
             execution_timeout: StdDuration::from_secs(30),
             last_executed_block: Mutex::new(None),
             state_snapshot: Mutex::new(None),
@@ -733,6 +788,11 @@ impl BlockifierVmBackend {
 
     pub fn with_tx_resolver(mut self, tx_resolver: Arc<dyn ExecutableTransactionResolver>) -> Self {
         self.tx_resolver = tx_resolver;
+        self
+    }
+
+    pub fn with_class_provider(mut self, class_provider: Arc<dyn BlockifierClassProvider>) -> Self {
+        self.class_provider = class_provider;
         self
     }
 
@@ -855,9 +915,12 @@ impl BlockifierVmBackend {
             }
             ExecutableStarknetTransaction::L1Handler(_) => {}
             ExecutableStarknetTransaction::Account(account_tx) => {
+                if self.class_provider.supports_account_execution() {
+                    return Ok(BlockifierTransaction::new_for_sequencing(executable));
+                }
                 return Err(ExecutionError::Backend(format!(
                     "unsupported executable transaction type {:?} for tx {} in block {}: \
-                     class-provider integration is required for account transactions",
+                     class-provider integration is required and currently unavailable",
                     account_tx.tx_type(),
                     tx.hash,
                     block_number
@@ -980,7 +1043,10 @@ impl ExecutionBackend for BlockifierVmBackend {
         let snapshot = self.snapshot_for_execution(state)?;
         let result: Result<ExecutionOutput, ExecutionError> = (|| {
             let mut executor = TransactionExecutor::pre_process_and_create(
-                BlockifierStateReaderAdapter::new(Arc::clone(&snapshot)),
+                BlockifierStateReaderAdapter::new(
+                    Arc::clone(&snapshot),
+                    Arc::clone(&self.class_provider),
+                ),
                 block_context,
                 (block.number >= 10).then_some(BlockifierBlockHashAndNumber {
                     hash: BlockifierBlockHash::default(),
@@ -1036,7 +1102,8 @@ impl ExecutionBackend for BlockifierVmBackend {
             let mut state_diff = starknet_node_types::StarknetStateDiff::default();
             for (address, writes) in summary.state_diff.storage_updates {
                 let contract_felt: BlockifierFelt = address.into();
-                let contract = format!("{:#x}", contract_felt);
+                let contract =
+                    starknet_node_types::ContractAddress::from(format!("{:#x}", contract_felt));
                 let contract_writes = state_diff.storage_diffs.entry(contract).or_default();
                 for (key, value) in writes {
                     let key_felt: BlockifierFelt = key.into();
@@ -1049,14 +1116,14 @@ impl ExecutionBackend for BlockifierVmBackend {
             for (address, nonce) in summary.state_diff.address_to_nonce {
                 let contract_felt: BlockifierFelt = address.into();
                 state_diff.nonces.insert(
-                    format!("{:#x}", contract_felt),
+                    format!("{:#x}", contract_felt).into(),
                     blockifier_felt_to_node_felt(nonce.0, "state_diff.nonces")?,
                 );
             }
             for class_hash in summary.state_diff.class_hash_to_compiled_class_hash.keys() {
                 state_diff
                     .declared_classes
-                    .push(format!("{:#x}", class_hash.0));
+                    .push(format!("{:#x}", class_hash.0).into());
             }
             state_diff.validate().map_err(|error| {
                 ExecutionError::Backend(format!("invalid blockifier state diff output: {error}"))
@@ -1100,7 +1167,7 @@ impl ExecutionBackend for BlockifierVmBackend {
         let blockifier_context = self.build_simulation_context(block_context)?;
         let mapped_tx = self.map_transaction_for_block(block_context.block_number, tx)?;
         let mut executor = TransactionExecutor::pre_process_and_create(
-            BlockifierReadOnlyStateAdapter::new(state),
+            BlockifierReadOnlyStateAdapter::new(state, Arc::clone(&self.class_provider)),
             blockifier_context,
             (block_context.block_number >= 10).then_some(BlockifierBlockHashAndNumber {
                 hash: BlockifierBlockHash::default(),
@@ -1152,9 +1219,9 @@ mod tests {
 
     use semver::Version;
     use starknet_node_types::{
-        BlockGasPrices, BuiltinStats, ExecutionOutput, GasPricePerToken, InMemoryState,
-        MutableState, SimulationResult, StarknetBlock, StarknetFelt, StarknetReceipt,
-        StarknetStateDiff, StarknetTransaction, StateReader,
+        BlockGasPrices, BuiltinStats, ContractAddress, ExecutionOutput, GasPricePerToken,
+        InMemoryState, MutableState, SimulationResult, StarknetBlock, StarknetFelt,
+        StarknetReceipt, StarknetStateDiff, StarknetTransaction, StateReader,
     };
 
     use super::*;
@@ -1221,7 +1288,7 @@ mod tests {
             _block: &StarknetBlock,
             state: &mut dyn MutableState,
         ) -> Result<ExecutionOutput, ExecutionError> {
-            state.set_storage("0x1".to_string(), "slot".to_string(), self.value);
+            state.set_storage(ContractAddress::from("0x1"), "0x2".to_string(), self.value);
             Ok(output(self.gas))
         }
 
@@ -1259,21 +1326,28 @@ mod tests {
     }
 
     impl StateReader for CountingCloneState {
-        fn get_storage(&self, contract: &String, key: &str) -> Option<StarknetFelt> {
+        fn get_storage(
+            &self,
+            contract: &ContractAddress,
+            key: &str,
+        ) -> Result<Option<StarknetFelt>, starknet_node_types::StateReadError> {
             self.inner.get_storage(contract, key)
         }
 
-        fn nonce_of(&self, contract: &String) -> Option<StarknetFelt> {
+        fn nonce_of(
+            &self,
+            contract: &ContractAddress,
+        ) -> Result<Option<StarknetFelt>, starknet_node_types::StateReadError> {
             self.inner.nonce_of(contract)
         }
     }
 
     impl MutableState for CountingCloneState {
-        fn set_storage(&mut self, contract: String, key: String, value: StarknetFelt) {
+        fn set_storage(&mut self, contract: ContractAddress, key: String, value: StarknetFelt) {
             self.inner.set_storage(contract, key, value);
         }
 
-        fn set_nonce(&mut self, contract: String, nonce: StarknetFelt) {
+        fn set_nonce(&mut self, contract: ContractAddress, nonce: StarknetFelt) {
             self.inner.set_nonce(contract, nonce);
         }
 
@@ -1306,7 +1380,7 @@ mod tests {
             parent_hash: format!("0x{:x}", number.saturating_sub(1)),
             state_root: format!("0x{number:x}"),
             timestamp: 1_700_000_000 + number,
-            sequencer_address: "0x1".to_string(),
+            sequencer_address: ContractAddress::from("0x1"),
             gas_prices: sample_gas_prices(),
             protocol_version: Version::parse(version).expect("valid version"),
             transactions: vec![StarknetTransaction::new(format!("0x{number:x}"))],
@@ -1328,7 +1402,7 @@ mod tests {
             parent_hash: format!("0x{:x}", number.saturating_sub(1)),
             state_root: format!("0x{number:x}"),
             timestamp: 1_700_000_000 + number,
-            sequencer_address: "0x1".to_string(),
+            sequencer_address: ContractAddress::from("0x1"),
             gas_prices: sample_gas_prices(),
             protocol_version: Version::parse(version).expect("valid version"),
             transactions: Vec::new(),
@@ -1338,7 +1412,7 @@ mod tests {
     fn output(gas: u64) -> ExecutionOutput {
         ExecutionOutput {
             receipts: vec![StarknetReceipt {
-                tx_hash: format!("0x{gas:x}"),
+                tx_hash: format!("0x{gas:x}").into(),
                 execution_status: true,
                 events: gas,
                 gas_consumed: gas,
@@ -1504,6 +1578,8 @@ mod tests {
         let mut canonical_output = output(7);
         fast_output.execution_time = Duration::from_millis(1);
         canonical_output.execution_time = Duration::from_millis(25);
+        fast_output.builtin_stats.pedersen = 1;
+        canonical_output.builtin_stats.pedersen = 9;
 
         let fast = ScriptedBackend::new("fast", BTreeMap::from([(1, fast_output)]), output(1));
         let canonical = ScriptedBackend::new(
@@ -1525,6 +1601,40 @@ mod tests {
             .execute_verified(&block(1, "0.14.2"), &mut state)
             .expect("semantic equality should pass");
         assert_eq!(result.receipts[0].gas_consumed, 7);
+    }
+
+    #[test]
+    fn verification_depth_one_only_verifies_tip_block() {
+        let fast = ScriptedBackend::new(
+            "fast",
+            BTreeMap::from([(99, output(3)), (100, output(4))]),
+            output(1),
+        );
+        let canonical = ScriptedBackend::new(
+            "canonical",
+            BTreeMap::from([(99, output(30)), (100, output(40))]),
+            output(10),
+        );
+        let backend = DualExecutionBackend::new(
+            Some(Box::new(fast)),
+            Box::new(canonical),
+            ExecutionMode::DualWithVerification {
+                verification_depth: 1,
+            },
+            MismatchPolicy::WarnAndFallback,
+        );
+        backend.set_verification_tip(100).expect("set tip");
+
+        let mut state = InMemoryState::default();
+        let older = backend
+            .execute_verified(&block(99, "0.14.2"), &mut state)
+            .expect("older than tip should skip canonical verification");
+        let tip = backend
+            .execute_verified(&block(100, "0.14.2"), &mut state)
+            .expect("tip should be canonically verified");
+
+        assert_eq!(older.receipts[0].gas_consumed, 3);
+        assert_eq!(tip.receipts[0].gas_consumed, 40);
     }
 
     #[test]
@@ -1625,8 +1735,8 @@ mod tests {
             .expect("fallback");
         assert_eq!(result.receipts[0].gas_consumed, 7);
         assert_eq!(
-            state.get_storage(&"0x1".to_string(), "slot"),
-            Some(StarknetFelt::from(999_u64))
+            state.get_storage(&ContractAddress::from("0x1"), "0x2"),
+            Ok(Some(StarknetFelt::from(999_u64)))
         );
     }
 
@@ -1724,7 +1834,7 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_highest_patch_for_protocol_constants_with_same_minor() {
+    fn rejects_missing_patch_for_protocol_constants_with_same_minor() {
         let selector = ProtocolVersionSelector::new([
             (
                 Version::parse("0.14.0").expect("valid"),
@@ -1740,10 +1850,13 @@ mod tests {
             ),
         ]);
 
-        let selected = selector
+        let err = selector
             .constants_for_block(&block(100, "0.14.3"))
-            .expect("fallback for same major.minor");
-        assert_eq!(selected.id, "v14_2");
+            .expect_err("must fail closed on missing patch constants");
+        assert_eq!(
+            err,
+            ExecutionError::MissingConstants(Version::parse("0.14.3").expect("valid"))
+        );
     }
 
     #[test]
@@ -1766,12 +1879,15 @@ mod tests {
 
     #[cfg(feature = "blockifier-adapter")]
     #[test]
-    fn blockifier_protocol_resolver_falls_back_to_highest_known_patch() {
+    fn blockifier_protocol_resolver_rejects_missing_patch_version() {
         let resolver = BlockifierProtocolVersionResolver::starknet_mainnet_defaults();
-        let resolved = resolver
+        let err = resolver
             .resolve_for_block(&Version::parse("0.14.3").expect("valid"))
-            .expect("must fallback to known highest patch");
-        assert_eq!(resolved.to_string(), "0.14.2");
+            .expect_err("must fail closed for missing patch");
+        assert_eq!(
+            err,
+            ExecutionError::MissingConstants(Version::parse("0.14.3").expect("valid"))
+        );
     }
 
     #[cfg(feature = "blockifier-adapter")]
@@ -1872,7 +1988,7 @@ mod tests {
             parent_hash: "0xb".to_string(),
             state_root: "0xc".to_string(),
             timestamp: 1_700_000_012,
-            sequencer_address: "0x1".to_string(),
+            sequencer_address: ContractAddress::from("0x1"),
             gas_prices: sample_gas_prices(),
             protocol_version: Version::parse("0.14.2").expect("valid version"),
             transactions: vec![executable_account_invoke_tx("0x123")],
@@ -1899,7 +2015,7 @@ mod tests {
             parent_hash: "0xb".to_string(),
             state_root: "0xc".to_string(),
             timestamp: 1_700_000_012,
-            sequencer_address: "0x1".to_string(),
+            sequencer_address: ContractAddress::from("0x1"),
             gas_prices: sample_gas_prices(),
             protocol_version: Version::parse("0.14.2").expect("valid version"),
             transactions: vec![executable_l1_handler_tx("0xabc")],
@@ -1909,7 +2025,7 @@ mod tests {
             .execute_block(&block, &mut state)
             .expect("execute non-empty block");
         assert_eq!(output.receipts.len(), 1);
-        assert_eq!(output.receipts[0].tx_hash, "0xabc");
+        assert_eq!(output.receipts[0].tx_hash, "0xabc".into());
         assert!(!output.receipts[0].execution_status);
     }
 
@@ -1940,7 +2056,7 @@ mod tests {
         let simulation = backend
             .simulate_tx(&tx, &state, &context(12, "0.14.2"))
             .expect("simulate tx");
-        assert_eq!(simulation.receipt.tx_hash, "0xabc");
+        assert_eq!(simulation.receipt.tx_hash, "0xabc".into());
         assert_eq!(
             simulation.estimated_fee,
             u128::from(simulation.receipt.gas_consumed)
@@ -1949,15 +2065,18 @@ mod tests {
 
     #[cfg(feature = "blockifier-adapter")]
     #[test]
-    fn blockifier_backend_simulate_tx_falls_back_on_same_minor_patch() {
+    fn blockifier_backend_simulate_tx_fails_closed_on_missing_patch_constants() {
         let backend = BlockifierVmBackend::starknet_mainnet();
         let state = InMemoryState::default();
         let tx = executable_l1_handler_tx("0xabc");
 
-        let simulation = backend
+        let err = backend
             .simulate_tx(&tx, &state, &context(12, "0.14.3"))
-            .expect("fallback to highest known 0.14.x constants");
-        assert_eq!(simulation.receipt.tx_hash, "0xabc");
+            .expect_err("must fail closed on missing patch constants");
+        assert_eq!(
+            err,
+            ExecutionError::MissingConstants(Version::parse("0.14.3").expect("valid version"))
+        );
     }
 
     #[cfg(feature = "blockifier-adapter")]

@@ -26,15 +26,56 @@ pub enum NotificationDecodeError {
     EntryTooLarge { size: usize, max: usize },
     #[error("failed to decode WAL entry: {0}")]
     Decode(String),
+    #[error("decoded notification field '{field}' value {value} exceeds max {max}")]
+    ContentLimitExceeded {
+        field: &'static str,
+        value: u64,
+        max: u64,
+    },
 }
 
 const LEGACY_V1_ENTRY_SIZE_BYTES: usize = core::mem::size_of::<u64>() * 2;
 const MAX_NOTIFICATION_ENTRY_BYTES: usize = 1024 * 1024;
+const MAX_NOTIFICATION_TX_COUNT: u64 = 1_000_000;
+const MAX_NOTIFICATION_EVENT_COUNT: u64 = 10_000_000;
 
 fn wal_bincode_options() -> impl Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .reject_trailing_bytes()
+}
+
+fn validate_notification_content(
+    notification: &StarknetExExNotification,
+) -> Result<(), NotificationDecodeError> {
+    match notification {
+        StarknetExExNotification::V1(v1) => {
+            if v1.tx_count > MAX_NOTIFICATION_TX_COUNT {
+                return Err(NotificationDecodeError::ContentLimitExceeded {
+                    field: "tx_count",
+                    value: v1.tx_count,
+                    max: MAX_NOTIFICATION_TX_COUNT,
+                });
+            }
+        }
+        StarknetExExNotification::V2(v2) => {
+            if v2.tx_count > MAX_NOTIFICATION_TX_COUNT {
+                return Err(NotificationDecodeError::ContentLimitExceeded {
+                    field: "tx_count",
+                    value: v2.tx_count,
+                    max: MAX_NOTIFICATION_TX_COUNT,
+                });
+            }
+            if v2.event_count > MAX_NOTIFICATION_EVENT_COUNT {
+                return Err(NotificationDecodeError::ContentLimitExceeded {
+                    field: "event_count",
+                    value: v2.event_count,
+                    max: MAX_NOTIFICATION_EVENT_COUNT,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn decode_wal_entry(bytes: &[u8]) -> Result<StarknetExExNotification, NotificationDecodeError> {
@@ -46,15 +87,22 @@ pub fn decode_wal_entry(bytes: &[u8]) -> Result<StarknetExExNotification, Notifi
     }
 
     match wal_bincode_options().deserialize::<StarknetExExNotification>(bytes) {
-        Ok(notification) => Ok(notification),
-        Err(enum_error) if bytes.len() == LEGACY_V1_ENTRY_SIZE_BYTES => wal_bincode_options()
-            .deserialize::<NotificationV1>(bytes)
-            .map(StarknetExExNotification::V1)
-            .map_err(|legacy_error| {
-                NotificationDecodeError::Decode(format!(
-                    "enum decode error: {enum_error}; legacy decode error: {legacy_error}"
-                ))
-            }),
+        Ok(notification) => {
+            validate_notification_content(&notification)?;
+            Ok(notification)
+        }
+        Err(enum_error) if bytes.len() == LEGACY_V1_ENTRY_SIZE_BYTES => {
+            let notification = wal_bincode_options()
+                .deserialize::<NotificationV1>(bytes)
+                .map(StarknetExExNotification::V1)
+                .map_err(|legacy_error| {
+                    NotificationDecodeError::Decode(format!(
+                        "enum decode error: {enum_error}; legacy decode error: {legacy_error}"
+                    ))
+                })?;
+            validate_notification_content(&notification)?;
+            Ok(notification)
+        }
         Err(enum_error) => Err(NotificationDecodeError::Decode(format!(
             "enum decode error: {enum_error}"
         ))),
@@ -128,6 +176,27 @@ mod tests {
             NotificationDecodeError::EntryTooLarge {
                 size: MAX_NOTIFICATION_ENTRY_BYTES + 1,
                 max: MAX_NOTIFICATION_ENTRY_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_decoded_entries_that_exceed_content_limits() {
+        let encoded = wal_bincode_options()
+            .serialize(&StarknetExExNotification::V2(NotificationV2 {
+                block_number: 42,
+                tx_count: MAX_NOTIFICATION_TX_COUNT + 1,
+                event_count: 9,
+            }))
+            .expect("serialize v2");
+
+        let err = decode_wal_entry(&encoded).expect_err("must fail");
+        assert_eq!(
+            err,
+            NotificationDecodeError::ContentLimitExceeded {
+                field: "tx_count",
+                value: MAX_NOTIFICATION_TX_COUNT + 1,
+                max: MAX_NOTIFICATION_TX_COUNT,
             }
         );
     }

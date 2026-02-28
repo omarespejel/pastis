@@ -52,12 +52,25 @@ Planned integrations with `starknet-agentic`, `starkclaw`, and `SISNA` are treat
 - Authentication and authorization:
   - Every MCP request must authenticate with an agent-scoped key.
   - Tool access is permission-gated per agent policy and rate limited.
+  - Agent identity is derived from credential verification, not caller-provided IDs.
 - Input validation:
   - All batch MCP requests are bounded by maximum depth and maximum size.
+  - Total flattened tool count across nested batches is bounded.
   - Unknown tools, malformed payloads, and non-monotonic control-plane timestamps are rejected.
 - Operational isolation:
-  - ExExes are logically isolated by bounded queues and sink circuit breakers.
-  - Any third-party agent process should run in a separate container/process boundary with least-privilege credentials.
+  - In-process ExEx execution is trusted-only and requires per-ExEx credentials.
+  - ExExes are logically isolated by bounded queues, circuit breakers, and cooldown-based sink recovery.
+  - Third-party/untrusted agent logic must run out-of-process (container/process/WASM boundary) with least-privilege credentials.
+
+## Chain ID Policy
+
+`NodeConfig.chain_id` accepts:
+
+- `SN_MAIN`
+- `SN_SEPOLIA`
+- custom IDs with strict format `SN_[A-Z0-9_]+`
+
+Custom IDs are intentionally supported for private networks/appchains and test environments.
 
 ## Architecture Narrative
 

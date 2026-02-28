@@ -29,26 +29,11 @@ impl VersionedConstantsResolver {
         &self,
         requested: &Version,
     ) -> Result<&VersionedConstants, VersionResolutionError> {
-        if let Some(constants) = self.bundled.get(requested) {
-            return Ok(constants);
-        }
-
-        if let Some(fallback_version) = self
-            .bundled
-            .keys()
-            .filter(|version| version.major == requested.major && version.minor == requested.minor)
-            .max()
-        {
-            return self.bundled.get(fallback_version).ok_or_else(|| {
-                VersionResolutionError::Missing {
-                    requested: requested.clone(),
-                }
-            });
-        }
-
-        Err(VersionResolutionError::Missing {
-            requested: requested.clone(),
-        })
+        self.bundled
+            .get(requested)
+            .ok_or_else(|| VersionResolutionError::Missing {
+                requested: requested.clone(),
+            })
     }
 }
 
@@ -90,7 +75,7 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_highest_known_patch_with_same_minor() {
+    fn rejects_missing_patch_version_in_same_minor() {
         let resolver = VersionedConstantsResolver::new([
             (
                 v("0.14.0"),
@@ -106,10 +91,15 @@ mod tests {
             ),
         ]);
 
-        let selected = resolver
+        let err = resolver
             .resolve_for_protocol(&v("0.14.3"))
-            .expect("must fallback to same major.minor");
-        assert_eq!(selected.id, "v14_2");
+            .expect_err("must fail closed for missing patch");
+        assert_eq!(
+            err,
+            VersionResolutionError::Missing {
+                requested: v("0.14.3"),
+            }
+        );
     }
 
     #[test]

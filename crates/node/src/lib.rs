@@ -26,6 +26,8 @@ pub enum ChainIdError {
 }
 
 impl ChainId {
+    /// Parses canonical Starknet public chain IDs and strict-format custom IDs.
+    /// Custom IDs are intentionally supported for private networks/appchains.
     pub fn parse(raw: impl Into<String>) -> Result<Self, ChainIdError> {
         let raw = raw.into();
         if raw.is_empty() {
@@ -275,7 +277,7 @@ mod tests {
         ) -> Result<ExecutionOutput, ExecutionError> {
             Ok(ExecutionOutput {
                 receipts: vec![StarknetReceipt {
-                    tx_hash: format!("0x{:x}", block.number),
+                    tx_hash: format!("0x{:x}", block.number).into(),
                     execution_status: true,
                     events: 0,
                     gas_consumed: 1,
@@ -395,7 +397,7 @@ mod tests {
             self.0.latest_block_number()
         }
 
-        fn current_state_root(&self) -> String {
+        fn current_state_root(&self) -> Result<String, StorageError> {
             self.0.current_state_root()
         }
     }
@@ -432,7 +434,7 @@ mod tests {
             parent_hash: "0x0".to_string(),
             state_root: state_root.to_string(),
             timestamp: 0,
-            sequencer_address: "0x1".to_string(),
+            sequencer_address: "0x1".into(),
             gas_prices: BlockGasPrices {
                 l1_gas: GasPricePerToken {
                     price_in_fri: 1,
@@ -502,7 +504,7 @@ mod tests {
             self.inner.latest_block_number()
         }
 
-        fn current_state_root(&self) -> String {
+        fn current_state_root(&self) -> Result<String, StorageError> {
             self.inner.current_state_root()
         }
     }
@@ -567,8 +569,8 @@ mod tests {
             Ok(1)
         }
 
-        fn current_state_root(&self) -> String {
-            "0x0".to_string()
+        fn current_state_root(&self) -> Result<String, StorageError> {
+            Ok("0x0".to_string())
         }
     }
 

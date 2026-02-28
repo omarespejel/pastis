@@ -28,9 +28,13 @@ use starknet_api::state::ThinStateDiff as ApolloThinStateDiff;
 use starknet_api::state::{StateNumber as ApolloStateNumber, StorageKey as ApolloStorageKey};
 
 #[cfg(feature = "apollo-adapter")]
+use starknet_node_types::ContractAddress;
+#[cfg(feature = "apollo-adapter")]
 use starknet_node_types::StarknetFelt;
 #[cfg(feature = "apollo-adapter")]
 use starknet_node_types::StarknetTransaction;
+#[cfg(feature = "apollo-adapter")]
+use starknet_node_types::StateReadError;
 #[cfg(feature = "apollo-adapter")]
 use starknet_node_types::{BlockGasPrices, GasPricePerToken};
 use starknet_node_types::{
@@ -48,6 +52,14 @@ pub enum StorageError {
     BlockOutOfRange {
         requested: BlockNumber,
         latest: BlockNumber,
+    },
+    #[error(
+        "block {block} timestamp {timestamp} is earlier than parent timestamp {parent_timestamp}"
+    )]
+    NonMonotonicTimestamp {
+        block: BlockNumber,
+        timestamp: u64,
+        parent_timestamp: u64,
     },
     #[error("operation not supported by backend: {0}")]
     UnsupportedOperation(&'static str),
@@ -77,6 +89,8 @@ pub enum CheckpointError {
     StateRootMismatch { expected: String, actual: String },
     #[error("checkpoint verification requires canonical state roots from backend '{backend}'")]
     UnsupportedStateRootSemantics { backend: String },
+    #[error("failed to read canonical state root from backend: {error}")]
+    StateRootReadFailed { error: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,8 +100,9 @@ pub enum StateRootSemantics {
 }
 
 pub trait StorageBackend: Send + Sync + HealthCheck {
-    /// Implementations expose mutable methods via `&mut self`.
-    /// For multi-threaded access, wrap backends in `ThreadSafeStorage`.
+    /// Implementations expose mutating methods via `&mut self`.
+    /// For shared concurrent access, callers should only expose `ThreadSafeStorage`
+    /// to avoid leaking unsynchronized backend instances.
     fn get_state_reader(
         &self,
         block_number: BlockNumber,
@@ -104,7 +119,7 @@ pub trait StorageBackend: Send + Sync + HealthCheck {
         block_number: BlockNumber,
     ) -> Result<Option<StarknetStateDiff>, StorageError>;
     fn latest_block_number(&self) -> Result<BlockNumber, StorageError>;
-    fn current_state_root(&self) -> String;
+    fn current_state_root(&self) -> Result<String, StorageError>;
     fn state_root_semantics(&self) -> StateRootSemantics {
         StateRootSemantics::Canonical
     }
@@ -208,11 +223,12 @@ impl<S: StorageBackend> StorageBackend for ThreadSafeStorage<S> {
         guard.latest_block_number()
     }
 
-    fn current_state_root(&self) -> String {
-        self.inner
+    fn current_state_root(&self) -> Result<String, StorageError> {
+        let guard = self
+            .inner
             .read()
-            .map(|guard| guard.current_state_root())
-            .unwrap_or_else(|_| "0x0".to_string())
+            .map_err(|_| StorageError::UnsupportedOperation("thread-safe storage lock poisoned"))?;
+        guard.current_state_root()
     }
 
     fn state_root_semantics(&self) -> StateRootSemantics {
@@ -321,6 +337,15 @@ impl StorageBackend for InMemoryStorage {
         next_state
             .apply_state_diff(&state_diff)
             .map_err(|error| StorageError::StateLimitExceeded(error.to_string()))?;
+        if let Some(parent_block) = self.blocks.get(&parent)
+            && block.timestamp < parent_block.timestamp
+        {
+            return Err(StorageError::NonMonotonicTimestamp {
+                block: block.number,
+                timestamp: block.timestamp,
+                parent_timestamp: parent_block.timestamp,
+            });
+        }
 
         self.blocks.insert(block.number, block);
         self.state_diffs.insert(expected, state_diff);
@@ -351,10 +376,10 @@ impl StorageBackend for InMemoryStorage {
         Ok(self.blocks.keys().next_back().copied().unwrap_or(0))
     }
 
-    fn current_state_root(&self) -> String {
+    fn current_state_root(&self) -> Result<String, StorageError> {
         // In-memory backend does not maintain Starknet's Patricia tries. Returning a sentinel
         // prevents accidental treatment of this value as a consensus state commitment.
-        "0x0".to_string()
+        Ok("0x0".to_string())
     }
 
     fn state_root_semantics(&self) -> StateRootSemantics {
@@ -374,7 +399,12 @@ impl CheckpointSyncVerifier {
                 backend: storage.detailed_status().name,
             });
         }
-        let actual = storage.current_state_root();
+        let actual =
+            storage
+                .current_state_root()
+                .map_err(|error| CheckpointError::StateRootReadFailed {
+                    error: error.to_string(),
+                })?;
         if actual == expected_root {
             return Ok(());
         }
@@ -394,25 +424,51 @@ struct ApolloStateReaderAdapter {
 
 #[cfg(feature = "apollo-adapter")]
 impl StateReader for ApolloStateReaderAdapter {
-    fn get_storage(&self, contract: &String, key: &str) -> Option<StarknetFelt> {
-        let contract = parse_contract_address(contract)?;
-        let key = parse_storage_key(key)?;
-        let txn = self.reader.begin_ro_txn().ok()?;
-        let state_reader = txn.get_state_reader().ok()?;
+    fn get_storage(
+        &self,
+        contract: &ContractAddress,
+        key: &str,
+    ) -> Result<Option<StarknetFelt>, StateReadError> {
+        let contract = parse_contract_address(contract.as_ref()).ok_or_else(|| {
+            StateReadError::Backend(format!("invalid contract address '{contract}'"))
+        })?;
+        let key = parse_storage_key(key)
+            .ok_or_else(|| StateReadError::Backend(format!("invalid storage key '{key}'")))?;
+        let txn = self
+            .reader
+            .begin_ro_txn()
+            .map_err(|error| StateReadError::Backend(error.to_string()))?;
+        let state_reader = txn
+            .get_state_reader()
+            .map_err(|error| StateReadError::Backend(error.to_string()))?;
         let value = state_reader
             .get_storage_at(self.state_number, &contract, &key)
-            .ok()?;
-        apollo_felt_to_node_felt(value).ok()
+            .map_err(|error| StateReadError::Backend(error.to_string()))?;
+        apollo_felt_to_node_felt(value)
+            .map(Some)
+            .map_err(|error| StateReadError::Backend(error.to_string()))
     }
 
-    fn nonce_of(&self, contract: &String) -> Option<StarknetFelt> {
-        let contract = parse_contract_address(contract)?;
-        let txn = self.reader.begin_ro_txn().ok()?;
-        let state_reader = txn.get_state_reader().ok()?;
-        let nonce: ApolloNonce = state_reader
+    fn nonce_of(&self, contract: &ContractAddress) -> Result<Option<StarknetFelt>, StateReadError> {
+        let contract = parse_contract_address(contract.as_ref()).ok_or_else(|| {
+            StateReadError::Backend(format!("invalid contract address '{contract}'"))
+        })?;
+        let txn = self
+            .reader
+            .begin_ro_txn()
+            .map_err(|error| StateReadError::Backend(error.to_string()))?;
+        let state_reader = txn
+            .get_state_reader()
+            .map_err(|error| StateReadError::Backend(error.to_string()))?;
+        let nonce: Option<ApolloNonce> = state_reader
             .get_nonce_at(self.state_number, &contract)
-            .ok()??;
-        apollo_felt_to_node_felt(nonce.0).ok()
+            .map_err(|error| StateReadError::Backend(error.to_string()))?;
+        nonce
+            .map(|nonce| {
+                apollo_felt_to_node_felt(nonce.0)
+                    .map_err(|error| StateReadError::Backend(error.to_string()))
+            })
+            .transpose()
     }
 }
 
@@ -496,7 +552,7 @@ fn apollo_felt_to_node_felt(value: ApolloFelt) -> Result<StarknetFelt, StorageEr
 fn map_thin_state_diff(diff: ApolloThinStateDiff) -> Result<StarknetStateDiff, StorageError> {
     let mut mapped = StarknetStateDiff::default();
     for (address, writes) in diff.storage_diffs {
-        let contract = format!("{:#x}", address.0.key());
+        let contract = ContractAddress::from(format!("{:#x}", address.0.key()));
         let mapped_writes = mapped.storage_diffs.entry(contract).or_default();
         for (key, value) in writes {
             mapped_writes.insert(
@@ -507,15 +563,19 @@ fn map_thin_state_diff(diff: ApolloThinStateDiff) -> Result<StarknetStateDiff, S
     }
     for (address, nonce) in diff.nonces {
         mapped.nonces.insert(
-            format!("{:#x}", address.0.key()),
+            format!("{:#x}", address.0.key()).into(),
             apollo_felt_to_node_felt(nonce.0)?,
         );
     }
     for class_hash in diff.class_hash_to_compiled_class_hash.keys() {
-        mapped.declared_classes.push(format!("{:#x}", class_hash.0));
+        mapped
+            .declared_classes
+            .push(format!("{:#x}", class_hash.0).into());
     }
     for class_hash in &diff.deprecated_declared_classes {
-        mapped.declared_classes.push(format!("{:#x}", class_hash.0));
+        mapped
+            .declared_classes
+            .push(format!("{:#x}", class_hash.0).into());
     }
     Ok(mapped)
 }
@@ -671,7 +731,7 @@ impl StorageBackend for ApolloStorageAdapter {
             parent_hash: format!("{:#x}", header_without_hash.parent_hash.0),
             state_root: format!("{:#x}", header_without_hash.state_root.0),
             timestamp: header_without_hash.timestamp.0,
-            sequencer_address: format!("{:#x}", header_without_hash.sequencer.0.0.key()),
+            sequencer_address: format!("{:#x}", header_without_hash.sequencer.0.0.key()).into(),
             gas_prices: BlockGasPrices {
                 l1_gas,
                 l1_data_gas,
@@ -707,14 +767,8 @@ impl StorageBackend for ApolloStorageAdapter {
         Ok(latest_block_from_marker(marker).map(|n| n.0).unwrap_or(0))
     }
 
-    fn current_state_root(&self) -> String {
-        match self.read_current_state_root() {
-            Ok(root) => root,
-            Err(error) => {
-                eprintln!("apollo-storage-adapter: failed to read current state root: {error}");
-                "0x0".to_string()
-            }
-        }
+    fn current_state_root(&self) -> Result<String, StorageError> {
+        self.read_current_state_root()
     }
 }
 
@@ -735,7 +789,7 @@ mod tests {
             parent_hash: format!("0x{:x}", number.saturating_sub(1)),
             state_root: format!("0x{:x}", number),
             timestamp: 1_700_000_000 + number,
-            sequencer_address: "0x1".to_string(),
+            sequencer_address: ContractAddress::from("0x1"),
             gas_prices: BlockGasPrices {
                 l1_gas: GasPricePerToken {
                     price_in_fri: 2,
@@ -758,9 +812,9 @@ mod tests {
     fn diff_with_balance(contract: &str, value: u64) -> StarknetStateDiff {
         let mut diff = StarknetStateDiff::default();
         diff.storage_diffs
-            .entry(contract.to_string())
+            .entry(ContractAddress::from(contract))
             .or_default()
-            .insert("balance".to_string(), StarknetFelt::from(value));
+            .insert("0x2".to_string(), StarknetFelt::from(value));
         diff
     }
 
@@ -775,8 +829,8 @@ mod tests {
 
         let reader = storage.get_state_reader(1).expect("state reader");
         assert_eq!(
-            reader.get_storage(&ContractAddress::from("0xabc"), "balance"),
-            Some(StarknetFelt::from(11_u64))
+            reader.get_storage(&ContractAddress::from("0xabc"), "0x2"),
+            Ok(Some(StarknetFelt::from(11_u64)))
         );
     }
 
@@ -787,6 +841,24 @@ mod tests {
             .insert_block(block(2), StarknetStateDiff::default())
             .expect_err("must fail");
         assert_eq!(err, StorageError::NonSequentialBlock(2));
+    }
+
+    #[test]
+    fn rejects_non_monotonic_block_timestamps() {
+        let mut storage = InMemoryStorage::new(InMemoryState::default());
+        storage
+            .insert_block(block(1), StarknetStateDiff::default())
+            .expect("insert block 1");
+
+        let mut stale_timestamp = block(2);
+        stale_timestamp.timestamp = block(1).timestamp.saturating_sub(1);
+        let err = storage
+            .insert_block(stale_timestamp, StarknetStateDiff::default())
+            .expect_err("must reject timestamp regression");
+        assert!(matches!(
+            err,
+            StorageError::NonMonotonicTimestamp { block: 2, .. }
+        ));
     }
 
     #[test]
@@ -806,7 +878,7 @@ mod tests {
         let mut storage = InMemoryStorage::new(InMemoryState::default());
         let mut diff = StarknetStateDiff::default();
         diff.storage_diffs
-            .insert("bad-contract".to_string(), BTreeMap::new());
+            .insert(ContractAddress::from("bad-contract"), BTreeMap::new());
 
         let err = storage
             .insert_block(block(1), diff)
@@ -836,12 +908,12 @@ mod tests {
         let storage = writer.clone();
         let handle = std::thread::spawn(move || {
             let reader = storage.get_state_reader(1).expect("state reader");
-            reader.get_storage(&ContractAddress::from("0xabc"), "balance")
+            reader.get_storage(&ContractAddress::from("0xabc"), "0x2")
         });
 
         assert_eq!(
             handle.join().expect("thread join"),
-            Some(StarknetFelt::from(11_u64))
+            Ok(Some(StarknetFelt::from(11_u64)))
         );
     }
 
@@ -998,7 +1070,7 @@ mod apollo_tests {
         adapter: &mut ApolloStorageAdapter,
         block_number: u64,
         storage_value: ApolloFelt,
-    ) -> Result<(String, String, String), StorageError> {
+    ) -> Result<(ContractAddress, String, starknet_node_types::ClassHash), StorageError> {
         let contract = ApolloContractAddress::from(0xabc_u64);
         let key = ApolloStorageKey::from(0x1_u64);
         let nonce = ApolloNonce(ApolloFelt::from(5_u64));
@@ -1027,9 +1099,9 @@ mod apollo_tests {
             .map_err(|error| StorageError::Apollo(error.to_string()))?;
 
         Ok((
-            format!("{:#x}", contract.0.key()),
+            format!("{:#x}", contract.0.key()).into(),
             format!("{:#x}", key.0.key()),
-            format!("{:#x}", class_hash.0),
+            format!("{:#x}", class_hash.0).into(),
         ))
     }
 
@@ -1129,9 +1201,12 @@ mod apollo_tests {
             .expect("state reader");
         assert_eq!(
             reader.get_storage(&contract, &key),
-            Some(StarknetFelt::from(77_u64))
+            Ok(Some(StarknetFelt::from(77_u64)))
         );
-        assert_eq!(reader.nonce_of(&contract), Some(StarknetFelt::from(5_u64)));
+        assert_eq!(
+            reader.nonce_of(&contract),
+            Ok(Some(StarknetFelt::from(5_u64)))
+        );
 
         let diff = adapter
             .get_state_diff(fixture.block_number)
@@ -1221,7 +1296,7 @@ mod apollo_tests {
             .expect("get block")
             .expect("block exists");
         assert_eq!(block.transactions.len(), 1);
-        assert_eq!(block.transactions[0].hash, "0xabc");
+        assert_eq!(block.transactions[0].hash, "0xabc".into());
     }
 
     #[test]
