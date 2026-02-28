@@ -5,6 +5,7 @@ use node_spec_core::mcp::{McpAccessController, ValidationLimits};
 use starknet_node_execution::BlockifierVmBackend;
 use starknet_node_execution::ExecutionBackend;
 use starknet_node_mcp_server::McpServer;
+use starknet_node_proving::ProvingBackend;
 use starknet_node_rpc::StarknetRpcServer;
 #[cfg(feature = "production-adapters")]
 use starknet_node_storage::ApolloStorageAdapter;
@@ -89,6 +90,7 @@ pub struct StarknetNode<S, E> {
     pub execution: E,
     pub rpc_enabled: bool,
     pub mcp_enabled: bool,
+    proving: Option<Box<dyn ProvingBackend>>,
 }
 
 impl<S: StorageBackend, E> StarknetNode<S, E> {
@@ -103,12 +105,17 @@ impl<S: StorageBackend, E> StarknetNode<S, E> {
     ) -> McpServer<'_> {
         McpServer::new(&self.storage, access_controller, validation_limits)
     }
+
+    pub fn proving_backend(&self) -> Option<&dyn ProvingBackend> {
+        self.proving.as_deref()
+    }
 }
 
 pub struct StarknetNodeBuilder<Stor, Exec> {
     config: NodeConfig,
     rpc_enabled: bool,
     mcp_enabled: bool,
+    proving: Option<Box<dyn ProvingBackend>>,
     storage: Stor,
     execution: Exec,
 }
@@ -195,6 +202,7 @@ impl StarknetNodeBuilder<NoStorage, NoExecution> {
             config,
             rpc_enabled: false,
             mcp_enabled: false,
+            proving: None,
             storage: NoStorage,
             execution: NoExecution,
         }
@@ -208,6 +216,7 @@ impl StarknetNodeBuilder<NoStorage, NoExecution> {
             config: self.config,
             rpc_enabled: self.rpc_enabled,
             mcp_enabled: self.mcp_enabled,
+            proving: self.proving,
             storage: WithStorage(storage),
             execution: NoExecution,
         }
@@ -223,6 +232,7 @@ impl<S: StorageBackend> StarknetNodeBuilder<WithStorage<S>, NoExecution> {
             config: self.config,
             rpc_enabled: self.rpc_enabled,
             mcp_enabled: self.mcp_enabled,
+            proving: self.proving,
             storage: self.storage,
             execution: WithExecution(execution),
         }
@@ -240,6 +250,11 @@ impl<S: StorageBackend, E: ExecutionBackend> StarknetNodeBuilder<WithStorage<S>,
         self
     }
 
+    pub fn with_proving(mut self, proving: impl ProvingBackend + 'static) -> Self {
+        self.proving = Some(Box::new(proving));
+        self
+    }
+
     pub fn build(self) -> StarknetNode<S, E> {
         StarknetNode {
             config: self.config,
@@ -247,6 +262,7 @@ impl<S: StorageBackend, E: ExecutionBackend> StarknetNodeBuilder<WithStorage<S>,
             execution: self.execution.0,
             rpc_enabled: self.rpc_enabled,
             mcp_enabled: self.mcp_enabled,
+            proving: self.proving,
         }
     }
 }
@@ -275,6 +291,7 @@ mod tests {
     use semver::Version;
     use starknet_node_execution::ExecutionError;
     use starknet_node_mcp_server::{McpRequest, McpResponse};
+    use starknet_node_proving::{ProvingError, StarkProof};
     use starknet_node_rpc::JsonRpcRequest;
     use starknet_node_storage::InMemoryStorage;
     #[cfg(feature = "production-adapters")]
@@ -329,6 +346,14 @@ mod tests {
         }
     }
 
+    struct DummyProving;
+
+    impl ProvingBackend for DummyProving {
+        fn verify_proof(&self, proof: &StarkProof) -> Result<bool, ProvingError> {
+            Ok(!proof.proof_bytes.is_empty())
+        }
+    }
+
     #[test]
     fn builds_node_after_storage_and_execution_are_provided() {
         let storage = InMemoryStorage::new(InMemoryState::default());
@@ -342,6 +367,35 @@ mod tests {
         assert!(node.rpc_enabled);
         assert!(node.mcp_enabled);
         assert_eq!(node.config.chain_id, ChainId::Mainnet);
+        assert!(node.proving_backend().is_none());
+    }
+
+    #[test]
+    fn builder_wires_optional_proving_backend() {
+        let storage = InMemoryStorage::new(InMemoryState::default());
+        let node = StarknetNodeBuilder::new(NodeConfig::default())
+            .with_storage(storage)
+            .with_execution(DummyExecution)
+            .with_proving(DummyProving)
+            .build();
+
+        let backend = node.proving_backend().expect("proving backend configured");
+        assert!(
+            backend
+                .verify_proof(&StarkProof {
+                    block_number: 1,
+                    proof_bytes: vec![1],
+                })
+                .expect("proof verification should succeed")
+        );
+        assert!(
+            !backend
+                .verify_proof(&StarkProof {
+                    block_number: 1,
+                    proof_bytes: Vec::new(),
+                })
+                .expect("proof verification should succeed")
+        );
     }
 
     #[test]

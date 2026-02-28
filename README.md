@@ -31,6 +31,7 @@ This repository currently ships core, tested building blocks:
 - ExEx manager with bounded WAL replay and failing-sink circuit breaker
 - OTel-style ExEx sink with deterministic per-block metrics capture and regression counters
 - BTCFi/strkBTC ExEx scaffolding with structural anomaly detection primitives
+- Proving-layer scaffolding with verify-only backend and trace-driven proving pipeline
 - MCP server request handler with authenticated tool execution and bounded batch support
 - JSON-RPC server request handler with strict JSON-RPC 2.0 validation and Starknet core method coverage
 - Type-state node builder that enforces composition order
@@ -46,6 +47,7 @@ Source entry points:
 - [crates/exex-manager/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/exex-manager/src/lib.rs)
 - [crates/exex-otel/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/exex-otel/src/lib.rs)
 - [crates/exex-btcfi/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/exex-btcfi/src/lib.rs)
+- [crates/proving/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/proving/src/lib.rs)
 - [crates/mcp-server/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/mcp-server/src/lib.rs)
 - [crates/rpc/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/rpc/src/lib.rs)
 - [crates/node/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/node/src/lib.rs)
@@ -138,9 +140,10 @@ Near-term implementation sequence:
 3. Extend RPC method coverage and map full Starknet error taxonomy
 4. Extend MCP server surface beyond control-plane tools (state query params, simulation, submit)
 5. Wire BTCFi ExEx into ExExManager registration flow and RPC/MCP anomaly query surfaces
+6. Attach concrete trace providers/provers to the proving pipeline for end-to-end proof jobs
 
 Long-term:
 
 - Full production node binary wiring
 - End-to-end sync pipeline integration
-- Optional proving pipeline integration
+- Production-grade STWO proving backend integration

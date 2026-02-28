@@ -15,6 +15,7 @@ bincode = { workspace = true }
 node-spec-core = { path = "../node-spec-core" }
 semver = { workspace = true }
 starknet-node-execution = { path = "../execution" }
+starknet-node-proving = { path = "../proving" }
 starknet-node-mcp-server = { path = "../mcp-server" }
 starknet-node-rpc = { path = "../rpc" }
 starknet-node-storage = { path = "../storage" }

@@ -4130,6 +4130,7 @@ dependencies = [
  "serde_json",
  "starknet-node-execution",
  "starknet-node-mcp-server",
+ "starknet-node-proving",
  "starknet-node-rpc",
  "starknet-node-storage",
  "starknet-node-types",
@@ -4182,6 +4183,14 @@ dependencies = [
  "semver",
  "starknet-node-storage",
  "starknet-node-types",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "starknet-node-proving"
+version = "0.1.0"
+dependencies = [
+ "starknet-node-execution",
  "thiserror 2.0.18",
 ]
 
