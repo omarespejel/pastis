@@ -119,6 +119,9 @@ STARKNET_RPC_URL="https://<your-starknet-rpc>" \
 cargo run -p starknet-node --bin demo-dashboard --all-features -- --mode real
 ```
 
+Real mode persists replay cursor state by default at `.pastis/replay-checkpoint.json` so restart recovery is deterministic.
+Override with `--replay-checkpoint <path>` or `PASTIS_DASHBOARD_REPLAY_CHECKPOINT=<path>`.
+
 Enable live BTCFi anomaly processing in `real` mode (state-diff driven) by setting monitor env vars:
 
 ```bash
@@ -157,6 +160,13 @@ cargo test -p starknet-node-storage --features apollo-adapter
 cargo test -p starknet-node-execution --features blockifier-adapter
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ./scripts/check-storage-adapter-deps.sh
+./scripts/check-replay-fixture-lock.sh
+```
+
+Refresh replay RPC fixtures (block + state update pairs) and lockfile:
+
+```bash
+./scripts/capture-replay-rpc-fixtures.sh --rpc-url "https://<your-starknet-rpc>"
 ```
 
 ## Performance Gate (Next Step)

@@ -17,7 +17,9 @@ use node_spec_core::mcp::{
 use semver::Version;
 use serde::Serialize;
 use serde_json::{Value, json};
-use starknet_node::replay::{ReplayCheck, ReplayEngine};
+use starknet_node::replay::{
+    FileReplayCheckpointStore, ReplayPipeline, ReplayPipelineError, ReplayPipelineStep,
+};
 use starknet_node::{NodeConfig, StarknetNode, StarknetNodeBuilder};
 use starknet_node_execution::{
     DualExecutionBackend, DualExecutionMetrics, ExecutionBackend, ExecutionError, ExecutionMode,
@@ -41,6 +43,7 @@ const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
 const DEFAULT_REFRESH_MS: u64 = 2_000;
 const DEFAULT_REPLAY_WINDOW: u64 = 64;
 const DEFAULT_MAX_REPLAY_PER_POLL: u64 = 16;
+const DEFAULT_REPLAY_CHECKPOINT_FILE: &str = ".pastis/replay-checkpoint.json";
 const DEMO_API_KEY: &str = "boss-demo-key";
 const MAX_RECENT_ERRORS: usize = 16;
 const MAX_RECENT_ANOMALIES: usize = 512;
@@ -85,6 +88,18 @@ struct DashboardConfig {
     rpc_url: Option<String>,
     replay_window: u64,
     max_replay_per_poll: u64,
+    replay_checkpoint_path: Option<String>,
+}
+
+#[derive(Default)]
+struct DashboardEnvConfig {
+    mode: Option<String>,
+    bind: Option<String>,
+    refresh: Option<String>,
+    rpc: Option<String>,
+    replay_window: Option<String>,
+    max_replay_per_poll: Option<String>,
+    replay_checkpoint: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -479,7 +494,7 @@ struct RealRuntimeState {
     node: StarknetNode<InMemoryStorage, DualExecutionBackend>,
     execution_state: InMemoryState,
     snapshot: Option<RealSnapshot>,
-    replay: ReplayEngine,
+    replay: ReplayPipeline,
     diagnostics: RuntimeDiagnostics,
     recent_errors: VecDeque<String>,
 }
@@ -497,7 +512,8 @@ impl RealRuntime {
         btcfi_config: Option<RealBtcfiConfig>,
         replay_window: u64,
         max_replay_per_poll: u64,
-    ) -> Self {
+        replay_checkpoint_path: Option<String>,
+    ) -> Result<Self, String> {
         let btcfi = btcfi_config.map(|cfg| {
             let wrappers = cfg
                 .wrappers
@@ -512,18 +528,25 @@ impl RealRuntime {
         });
         let mut diagnostics = RuntimeDiagnostics::new();
         diagnostics.anomaly_monitor_enabled = btcfi.is_some();
-        Self {
+        let replay = new_replay_pipeline(
+            replay_window,
+            max_replay_per_poll,
+            replay_checkpoint_path.as_deref(),
+        )
+        .map_err(|error| format!("failed to initialize replay pipeline: {error}"))?;
+
+        Ok(Self {
             client: Arc::new(client),
             btcfi,
             state: Arc::new(Mutex::new(RealRuntimeState {
                 node: build_dashboard_node(),
                 execution_state: InMemoryState::default(),
                 snapshot: None,
-                replay: ReplayEngine::new(replay_window, max_replay_per_poll),
+                replay,
                 diagnostics,
                 recent_errors: VecDeque::new(),
             })),
-        }
+        })
     }
 
     async fn poll_once(&self) -> Result<RealSnapshot, String> {
@@ -577,15 +600,17 @@ impl RealRuntime {
 
             let local_block_number = match guard
                 .replay
-                .check_block(external_block, &fetch.replay.parent_hash)
+                .evaluate_block(external_block, &fetch.replay.parent_hash)
             {
-                ReplayCheck::Continue { local_block_number } => local_block_number,
-                ReplayCheck::Reorg {
+                Ok(ReplayPipelineStep::Continue { local_block_number }) => local_block_number,
+                Ok(ReplayPipelineStep::ReorgRecoverable {
                     conflicting_external_block,
-                    ..
-                } => {
+                    restart_external_block,
+                    depth,
+                }) => {
                     let message = format!(
-                        "reorg detected at external block {conflicting_external_block}: parent {} did not match expected parent",
+                        "recoverable reorg detected at external block {conflicting_external_block} \
+                         (depth={depth}, restart={restart_external_block}): observed parent {}",
                         fetch.replay.parent_hash
                     );
                     guard.diagnostics.reorg_events = guard.replay.reorg_events();
@@ -602,6 +627,16 @@ impl RealRuntime {
                         Some(guard.replay.replay_lag_blocks(external_head_block));
                     guard.diagnostics.recent_errors = guard.recent_errors.iter().cloned().collect();
                     break;
+                }
+                Err(error) => {
+                    let message = format!(
+                        "replay guardrail failure at external block {external_block}: {error}"
+                    );
+                    guard.diagnostics.replay_failures =
+                        guard.diagnostics.replay_failures.saturating_add(1);
+                    guard.diagnostics.last_replay_error = Some(message.clone());
+                    record_real_runtime_failure(&mut guard, message.clone());
+                    return Err(message);
                 }
             };
 
@@ -688,9 +723,19 @@ impl RealRuntime {
             guard.diagnostics.last_local_block = Some(local_block_number);
             guard.diagnostics.last_processed_block = Some(external_block);
             guard.diagnostics.last_external_replayed_block = Some(external_block);
-            guard
+            if let Err(error) = guard
                 .replay
-                .mark_committed(external_block, &fetch.replay.block_hash);
+                .mark_committed(external_block, &fetch.replay.block_hash)
+            {
+                let message = format!(
+                    "failed to checkpoint replay state after external block {external_block}: {error}"
+                );
+                guard.diagnostics.replay_failures =
+                    guard.diagnostics.replay_failures.saturating_add(1);
+                guard.diagnostics.last_replay_error = Some(message.clone());
+                record_real_runtime_failure(&mut guard, message.clone());
+                return Err(message);
+            }
             guard.diagnostics.replay_lag_blocks =
                 Some(guard.replay.replay_lag_blocks(external_head_block));
         }
@@ -832,6 +877,20 @@ fn build_dashboard_execution_backend() -> DualExecutionBackend {
         },
         MismatchPolicy::WarnAndFallback,
     )
+}
+
+fn new_replay_pipeline(
+    replay_window: u64,
+    max_replay_per_poll: u64,
+    checkpoint_path: Option<&str>,
+) -> Result<ReplayPipeline, ReplayPipelineError> {
+    let pipeline = ReplayPipeline::new(replay_window, max_replay_per_poll);
+    match checkpoint_path {
+        Some(path) => {
+            pipeline.with_checkpoint_store(Arc::new(FileReplayCheckpointStore::new(path)))
+        }
+        None => Ok(pipeline),
+    }
 }
 
 impl RealRpcClient {
@@ -1052,7 +1111,8 @@ async fn main() -> Result<(), String> {
                 btcfi_config,
                 config.replay_window,
                 config.max_replay_per_poll,
-            ));
+                config.replay_checkpoint_path.clone(),
+            )?);
             if let Err(error) = runtime.poll_once().await {
                 eprintln!("warning: initial real runtime poll failed: {error}");
             }
@@ -1408,23 +1468,21 @@ fn parse_dashboard_config() -> Result<DashboardConfig, String> {
     let args: Vec<String> = env::args().skip(1).collect();
     parse_dashboard_config_from(
         args,
-        env::var("PASTIS_DASHBOARD_MODE").ok(),
-        env::var("PASTIS_DASHBOARD_BIND").ok(),
-        env::var("PASTIS_DASHBOARD_REFRESH_MS").ok(),
-        env::var("STARKNET_RPC_URL").ok(),
-        env::var("PASTIS_DASHBOARD_REPLAY_WINDOW").ok(),
-        env::var("PASTIS_DASHBOARD_MAX_REPLAY_PER_POLL").ok(),
+        DashboardEnvConfig {
+            mode: env::var("PASTIS_DASHBOARD_MODE").ok(),
+            bind: env::var("PASTIS_DASHBOARD_BIND").ok(),
+            refresh: env::var("PASTIS_DASHBOARD_REFRESH_MS").ok(),
+            rpc: env::var("STARKNET_RPC_URL").ok(),
+            replay_window: env::var("PASTIS_DASHBOARD_REPLAY_WINDOW").ok(),
+            max_replay_per_poll: env::var("PASTIS_DASHBOARD_MAX_REPLAY_PER_POLL").ok(),
+            replay_checkpoint: env::var("PASTIS_DASHBOARD_REPLAY_CHECKPOINT").ok(),
+        },
     )
 }
 
 fn parse_dashboard_config_from(
     args: Vec<String>,
-    env_mode: Option<String>,
-    env_bind: Option<String>,
-    env_refresh: Option<String>,
-    env_rpc: Option<String>,
-    env_replay_window: Option<String>,
-    env_max_replay_per_poll: Option<String>,
+    env_config: DashboardEnvConfig,
 ) -> Result<DashboardConfig, String> {
     let mut cli_mode: Option<DashboardModeKind> = None;
     let mut cli_bind: Option<String> = None;
@@ -1432,6 +1490,7 @@ fn parse_dashboard_config_from(
     let mut cli_rpc_url: Option<String> = None;
     let mut cli_replay_window: Option<u64> = None;
     let mut cli_max_replay_per_poll: Option<u64> = None;
+    let mut cli_replay_checkpoint: Option<String> = None;
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -1472,6 +1531,12 @@ fn parse_dashboard_config_from(
                     .ok_or_else(|| "--max-replay-per-poll requires a value".to_string())?;
                 cli_max_replay_per_poll = Some(parse_positive_u64(&raw)?);
             }
+            "--replay-checkpoint" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--replay-checkpoint requires a value".to_string())?;
+                cli_replay_checkpoint = Some(raw);
+            }
             "--help" | "-h" => {
                 return Err(help_text());
             }
@@ -1483,7 +1548,8 @@ fn parse_dashboard_config_from(
 
     let mode = match cli_mode {
         Some(value) => value,
-        None => env_mode
+        None => env_config
+            .mode
             .as_deref()
             .map(DashboardModeKind::parse)
             .transpose()?
@@ -1491,7 +1557,8 @@ fn parse_dashboard_config_from(
     };
     let refresh_ms = match cli_refresh_ms {
         Some(value) => value,
-        None => env_refresh
+        None => env_config
+            .refresh
             .as_deref()
             .map(parse_refresh_ms)
             .transpose()?
@@ -1499,7 +1566,8 @@ fn parse_dashboard_config_from(
     };
     let replay_window = match cli_replay_window {
         Some(value) => value,
-        None => env_replay_window
+        None => env_config
+            .replay_window
             .as_deref()
             .map(parse_positive_u64)
             .transpose()?
@@ -1507,7 +1575,8 @@ fn parse_dashboard_config_from(
     };
     let max_replay_per_poll = match cli_max_replay_per_poll {
         Some(value) => value,
-        None => env_max_replay_per_poll
+        None => env_config
+            .max_replay_per_poll
             .as_deref()
             .map(parse_positive_u64)
             .transpose()?
@@ -1516,12 +1585,18 @@ fn parse_dashboard_config_from(
     let config = DashboardConfig {
         mode,
         bind_addr: cli_bind
-            .or(env_bind)
+            .or(env_config.bind)
             .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string()),
         refresh_ms,
-        rpc_url: cli_rpc_url.or(env_rpc),
+        rpc_url: cli_rpc_url.or(env_config.rpc),
         replay_window,
         max_replay_per_poll,
+        replay_checkpoint_path: cli_replay_checkpoint
+            .or(env_config.replay_checkpoint)
+            .or_else(|| {
+                (mode == DashboardModeKind::Real)
+                    .then(|| DEFAULT_REPLAY_CHECKPOINT_FILE.to_string())
+            }),
     };
 
     if config.mode == DashboardModeKind::Real && config.rpc_url.is_none() {
@@ -1962,7 +2037,7 @@ fn value_as_felt(raw: &Value, field: &str, warnings: &mut Vec<String>) -> Option
 }
 
 fn help_text() -> String {
-    "usage: demo-dashboard [--mode demo|real] [--rpc-url <url>] [--bind <addr>] [--refresh-ms <ms>] [--replay-window <blocks>] [--max-replay-per-poll <blocks>]
+    "usage: demo-dashboard [--mode demo|real] [--rpc-url <url>] [--bind <addr>] [--refresh-ms <ms>] [--replay-window <blocks>] [--max-replay-per-poll <blocks>] [--replay-checkpoint <path>]
 environment:
   PASTIS_DASHBOARD_MODE=demo|real
   STARKNET_RPC_URL=https://...
@@ -1970,6 +2045,7 @@ environment:
   PASTIS_DASHBOARD_REFRESH_MS=2000
   PASTIS_DASHBOARD_REPLAY_WINDOW=64
   PASTIS_DASHBOARD_MAX_REPLAY_PER_POLL=16
+  PASTIS_DASHBOARD_REPLAY_CHECKPOINT=.pastis/replay-checkpoint.json
   PASTIS_MONITOR_STRKBTC_SHIELDED_POOL=0x...
   PASTIS_MONITOR_WBTC_CONTRACT=0x..."
         .to_string()
@@ -2440,12 +2516,7 @@ mod tests {
     fn parse_dashboard_config_requires_rpc_in_real_mode() {
         let err = parse_dashboard_config_from(
             vec!["--mode".to_string(), "real".to_string()],
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            DashboardEnvConfig::default(),
         )
         .expect_err("real mode without rpc must fail");
         assert!(err.contains("real mode requires --rpc-url"));
@@ -2455,12 +2526,10 @@ mod tests {
     fn parse_dashboard_config_allows_real_mode_with_env_rpc() {
         let config = parse_dashboard_config_from(
             vec!["--mode".to_string(), "real".to_string()],
-            None,
-            None,
-            None,
-            Some("https://rpc.example".to_string()),
-            None,
-            None,
+            DashboardEnvConfig {
+                rpc: Some("https://rpc.example".to_string()),
+                ..DashboardEnvConfig::default()
+            },
         )
         .expect("config should parse");
         assert_eq!(config.mode, DashboardModeKind::Real);
@@ -2484,12 +2553,15 @@ mod tests {
                 "--max-replay-per-poll".to_string(),
                 "12".to_string(),
             ],
-            Some("demo".to_string()),
-            Some("127.0.0.1:8080".to_string()),
-            Some("2000".to_string()),
-            Some("https://env.rpc".to_string()),
-            Some("72".to_string()),
-            Some("8".to_string()),
+            DashboardEnvConfig {
+                mode: Some("demo".to_string()),
+                bind: Some("127.0.0.1:8080".to_string()),
+                refresh: Some("2000".to_string()),
+                rpc: Some("https://env.rpc".to_string()),
+                replay_window: Some("72".to_string()),
+                max_replay_per_poll: Some("8".to_string()),
+                ..DashboardEnvConfig::default()
+            },
         )
         .expect("config should parse");
 
@@ -2516,12 +2588,14 @@ mod tests {
                 "--max-replay-per-poll".to_string(),
                 "6".to_string(),
             ],
-            Some("invalid-mode".to_string()),
-            None,
-            Some("invalid-refresh".to_string()),
-            Some("https://env.rpc".to_string()),
-            Some("invalid-window".to_string()),
-            Some("invalid-max".to_string()),
+            DashboardEnvConfig {
+                mode: Some("invalid-mode".to_string()),
+                refresh: Some("invalid-refresh".to_string()),
+                rpc: Some("https://env.rpc".to_string()),
+                replay_window: Some("invalid-window".to_string()),
+                max_replay_per_poll: Some("invalid-max".to_string()),
+                ..DashboardEnvConfig::default()
+            },
         )
         .expect("cli flags should override malformed env values");
 
@@ -2536,52 +2610,78 @@ mod tests {
     fn parse_dashboard_config_invalid_env_fails_without_cli_override() {
         let error = parse_dashboard_config_from(
             Vec::new(),
-            Some("invalid-mode".to_string()),
-            None,
-            None,
-            None,
-            None,
-            None,
+            DashboardEnvConfig {
+                mode: Some("invalid-mode".to_string()),
+                ..DashboardEnvConfig::default()
+            },
         )
         .expect_err("invalid env mode must fail when no cli override is present");
         assert!(error.contains("unsupported mode"));
     }
 
     #[test]
-    fn replay_engine_bootstraps_window_and_tracks_lag() {
-        let mut replay = ReplayEngine::new(4, 3);
+    fn parse_dashboard_config_real_mode_defaults_checkpoint_path() {
+        let config = parse_dashboard_config_from(
+            vec![
+                "--mode".to_string(),
+                "real".to_string(),
+                "--rpc-url".to_string(),
+                "https://rpc.example".to_string(),
+            ],
+            DashboardEnvConfig::default(),
+        )
+        .expect("config should parse");
+        assert_eq!(
+            config.replay_checkpoint_path.as_deref(),
+            Some(DEFAULT_REPLAY_CHECKPOINT_FILE)
+        );
+    }
+
+    #[test]
+    fn replay_pipeline_bootstraps_window_and_tracks_lag() {
+        let mut replay = new_replay_pipeline(4, 3, None).expect("pipeline");
         assert_eq!(replay.plan(10), vec![7, 8, 9]);
         assert_eq!(
-            replay.check_block(7, "0x0"),
-            ReplayCheck::Continue {
+            replay
+                .evaluate_block(7, "0x0")
+                .expect("replay step should be continue"),
+            ReplayPipelineStep::Continue {
                 local_block_number: 1
             }
         );
-        replay.mark_committed(7, "0xa");
+        replay
+            .mark_committed(7, "0xa")
+            .expect("commit should update replay state");
         assert_eq!(replay.replay_lag_blocks(10), 3);
         assert_eq!(replay.expected_parent_hash(), Some("0xa"));
     }
 
     #[test]
-    fn replay_engine_reset_for_reorg_rewinds_window() {
-        let mut replay = ReplayEngine::new(5, 2);
+    fn replay_pipeline_reset_for_reorg_rewinds_window() {
+        let mut replay = new_replay_pipeline(5, 2, None).expect("pipeline");
         let _ = replay.plan(20);
         assert_eq!(
-            replay.check_block(16, "0x0"),
-            ReplayCheck::Continue {
+            replay
+                .evaluate_block(16, "0x0")
+                .expect("step should continue"),
+            ReplayPipelineStep::Continue {
                 local_block_number: 1
             }
         );
-        replay.mark_committed(16, "0x16");
+        replay.mark_committed(16, "0x16").expect("commit 16");
         assert_eq!(
-            replay.check_block(17, "0xdead"),
-            ReplayCheck::Reorg {
+            replay
+                .evaluate_block(17, "0xdead")
+                .expect_err("unknown ancestor must fail-closed"),
+            ReplayPipelineError::DeepReorgBeyondWindow {
                 conflicting_external_block: 17,
-                restart_external_block: 13,
+                observed_parent_hash: "0xdead".to_string(),
+                expected_parent_hash: "0x16".to_string(),
+                replay_window: 5,
             }
         );
-        assert_eq!(replay.plan(20), vec![13, 14]);
-        assert_eq!(replay.next_local_block(), 1);
+        assert_eq!(replay.plan(20), vec![17, 18]);
+        assert_eq!(replay.next_local_block(), 2);
     }
 
     #[test]
@@ -3061,21 +3161,27 @@ mod tests {
             "mainnet_block_7242624_get_state_update.json",
         );
 
-        let mut replay = ReplayEngine::new(8, 8);
+        let mut replay = new_replay_pipeline(8, 8, None).expect("pipeline");
         let mut node = build_dashboard_node();
         let mut execution_state = InMemoryState::default();
 
         for fetch in [&fetch_623, &fetch_624] {
-            let check = replay.check_block(
-                fetch.replay.external_block_number,
-                &fetch.replay.parent_hash,
-            );
-            let local_block_number = match check {
-                ReplayCheck::Continue { local_block_number } => local_block_number,
-                ReplayCheck::Reorg { .. } => panic!("unexpected reorg in canonical fixture path"),
+            let local_block_number = match replay
+                .evaluate_block(
+                    fetch.replay.external_block_number,
+                    &fetch.replay.parent_hash,
+                )
+                .expect("canonical fixture path must continue")
+            {
+                ReplayPipelineStep::Continue { local_block_number } => local_block_number,
+                ReplayPipelineStep::ReorgRecoverable { .. } => {
+                    panic!("unexpected reorg in canonical fixture path")
+                }
             };
             apply_fetch_to_local_chain(&mut node, &mut execution_state, local_block_number, fetch);
-            replay.mark_committed(fetch.replay.external_block_number, &fetch.replay.block_hash);
+            replay
+                .mark_committed(fetch.replay.external_block_number, &fetch.replay.block_hash)
+                .expect("mark committed");
         }
 
         assert_eq!(
@@ -3087,27 +3193,34 @@ mod tests {
 
         let mut reorg_block_with_txs =
             load_rpc_fixture("mainnet_block_7242625_get_block_with_txs.json");
-        reorg_block_with_txs["parent_hash"] = serde_json::Value::String("0xdeadbeef".to_string());
+        reorg_block_with_txs["parent_hash"] =
+            serde_json::Value::String(fetch_623.replay.block_hash.clone());
         let mut parse_warnings = Vec::new();
         let reorg_replay = parse_block_with_txs(&reorg_block_with_txs, &mut parse_warnings)
             .expect("reorg block fixture should parse");
         assert!(parse_warnings.is_empty());
 
-        let reorg_check = replay.check_block(
-            reorg_replay.external_block_number,
-            &reorg_replay.parent_hash,
-        );
-        match reorg_check {
-            ReplayCheck::Reorg {
+        let reorg_step = replay
+            .evaluate_block(
+                reorg_replay.external_block_number,
+                &reorg_replay.parent_hash,
+            )
+            .expect("reorg with in-window ancestor should be recoverable");
+        match reorg_step {
+            ReplayPipelineStep::ReorgRecoverable {
                 conflicting_external_block,
                 restart_external_block,
+                depth,
             } => {
                 assert_eq!(conflicting_external_block, 7_242_625);
                 assert_eq!(restart_external_block, 7_242_618);
+                assert_eq!(depth, 1);
                 node = build_dashboard_node();
                 execution_state = InMemoryState::default();
             }
-            ReplayCheck::Continue { .. } => panic!("reorg branch must trigger replay reset"),
+            ReplayPipelineStep::Continue { .. } => {
+                panic!("reorg branch must trigger replay reset")
+            }
         }
 
         assert_eq!(replay.reorg_events(), 1);
@@ -3123,5 +3236,170 @@ mod tests {
             (7_242_618..=7_242_625).collect::<Vec<_>>()
         );
         assert!(execution_state.storage.is_empty());
+    }
+
+    #[test]
+    fn replay_pipeline_checkpoint_restores_real_fixture_progress() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let checkpoint_path = dir.path().join("replay-checkpoint.json");
+        let checkpoint_path_str = checkpoint_path
+            .to_str()
+            .expect("checkpoint path should be valid utf8");
+
+        let fetch_623 = fetch_from_rpc_fixtures(
+            "mainnet_block_7242623_get_block_with_txs.json",
+            "mainnet_block_7242623_get_state_update.json",
+        );
+        let fetch_624 = fetch_from_rpc_fixtures(
+            "mainnet_block_7242624_get_block_with_txs.json",
+            "mainnet_block_7242624_get_state_update.json",
+        );
+
+        let mut first_boot =
+            new_replay_pipeline(8, 8, Some(checkpoint_path_str)).expect("first boot pipeline");
+        assert_eq!(
+            first_boot
+                .evaluate_block(
+                    fetch_623.replay.external_block_number,
+                    &fetch_623.replay.parent_hash
+                )
+                .expect("block 7242623 should continue"),
+            ReplayPipelineStep::Continue {
+                local_block_number: 1
+            }
+        );
+        first_boot
+            .mark_committed(
+                fetch_623.replay.external_block_number,
+                &fetch_623.replay.block_hash,
+            )
+            .expect("checkpoint should persist committed progress");
+
+        let mut second_boot =
+            new_replay_pipeline(8, 8, Some(checkpoint_path_str)).expect("second boot pipeline");
+        assert_eq!(second_boot.next_external_block(), Some(7_242_624));
+        assert_eq!(
+            second_boot.expected_parent_hash(),
+            Some(fetch_623.replay.block_hash.as_str())
+        );
+        assert_eq!(
+            second_boot
+                .evaluate_block(
+                    fetch_624.replay.external_block_number,
+                    &fetch_624.replay.parent_hash
+                )
+                .expect("next block should continue after restore"),
+            ReplayPipelineStep::Continue {
+                local_block_number: 2
+            }
+        );
+    }
+
+    #[test]
+    fn replay_pipeline_fail_closed_on_deep_reorg_from_real_fixture_parent() {
+        let fetch_623 = fetch_from_rpc_fixtures(
+            "mainnet_block_7242623_get_block_with_txs.json",
+            "mainnet_block_7242623_get_state_update.json",
+        );
+        let fetch_624 = fetch_from_rpc_fixtures(
+            "mainnet_block_7242624_get_block_with_txs.json",
+            "mainnet_block_7242624_get_state_update.json",
+        );
+
+        let mut pipeline = new_replay_pipeline(4, 8, None).expect("pipeline");
+        for fetch in [&fetch_623, &fetch_624] {
+            assert!(matches!(
+                pipeline
+                    .evaluate_block(
+                        fetch.replay.external_block_number,
+                        &fetch.replay.parent_hash
+                    )
+                    .expect("canonical path should continue"),
+                ReplayPipelineStep::Continue { .. }
+            ));
+            pipeline
+                .mark_committed(fetch.replay.external_block_number, &fetch.replay.block_hash)
+                .expect("commit should update cursor");
+        }
+
+        let err = pipeline
+            .evaluate_block(7_242_625, "0xdeadbeef")
+            .expect_err("deep reorg ancestor outside hash window must fail-closed");
+        assert!(matches!(
+            err,
+            ReplayPipelineError::DeepReorgBeyondWindow {
+                conflicting_external_block: 7_242_625,
+                ..
+            }
+        ));
+        assert_eq!(pipeline.reorg_events(), 0);
+        assert_eq!(pipeline.next_local_block(), 3);
+    }
+
+    #[tokio::test]
+    async fn real_rpc_client_call_surfaces_http_failure_payload() {
+        async fn failing_handler() -> (StatusCode, Json<Value>) {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {"code": -32000, "message": "upstream offline"}
+                })),
+            )
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind rpc test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            let app = Router::new().route("/", axum::routing::post(failing_handler));
+            axum::serve(listener, app)
+                .await
+                .expect("rpc test server should run");
+        });
+
+        let client = RealRpcClient::new(format!("http://{addr}")).expect("client");
+        let err = client
+            .call("starknet_chainId", json!([]))
+            .await
+            .expect_err("http failure must be surfaced");
+        assert!(err.contains("HTTP 502"), "unexpected error: {err}");
+        assert!(err.contains("upstream offline"), "unexpected error: {err}");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn real_rpc_client_call_surfaces_jsonrpc_error_payload() {
+        async fn error_payload_handler() -> Json<Value> {
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"code": 24, "message": "rate limited"}
+            }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind rpc test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            let app = Router::new().route("/", axum::routing::post(error_payload_handler));
+            axum::serve(listener, app)
+                .await
+                .expect("rpc test server should run");
+        });
+
+        let client = RealRpcClient::new(format!("http://{addr}")).expect("client");
+        let err = client
+            .call("starknet_getBlockWithTxs", json!([{"block_number": 1}]))
+            .await
+            .expect_err("jsonrpc error payload must be surfaced");
+        assert!(err.contains("error payload"), "unexpected error: {err}");
+        assert!(err.contains("rate limited"), "unexpected error: {err}");
+
+        server.abort();
     }
 }
