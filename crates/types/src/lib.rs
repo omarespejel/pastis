@@ -923,7 +923,7 @@ mod tests {
         let tx =
             StarknetTransaction::try_with_executable("0xabc", ExecutableTx::L1Handler(executable))
                 .expect("matching hashes");
-        assert_eq!(tx.hash, "0xabc");
+        assert_eq!(tx.hash, "0xabc".into());
     }
 
     #[cfg(feature = "blockifier-adapter")]
