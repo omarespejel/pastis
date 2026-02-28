@@ -9,5 +9,10 @@
 - Captured blocks:
   - `7242623`
   - `7242624`
+  - `7242625`
 
 These fixtures are immutable replay inputs for deterministic parser and state-diff ingestion tests.
+
+Integrity lock:
+- Check: `./scripts/check-replay-fixture-lock.sh`
+- Refresh after intentional fixture changes: `PASTIS_FIXTURE_LOCK_UPDATE=1 ./scripts/check-replay-fixture-lock.sh`

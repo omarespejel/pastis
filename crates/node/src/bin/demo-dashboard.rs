@@ -2365,6 +2365,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use starknet_node_types::BlockId;
 
     fn load_rpc_fixture(name: &str) -> Value {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2379,6 +2380,60 @@ mod tests {
         serde_json::from_str(&raw).unwrap_or_else(|error| {
             panic!("failed to parse RPC fixture {}: {error}", path.display());
         })
+    }
+
+    fn fetch_from_rpc_fixtures(block_fixture: &str, state_update_fixture: &str) -> RealFetch {
+        let block_with_txs = load_rpc_fixture(block_fixture);
+        let state_update = load_rpc_fixture(state_update_fixture);
+
+        let mut parse_warnings = Vec::new();
+        let replay = parse_block_with_txs(&block_with_txs, &mut parse_warnings)
+            .expect("block fixture must parse successfully");
+        assert!(
+            parse_warnings.is_empty(),
+            "unexpected block parse warnings: {parse_warnings:?}"
+        );
+
+        let (state_diff, state_warnings) =
+            state_update_to_diff(&state_update).expect("state update fixture must parse");
+        assert!(
+            state_warnings.is_empty(),
+            "unexpected state update warnings: {state_warnings:?}"
+        );
+
+        RealFetch {
+            snapshot: RealSnapshot {
+                chain_id: "SN_MAIN".to_string(),
+                latest_block: replay.external_block_number,
+                state_root: state_update
+                    .get("new_root")
+                    .and_then(Value::as_str)
+                    .expect("fixture must expose new_root")
+                    .to_string(),
+                tx_count: replay.transaction_hashes.len() as u64,
+                rpc_latency_ms: 0,
+                captured_unix_seconds: 0,
+            },
+            replay,
+            state_diff,
+            parse_warnings,
+        }
+    }
+
+    fn apply_fetch_to_local_chain(
+        node: &mut StarknetNode<InMemoryStorage, DualExecutionBackend>,
+        execution_state: &mut InMemoryState,
+        local_block_number: u64,
+        fetch: &RealFetch,
+    ) {
+        let block = ingest_block_from_fetch(local_block_number, fetch)
+            .expect("fixture block ingestion should succeed");
+        node.execution
+            .execute_block(&block, execution_state)
+            .expect("fixture block execution should succeed");
+        node.storage
+            .insert_block(block, fetch.state_diff.clone())
+            .expect("fixture block commit should succeed");
     }
 
     #[test]
@@ -2930,5 +2985,143 @@ mod tests {
             ingested.state_root,
             "0x25a23d7704a148a505fcd1d25c58c5a2f4847fbd3a739d809a1d0cfb25f7494"
         );
+    }
+
+    #[test]
+    fn replay_pipeline_applies_real_mainnet_fixture_sequence_deterministically() {
+        let fetch_623 = fetch_from_rpc_fixtures(
+            "mainnet_block_7242623_get_block_with_txs.json",
+            "mainnet_block_7242623_get_state_update.json",
+        );
+        let fetch_624 = fetch_from_rpc_fixtures(
+            "mainnet_block_7242624_get_block_with_txs.json",
+            "mainnet_block_7242624_get_state_update.json",
+        );
+        let fetch_625 = fetch_from_rpc_fixtures(
+            "mainnet_block_7242625_get_block_with_txs.json",
+            "mainnet_block_7242625_get_state_update.json",
+        );
+
+        let mut node = build_dashboard_node();
+        let mut execution_state = InMemoryState::default();
+        apply_fetch_to_local_chain(&mut node, &mut execution_state, 1, &fetch_623);
+        apply_fetch_to_local_chain(&mut node, &mut execution_state, 2, &fetch_624);
+        apply_fetch_to_local_chain(&mut node, &mut execution_state, 3, &fetch_625);
+
+        let latest = node
+            .storage
+            .latest_block_number()
+            .expect("latest block should be readable");
+        assert_eq!(latest, 3);
+
+        let block_2 = node
+            .storage
+            .get_block(BlockId::Number(2))
+            .expect("block 2 query should succeed")
+            .expect("block 2 should exist");
+        assert_eq!(block_2.parent_hash, fetch_624.replay.parent_hash);
+
+        let block_3 = node
+            .storage
+            .get_block(BlockId::Number(3))
+            .expect("block 3 query should succeed")
+            .expect("block 3 should exist");
+        assert_eq!(block_3.parent_hash, fetch_625.replay.parent_hash);
+        assert_eq!(
+            block_3.state_root,
+            "0x7c1c12b436136bf413dd5e32ce9a4cdf06cdae9d67fe0babdde6a42f1be4484"
+        );
+        assert_eq!(block_3.transactions.len(), 4);
+
+        let reader = node
+            .storage
+            .get_state_reader(3)
+            .expect("state reader at block 3 should exist");
+        let contract = ContractAddress::from(
+            "0x4718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
+        );
+        let key = "0xa93b2f657f711d43133241be6c27adda9539a298e34d644a2c37106a92d49d";
+        let expected = StarknetFelt::from_str("0x24188c710b6bd481c0").expect("valid fixture felt");
+        assert_eq!(
+            reader
+                .get_storage(&contract, key)
+                .expect("state read should succeed"),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn replay_pipeline_detects_reorg_and_resets_local_chain_state() {
+        let fetch_623 = fetch_from_rpc_fixtures(
+            "mainnet_block_7242623_get_block_with_txs.json",
+            "mainnet_block_7242623_get_state_update.json",
+        );
+        let fetch_624 = fetch_from_rpc_fixtures(
+            "mainnet_block_7242624_get_block_with_txs.json",
+            "mainnet_block_7242624_get_state_update.json",
+        );
+
+        let mut replay = ReplayEngine::new(8, 8);
+        let mut node = build_dashboard_node();
+        let mut execution_state = InMemoryState::default();
+
+        for fetch in [&fetch_623, &fetch_624] {
+            let check = replay.check_block(
+                fetch.replay.external_block_number,
+                &fetch.replay.parent_hash,
+            );
+            let local_block_number = match check {
+                ReplayCheck::Continue { local_block_number } => local_block_number,
+                ReplayCheck::Reorg { .. } => panic!("unexpected reorg in canonical fixture path"),
+            };
+            apply_fetch_to_local_chain(&mut node, &mut execution_state, local_block_number, fetch);
+            replay.mark_committed(fetch.replay.external_block_number, &fetch.replay.block_hash);
+        }
+
+        assert_eq!(
+            node.storage
+                .latest_block_number()
+                .expect("latest should be readable before reorg"),
+            2
+        );
+
+        let mut reorg_block_with_txs =
+            load_rpc_fixture("mainnet_block_7242625_get_block_with_txs.json");
+        reorg_block_with_txs["parent_hash"] = serde_json::Value::String("0xdeadbeef".to_string());
+        let mut parse_warnings = Vec::new();
+        let reorg_replay = parse_block_with_txs(&reorg_block_with_txs, &mut parse_warnings)
+            .expect("reorg block fixture should parse");
+        assert!(parse_warnings.is_empty());
+
+        let reorg_check = replay.check_block(
+            reorg_replay.external_block_number,
+            &reorg_replay.parent_hash,
+        );
+        match reorg_check {
+            ReplayCheck::Reorg {
+                conflicting_external_block,
+                restart_external_block,
+            } => {
+                assert_eq!(conflicting_external_block, 7_242_625);
+                assert_eq!(restart_external_block, 7_242_618);
+                node = build_dashboard_node();
+                execution_state = InMemoryState::default();
+            }
+            ReplayCheck::Continue { .. } => panic!("reorg branch must trigger replay reset"),
+        }
+
+        assert_eq!(replay.reorg_events(), 1);
+        assert_eq!(replay.next_local_block(), 1);
+        assert_eq!(
+            node.storage
+                .latest_block_number()
+                .expect("latest should be readable after reset"),
+            0
+        );
+        assert_eq!(
+            replay.plan(7_242_625),
+            (7_242_618..=7_242_625).collect::<Vec<_>>()
+        );
+        assert!(execution_state.storage.is_empty());
     }
 }

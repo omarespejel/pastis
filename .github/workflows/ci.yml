@@ -29,6 +29,9 @@ jobs:
       - name: Verify storage adapter dependencies
         run: ./scripts/check-storage-adapter-deps.sh
 
+      - name: Verify replay fixture lock
+        run: ./scripts/check-replay-fixture-lock.sh
+
       - name: Format check
         run: cargo fmt --all --check
 
