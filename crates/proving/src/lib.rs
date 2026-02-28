@@ -52,24 +52,27 @@ pub trait TraceProver: Send + Sync {
     fn prove(&self, block_number: u64, traces: &[CasmTrace]) -> Result<StarkProof, ProvingError>;
 }
 
-pub struct ProvingPipeline<T, P> {
+pub struct ProvingPipeline<T, P, V> {
     trace_provider: T,
     prover: P,
+    verifier: V,
 }
 
-impl<T, P> ProvingPipeline<T, P> {
-    pub fn new(trace_provider: T, prover: P) -> Self {
+impl<T, P, V> ProvingPipeline<T, P, V> {
+    pub fn new(trace_provider: T, prover: P, verifier: V) -> Self {
         Self {
             trace_provider,
             prover,
+            verifier,
         }
     }
 }
 
-impl<T, P> ProvingPipeline<T, P>
+impl<T, P, V> ProvingPipeline<T, P, V>
 where
     T: TraceProvider,
     P: TraceProver,
+    V: ProvingBackend,
 {
     pub fn prove_block(&self, block_number: u64) -> Result<StarkProof, ProvingError> {
         let traces = self
@@ -79,7 +82,13 @@ where
         if traces.is_empty() {
             return Err(ProvingError::EmptyTraceSet { block_number });
         }
-        self.prover.prove(block_number, &traces)
+        let proof = self.prover.prove(block_number, &traces)?;
+        if !self.verifier.verify_proof(&proof)? {
+            return Err(ProvingError::InvalidProof(
+                "generated proof failed verification".to_string(),
+            ));
+        }
+        Ok(proof)
     }
 }
 
@@ -125,6 +134,14 @@ mod tests {
         }
     }
 
+    struct RejectingVerifier;
+
+    impl ProvingBackend for RejectingVerifier {
+        fn verify_proof(&self, _proof: &StarkProof) -> Result<bool, ProvingError> {
+            Ok(false)
+        }
+    }
+
     #[test]
     fn verify_only_returns_false_for_empty_proof_payload() {
         let verifier = StwoVerifyOnly::new();
@@ -155,7 +172,7 @@ mod tests {
             traces_by_block: BTreeMap::new(),
         };
         let prover = RecordingProver::default();
-        let pipeline = ProvingPipeline::new(provider, prover);
+        let pipeline = ProvingPipeline::new(provider, prover, StwoVerifyOnly::new());
 
         let err = pipeline
             .prove_block(42)
@@ -179,7 +196,7 @@ mod tests {
             traces_by_block: BTreeMap::from([(42, Vec::new())]),
         };
         let prover = RecordingProver::default();
-        let pipeline = ProvingPipeline::new(provider, prover);
+        let pipeline = ProvingPipeline::new(provider, prover, StwoVerifyOnly::new());
 
         let err = pipeline
             .prove_block(42)
@@ -206,7 +223,7 @@ mod tests {
             )]),
         };
         let prover = RecordingProver::default();
-        let pipeline = ProvingPipeline::new(provider, prover);
+        let pipeline = ProvingPipeline::new(provider, prover, StwoVerifyOnly::new());
 
         let proof = pipeline.prove_block(42).expect("proof generation succeeds");
         assert_eq!(proof.block_number, 42);
@@ -219,5 +236,19 @@ mod tests {
             .expect("calls mutex should not be poisoned")
             .clone();
         assert_eq!(calls, vec![(42, 2)]);
+    }
+
+    #[test]
+    fn pipeline_fails_closed_when_generated_proof_does_not_verify() {
+        let provider = FixedTraceProvider {
+            traces_by_block: BTreeMap::from([(42, vec![CasmTrace { steps: 10 }])]),
+        };
+        let prover = RecordingProver::default();
+        let pipeline = ProvingPipeline::new(provider, prover, RejectingVerifier);
+
+        let err = pipeline
+            .prove_block(42)
+            .expect_err("unverifiable generated proof must fail");
+        assert!(matches!(err, ProvingError::InvalidProof(_)));
     }
 }

@@ -263,12 +263,16 @@ fn run_mcp_validation_benchmark(iterations: usize) -> Result<MetricResult, Strin
 
 fn build_metric(name: &'static str, mut samples_us: Vec<u64>, elapsed: Duration) -> MetricResult {
     samples_us.sort_unstable();
-    let len = samples_us.len().max(1);
+    let len = samples_us.len();
     let p50_us = percentile(&samples_us, 50);
     let p95_us = percentile(&samples_us, 95);
     let p99_us = percentile(&samples_us, 99);
     let safe_elapsed = elapsed.as_secs_f64().max(1e-9);
-    let ops_per_sec = (len as f64 / safe_elapsed).min(1e9);
+    let ops_per_sec = if len == 0 {
+        0.0
+    } else {
+        (len as f64 / safe_elapsed).min(1e9)
+    };
     MetricResult {
         name,
         p50_us,
@@ -389,9 +393,17 @@ fn print_metric(metric: &MetricResult) {
     );
 }
 
+fn validate_iterations(iterations: usize) -> Result<(), String> {
+    if iterations == 0 {
+        return Err("PASTIS_PERF_ITERATIONS must be greater than 0".to_string());
+    }
+    Ok(())
+}
+
 fn main() {
     let run = || -> Result<(), String> {
         let iterations = env_usize("PASTIS_PERF_ITERATIONS", DEFAULT_ITERATIONS)?;
+        validate_iterations(iterations)?;
         let budgets = PerfBudgets::from_env()?;
         let metadata = BenchmarkMetadata::collect(iterations);
 
@@ -508,5 +520,21 @@ MemTotal:       1024 kB
     fn build_metric_caps_unrealistic_ops_per_second() {
         let metric = build_metric("demo", vec![1, 2, 3], Duration::from_nanos(1));
         assert_eq!(metric.ops_per_sec, 1e9);
+    }
+
+    #[test]
+    fn build_metric_with_empty_samples_has_zero_throughput() {
+        let metric = build_metric("demo", Vec::new(), Duration::from_secs(1));
+        assert_eq!(metric.ops_per_sec, 0.0);
+        assert_eq!(metric.p50_us, 0);
+        assert_eq!(metric.p95_us, 0);
+        assert_eq!(metric.p99_us, 0);
+    }
+
+    #[test]
+    fn rejects_zero_iterations() {
+        let err = validate_iterations(0).expect_err("zero iterations must fail");
+        assert!(err.contains("PASTIS_PERF_ITERATIONS"));
+        assert!(validate_iterations(1).is_ok());
     }
 }
