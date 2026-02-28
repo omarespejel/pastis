@@ -110,12 +110,16 @@ impl ExecutionBackend for DemoExecution {
         _state: &mut dyn MutableState,
     ) -> Result<ExecutionOutput, ExecutionError> {
         Ok(ExecutionOutput {
-            receipts: vec![StarknetReceipt {
-                tx_hash: format!("0x{:x}", block.number).into(),
-                execution_status: true,
-                events: 0,
-                gas_consumed: 1,
-            }],
+            receipts: block
+                .transactions
+                .iter()
+                .map(|tx| StarknetReceipt {
+                    tx_hash: tx.hash.clone(),
+                    execution_status: true,
+                    events: 0,
+                    gas_consumed: 1,
+                })
+                .collect(),
             state_diff: StarknetStateDiff::default(),
             builtin_stats: BuiltinStats::default(),
             execution_time: Duration::from_millis(1),
@@ -151,6 +155,9 @@ struct DemoRuntime {
     last_nullifier_key: Option<String>,
     tick_successes: u64,
     tick_failures: u64,
+    replayed_tx_count: u64,
+    replay_failures: u64,
+    last_replay_error: Option<String>,
     last_error: Option<String>,
     recent_errors: VecDeque<String>,
 }
@@ -198,6 +205,9 @@ impl DemoRuntime {
             last_nullifier_key: None,
             tick_successes: 0,
             tick_failures: 0,
+            replayed_tx_count: 0,
+            replay_failures: 0,
+            last_replay_error: None,
             last_error: None,
             recent_errors: VecDeque::new(),
         }
@@ -214,9 +224,15 @@ impl DemoRuntime {
             .execute_block(&block, &mut self.execution_state)
         {
             let message = format!("execute block failed: {error}");
+            self.replay_failures = self.replay_failures.saturating_add(1);
+            self.last_replay_error = Some(message.clone());
             self.record_tick_error(message.clone());
             return Err(message);
         }
+        self.replayed_tx_count = self
+            .replayed_tx_count
+            .saturating_add(block.transactions.len() as u64);
+        self.last_replay_error = None;
         if let Err(error) = self.node.storage.insert_block(block, diff.clone()) {
             let message = format!("insert block failed: {error}");
             self.record_tick_error(message.clone());
@@ -376,8 +392,18 @@ struct RealSnapshot {
 }
 
 #[derive(Debug, Clone)]
+struct RealBlockReplay {
+    external_block_number: u64,
+    parent_hash: String,
+    sequencer_address: String,
+    timestamp: u64,
+    transaction_hashes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 struct RealFetch {
     snapshot: RealSnapshot,
+    replay: RealBlockReplay,
     state_diff: StarknetStateDiff,
     parse_warnings: Vec<String>,
 }
@@ -389,11 +415,14 @@ struct RuntimeDiagnostics {
     consecutive_failures: u64,
     commit_failure_count: u64,
     execution_failure_count: u64,
+    replayed_tx_count: u64,
+    replay_failures: u64,
     last_success_unix_seconds: Option<u64>,
     last_failure_unix_seconds: Option<u64>,
     last_processed_block: Option<u64>,
     last_local_block: Option<u64>,
     last_error: Option<String>,
+    last_replay_error: Option<String>,
     recent_errors: Vec<String>,
     anomaly_monitor_enabled: bool,
     retained_anomaly_count: usize,
@@ -410,11 +439,14 @@ impl RuntimeDiagnostics {
             consecutive_failures: 0,
             commit_failure_count: 0,
             execution_failure_count: 0,
+            replayed_tx_count: 0,
+            replay_failures: 0,
             last_success_unix_seconds: None,
             last_failure_unix_seconds: None,
             last_processed_block: None,
             last_local_block: None,
             last_error: None,
+            last_replay_error: None,
             recent_errors: Vec::new(),
             anomaly_monitor_enabled: false,
             retained_anomaly_count: 0,
@@ -486,7 +518,7 @@ impl RealRuntime {
                     .lock()
                     .map_err(|_| "real runtime lock poisoned".to_string())?;
                 guard.snapshot = Some(fetch.snapshot.clone());
-                for warning in fetch.parse_warnings {
+                for warning in &fetch.parse_warnings {
                     push_recent_error(&mut guard.recent_errors, format!("warning: {warning}"));
                 }
 
@@ -497,12 +529,26 @@ impl RealRuntime {
                     .unwrap_or(true);
 
                 if should_process {
-                    let local_block = ingest_block_from_snapshot(
-                        guard.next_local_block,
-                        fetch.snapshot.latest_block,
-                        &fetch.snapshot.state_root,
-                        fetch.snapshot.tx_count,
-                    );
+                    let local_block = ingest_block_from_fetch(guard.next_local_block, &fetch)
+                        .map_err(|error| {
+                            let message = format!(
+                                "failed to build replay block {}: {error}",
+                                guard.next_local_block
+                            );
+                            guard.diagnostics.failure_count =
+                                guard.diagnostics.failure_count.saturating_add(1);
+                            guard.diagnostics.replay_failures =
+                                guard.diagnostics.replay_failures.saturating_add(1);
+                            guard.diagnostics.consecutive_failures =
+                                guard.diagnostics.consecutive_failures.saturating_add(1);
+                            guard.diagnostics.last_failure_unix_seconds = Some(unix_now());
+                            guard.diagnostics.last_error = Some(message.clone());
+                            guard.diagnostics.last_replay_error = Some(message.clone());
+                            push_recent_error(&mut guard.recent_errors, message.clone());
+                            guard.diagnostics.recent_errors =
+                                guard.recent_errors.iter().cloned().collect();
+                            message
+                        })?;
                     let mut execution_state = std::mem::take(&mut guard.execution_state);
                     let execution_result = guard
                         .node
@@ -518,15 +564,23 @@ impl RealRuntime {
                             guard.diagnostics.failure_count.saturating_add(1);
                         guard.diagnostics.execution_failure_count =
                             guard.diagnostics.execution_failure_count.saturating_add(1);
+                        guard.diagnostics.replay_failures =
+                            guard.diagnostics.replay_failures.saturating_add(1);
                         guard.diagnostics.consecutive_failures =
                             guard.diagnostics.consecutive_failures.saturating_add(1);
                         guard.diagnostics.last_failure_unix_seconds = Some(unix_now());
                         guard.diagnostics.last_error = Some(message.clone());
+                        guard.diagnostics.last_replay_error = Some(message.clone());
                         push_recent_error(&mut guard.recent_errors, message.clone());
                         guard.diagnostics.recent_errors =
                             guard.recent_errors.iter().cloned().collect();
                         return Err(message);
                     }
+                    guard.diagnostics.replayed_tx_count = guard
+                        .diagnostics
+                        .replayed_tx_count
+                        .saturating_add(local_block.transactions.len() as u64);
+                    guard.diagnostics.last_replay_error = None;
                     if let Err(error) = guard
                         .node
                         .storage
@@ -742,6 +796,7 @@ impl RealRpcClient {
 
     async fn fetch_status(&self) -> Result<RealFetch, String> {
         let started = Instant::now();
+        let mut parse_warnings = Vec::new();
 
         let chain_id_raw = self.call("starknet_chainId", json!([])).await?;
         let chain_id = chain_id_raw
@@ -756,29 +811,59 @@ impl RealRpcClient {
             })?;
 
         let block_selector = json!([{ "block_number": latest_block }]);
+        let block_with_txs = self
+            .call("starknet_getBlockWithTxs", block_selector.clone())
+            .await?;
+        let replay = parse_block_with_txs(&block_with_txs, &mut parse_warnings)?;
+        if replay.external_block_number != latest_block {
+            parse_warnings.push(format!(
+                "block number mismatch between blockHashAndNumber ({latest_block}) and \
+                 getBlockWithTxs ({})",
+                replay.external_block_number
+            ));
+        }
         let tx_count_raw = self
             .call("starknet_getBlockTransactionCount", block_selector.clone())
             .await?;
-        let tx_count = value_as_u64(&tx_count_raw)
+        let tx_count_from_rpc = value_as_u64(&tx_count_raw)
             .ok_or_else(|| format!("invalid tx count payload: {tx_count_raw}"))?;
+        let tx_count_from_replay = replay.transaction_hashes.len() as u64;
+        if tx_count_from_rpc != tx_count_from_replay {
+            parse_warnings.push(format!(
+                "tx count mismatch between getBlockTransactionCount ({tx_count_from_rpc}) and \
+                 getBlockWithTxs ({tx_count_from_replay})"
+            ));
+        }
 
-        let state_update = self.call("starknet_getStateUpdate", block_selector).await?;
+        let state_update = self
+            .call("starknet_getStateUpdate", block_selector.clone())
+            .await?;
         let state_root = state_update
             .get("new_root")
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string();
-        let (state_diff, parse_warnings) = state_update_to_diff(&state_update)?;
+        if let Some(block_root) = block_with_txs.get("new_root").and_then(Value::as_str)
+            && block_root != state_root
+        {
+            parse_warnings.push(format!(
+                "state root mismatch between getBlockWithTxs ({block_root}) and \
+                 getStateUpdate ({state_root})"
+            ));
+        }
+        let (state_diff, mut state_diff_warnings) = state_update_to_diff(&state_update)?;
+        parse_warnings.append(&mut state_diff_warnings);
 
         Ok(RealFetch {
             snapshot: RealSnapshot {
                 chain_id,
                 latest_block,
                 state_root,
-                tx_count,
+                tx_count: tx_count_from_replay,
                 rpc_latency_ms: saturating_u128_to_u64(started.elapsed().as_millis()),
                 captured_unix_seconds: unix_now(),
             },
+            replay,
             state_diff,
             parse_warnings,
         })
@@ -834,6 +919,8 @@ struct StatusPayload {
     dual_mismatches: u64,
     dual_fast_executions: u64,
     dual_canonical_executions: u64,
+    replayed_tx_count: u64,
+    replay_failures: u64,
     data_age_seconds: Option<u64>,
     failure_count: u64,
     consecutive_failures: u64,
@@ -865,6 +952,9 @@ struct DebugPayload {
     dual_mismatches: u64,
     dual_fast_executions: u64,
     dual_canonical_executions: u64,
+    replayed_tx_count: u64,
+    replay_failures: u64,
+    last_replay_error: Option<String>,
     last_error: Option<String>,
     recent_errors: Vec<String>,
     snapshot_available: bool,
@@ -1016,6 +1106,8 @@ fn demo_status(
         dual_mismatches: metrics.mismatches,
         dual_fast_executions: metrics.fast_executions,
         dual_canonical_executions: metrics.canonical_executions,
+        replayed_tx_count: guard.replayed_tx_count,
+        replay_failures: guard.replay_failures,
         data_age_seconds: Some(0),
         failure_count: guard.tick_failures,
         consecutive_failures: 0,
@@ -1062,6 +1154,9 @@ fn demo_debug(runtime: &Arc<Mutex<DemoRuntime>>, refresh_ms: u64) -> Result<Debu
         dual_mismatches: metrics.mismatches,
         dual_fast_executions: metrics.fast_executions,
         dual_canonical_executions: metrics.canonical_executions,
+        replayed_tx_count: guard.replayed_tx_count,
+        replay_failures: guard.replay_failures,
+        last_replay_error: guard.last_replay_error.clone(),
         last_error: guard.last_error.clone(),
         recent_errors: guard.recent_errors.iter().cloned().collect(),
         snapshot_available: guard.tick_successes > 0,
@@ -1088,6 +1183,8 @@ async fn real_status(runtime: &Arc<RealRuntime>, refresh_ms: u64) -> Result<Stat
         dual_mismatches: diagnostics.dual_mismatches,
         dual_fast_executions: diagnostics.dual_fast_executions,
         dual_canonical_executions: diagnostics.dual_canonical_executions,
+        replayed_tx_count: diagnostics.replayed_tx_count,
+        replay_failures: diagnostics.replay_failures,
         data_age_seconds,
         failure_count: diagnostics.failure_count,
         consecutive_failures: diagnostics.consecutive_failures,
@@ -1123,6 +1220,9 @@ fn real_debug(runtime: &Arc<RealRuntime>, refresh_ms: u64) -> Result<DebugPayloa
         dual_mismatches: diagnostics.dual_mismatches,
         dual_fast_executions: diagnostics.dual_fast_executions,
         dual_canonical_executions: diagnostics.dual_canonical_executions,
+        replayed_tx_count: diagnostics.replayed_tx_count,
+        replay_failures: diagnostics.replay_failures,
+        last_replay_error: diagnostics.last_replay_error,
         last_error: diagnostics.last_error,
         recent_errors: diagnostics.recent_errors,
         snapshot_available: runtime.snapshot()?.is_some(),
@@ -1151,25 +1251,48 @@ fn demo_block(number: u64) -> StarknetBlock {
             },
         },
         protocol_version: Version::parse("0.14.2").expect("demo protocol version must be valid"),
-        transactions: Vec::new(),
+        transactions: vec![StarknetTransaction::new(format!("0x{number:x}"))],
     }
 }
 
-fn ingest_block_from_snapshot(
-    local_number: u64,
-    external_number: u64,
-    external_state_root: &str,
-    _external_tx_count: u64,
-) -> StarknetBlock {
-    let state_root = StarknetFelt::from_str(external_state_root)
+fn ingest_block_from_fetch(local_number: u64, fetch: &RealFetch) -> Result<StarknetBlock, String> {
+    let replay = &fetch.replay;
+    let parent_hash = StarknetFelt::from_str(&replay.parent_hash)
         .map(|felt| format!("{:#x}", felt))
-        .unwrap_or_else(|_| "0x0".to_string());
-    StarknetBlock {
+        .map_err(|error| {
+            format!(
+                "invalid replay parent hash `{}`: {error}",
+                replay.parent_hash
+            )
+        })?;
+    let state_root = StarknetFelt::from_str(&fetch.snapshot.state_root)
+        .map(|felt| format!("{:#x}", felt))
+        .map_err(|error| {
+            format!(
+                "invalid replay state root `{}`: {error}",
+                fetch.snapshot.state_root
+            )
+        })?;
+    let sequencer_address = StarknetFelt::from_str(&replay.sequencer_address)
+        .map(|felt| format!("{:#x}", felt))
+        .map_err(|error| {
+            format!(
+                "invalid replay sequencer address `{}`: {error}",
+                replay.sequencer_address
+            )
+        })?;
+    let transactions = replay
+        .transaction_hashes
+        .iter()
+        .cloned()
+        .map(StarknetTransaction::new)
+        .collect();
+    let block = StarknetBlock {
         number: local_number,
-        parent_hash: format!("0x{:x}", external_number.saturating_sub(1)),
+        parent_hash,
         state_root,
-        timestamp: unix_now(),
-        sequencer_address: ContractAddress::from("0x1"),
+        timestamp: replay.timestamp,
+        sequencer_address: ContractAddress::from(sequencer_address),
         gas_prices: BlockGasPrices {
             l1_gas: GasPricePerToken {
                 price_in_fri: 1,
@@ -1184,9 +1307,13 @@ fn ingest_block_from_snapshot(
                 price_in_wei: 1,
             },
         },
-        protocol_version: Version::parse("0.14.2").expect("ingest protocol version must be valid"),
-        transactions: Vec::new(),
-    }
+        protocol_version: Version::parse("0.14.2").expect("replay protocol version must be valid"),
+        transactions,
+    };
+    block
+        .validate()
+        .map_err(|error| format!("invalid replay block {local_number}: {error}"))?;
+    Ok(block)
 }
 
 fn parse_dashboard_config() -> Result<DashboardConfig, String> {
@@ -1362,6 +1489,79 @@ fn parse_env_usize(name: &str, default: usize) -> Result<usize, String> {
             .map_err(|error| format!("invalid {name} value `{raw}`: {error}")),
         Err(_) => Ok(default),
     }
+}
+
+fn parse_block_with_txs(
+    block_with_txs: &Value,
+    warnings: &mut Vec<String>,
+) -> Result<RealBlockReplay, String> {
+    let external_block_number = value_as_u64(
+        block_with_txs
+            .get("block_number")
+            .ok_or_else(|| format!("getBlockWithTxs missing block_number: {block_with_txs}"))?,
+    )
+    .ok_or_else(|| format!("invalid getBlockWithTxs block_number: {block_with_txs}"))?;
+    let parent_hash_raw = block_with_txs
+        .get("parent_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("getBlockWithTxs missing parent_hash: {block_with_txs}"))?;
+    let parent_hash = StarknetFelt::from_str(parent_hash_raw)
+        .map(|felt| format!("{:#x}", felt))
+        .map_err(|error| {
+            format!("invalid getBlockWithTxs parent_hash `{parent_hash_raw}`: {error}")
+        })?;
+    let sequencer_raw = block_with_txs
+        .get("sequencer_address")
+        .and_then(Value::as_str)
+        .unwrap_or("0x1");
+    let sequencer_address = StarknetFelt::from_str(sequencer_raw)
+        .map(|felt| format!("{:#x}", felt))
+        .map_err(|error| {
+            format!("invalid getBlockWithTxs sequencer_address `{sequencer_raw}`: {error}")
+        })?;
+    let timestamp = value_as_u64(
+        block_with_txs
+            .get("timestamp")
+            .ok_or_else(|| format!("getBlockWithTxs missing timestamp: {block_with_txs}"))?,
+    )
+    .ok_or_else(|| format!("invalid getBlockWithTxs timestamp: {block_with_txs}"))?;
+    let transactions = block_with_txs
+        .get("transactions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("getBlockWithTxs missing transactions array: {block_with_txs}"))?;
+    let mut transaction_hashes = Vec::with_capacity(transactions.len());
+    for (idx, tx) in transactions.iter().enumerate() {
+        let tx_hash_raw = if let Some(raw) = tx.as_str() {
+            raw
+        } else {
+            tx.get("transaction_hash")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    format!("transaction {idx} in getBlockWithTxs missing transaction_hash: {tx}")
+                })?
+        };
+        let tx_hash = StarknetFelt::from_str(tx_hash_raw)
+            .map(|felt| format!("{:#x}", felt))
+            .map_err(|error| {
+                format!("invalid transaction_hash `{tx_hash_raw}` at index {idx}: {error}")
+            })?;
+        transaction_hashes.push(tx_hash);
+    }
+    if let Some(status_raw) = block_with_txs.get("status").and_then(Value::as_str)
+        && status_raw.eq_ignore_ascii_case("PENDING")
+    {
+        warnings.push(
+            "getBlockWithTxs returned a pending block; replay semantics may change on reorg"
+                .to_string(),
+        );
+    }
+    Ok(RealBlockReplay {
+        external_block_number,
+        parent_hash,
+        sequencer_address,
+        timestamp,
+        transaction_hashes,
+    })
 }
 
 fn state_update_to_diff(state_update: &Value) -> Result<(StarknetStateDiff, Vec<String>), String> {
@@ -1819,6 +2019,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <div class="card"><h3>Dual Mismatches</h3><div class="value danger" id="dualMismatches">-</div></div>
       <div class="card"><h3>Dual Fast Execs</h3><div class="value" id="dualFast">-</div></div>
       <div class="card"><h3>Dual Canonical Execs</h3><div class="value" id="dualCanonical">-</div></div>
+      <div class="card"><h3>Replayed Txs</h3><div class="value" id="replayedTxs">-</div></div>
+      <div class="card"><h3>Replay Failures</h3><div class="value danger" id="replayFailures">-</div></div>
       <div class="card"><h3>Data Age (s)</h3><div class="value" id="dataAge">-</div></div>
       <div class="card"><h3>Failures</h3><div class="value" id="failureCount">-</div></div>
     </div>
@@ -1900,6 +2102,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       document.getElementById('dualMismatches').textContent = status.dual_mismatches;
       document.getElementById('dualFast').textContent = status.dual_fast_executions;
       document.getElementById('dualCanonical').textContent = status.dual_canonical_executions;
+      document.getElementById('replayedTxs').textContent = status.replayed_tx_count;
+      document.getElementById('replayFailures').textContent = status.replay_failures;
       document.getElementById('dataAge').textContent =
         status.data_age_seconds === null ? 'n/a' : String(status.data_age_seconds);
       document.getElementById('failureCount').textContent =
@@ -1931,9 +2135,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
 
       const fetchMs = Math.round(performance.now() - started);
+      const replayError = debug.last_replay_error ? ` | last_replay_error=${debug.last_replay_error}` : '';
       const lastError = debug.last_error ? ` | last_error=${debug.last_error}` : '';
       document.getElementById('meta').textContent =
-        `Refreshed in ${fetchMs}ms | API refresh=${status.refresh_ms}ms | anomaly source=${anomalies.source}${lastError}`;
+        `Refreshed in ${fetchMs}ms | API refresh=${status.refresh_ms}ms | anomaly source=${anomalies.source}${replayError}${lastError}`;
     }
 
     load();
@@ -2096,18 +2301,119 @@ mod tests {
     }
 
     #[test]
-    fn ingest_block_from_snapshot_builds_valid_block() {
-        let block = ingest_block_from_snapshot(3, 7_000_123, "0x123", 11);
+    fn ingest_block_from_fetch_builds_valid_block_and_rejects_invalid_root() {
+        let fetch = RealFetch {
+            snapshot: RealSnapshot {
+                chain_id: "SN_MAIN".to_string(),
+                latest_block: 7_000_123,
+                state_root: "0x123".to_string(),
+                tx_count: 0,
+                rpc_latency_ms: 0,
+                captured_unix_seconds: 1_700_000_000,
+            },
+            replay: RealBlockReplay {
+                external_block_number: 7_000_123,
+                parent_hash: format!("0x{:x}", 7_000_122_u64),
+                sequencer_address: "0x1".to_string(),
+                timestamp: 1_700_000_000,
+                transaction_hashes: Vec::new(),
+            },
+            state_diff: StarknetStateDiff::default(),
+            parse_warnings: Vec::new(),
+        };
+        let block = ingest_block_from_fetch(3, &fetch).expect("fetch block should be valid");
         assert_eq!(block.number, 3);
         assert_eq!(block.parent_hash, format!("0x{:x}", 7_000_122_u64));
         assert_eq!(block.state_root, "0x123");
         block.validate().expect("ingested block must be valid");
 
-        let invalid_root = ingest_block_from_snapshot(4, 7_000_124, "bad-root", 12);
-        assert_eq!(invalid_root.state_root, "0x0");
-        invalid_root
-            .validate()
-            .expect("fallback state root keeps block valid");
+        let mut invalid_fetch = fetch;
+        invalid_fetch.snapshot.state_root = "bad-root".to_string();
+        let error = ingest_block_from_fetch(4, &invalid_fetch).expect_err("invalid root must fail");
+        assert!(error.contains("invalid replay state root"));
+    }
+
+    #[test]
+    fn parse_block_with_txs_parses_variants_and_flags_pending() {
+        let mut warnings = Vec::new();
+        let block = json!({
+            "block_number": 44,
+            "parent_hash": "0xabc",
+            "sequencer_address": "0x123",
+            "timestamp": 1_701_000_000u64,
+            "status": "PENDING",
+            "transactions": [
+                "0x1",
+                {"transaction_hash": "0x2"}
+            ]
+        });
+
+        let replay = parse_block_with_txs(&block, &mut warnings).expect("block should parse");
+        assert_eq!(replay.external_block_number, 44);
+        assert_eq!(replay.parent_hash, "0xabc");
+        assert_eq!(replay.sequencer_address, "0x123");
+        assert_eq!(replay.timestamp, 1_701_000_000);
+        assert_eq!(replay.transaction_hashes, vec!["0x1", "0x2"]);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("pending block")),
+            "expected pending warning, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn parse_block_with_txs_rejects_missing_transaction_hash() {
+        let mut warnings = Vec::new();
+        let block = json!({
+            "block_number": 44,
+            "parent_hash": "0xabc",
+            "sequencer_address": "0x123",
+            "timestamp": 1_701_000_000u64,
+            "transactions": [
+                {"type": "INVOKE"}
+            ]
+        });
+
+        let error =
+            parse_block_with_txs(&block, &mut warnings).expect_err("missing hash must fail");
+        assert!(error.contains("missing transaction_hash"));
+    }
+
+    #[test]
+    fn ingest_block_from_fetch_uses_replay_transaction_hashes() {
+        let fetch = RealFetch {
+            snapshot: RealSnapshot {
+                chain_id: "SN_MAIN".to_string(),
+                latest_block: 99,
+                state_root: "0x555".to_string(),
+                tx_count: 2,
+                rpc_latency_ms: 10,
+                captured_unix_seconds: 1_700_000_000,
+            },
+            replay: RealBlockReplay {
+                external_block_number: 99,
+                parent_hash: "0x777".to_string(),
+                sequencer_address: "0x123".to_string(),
+                timestamp: 1_701_000_000,
+                transaction_hashes: vec!["0x10".to_string(), "0x20".to_string()],
+            },
+            state_diff: StarknetStateDiff::default(),
+            parse_warnings: Vec::new(),
+        };
+
+        let block = ingest_block_from_fetch(8, &fetch).expect("fetch should convert to block");
+        assert_eq!(block.number, 8);
+        assert_eq!(block.parent_hash, "0x777");
+        assert_eq!(block.state_root, "0x555");
+        assert_eq!(
+            block
+                .transactions
+                .iter()
+                .map(|tx| tx.hash.as_ref().to_string())
+                .collect::<Vec<_>>(),
+            vec!["0x10".to_string(), "0x20".to_string()]
+        );
     }
 
     #[test]
