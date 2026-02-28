@@ -1,12 +1,15 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::fs::{self, OpenOptions};
 use std::future::Future;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use semver::Version;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::sleep;
 
@@ -59,6 +62,7 @@ pub struct RuntimeConfig {
     pub retry: RpcRetryConfig,
     pub peer_count_hint: usize,
     pub require_peers: bool,
+    pub local_journal_path: Option<String>,
 }
 
 impl RuntimeConfig {
@@ -77,6 +81,11 @@ impl RuntimeConfig {
         }
         if self.rpc_timeout.is_zero() {
             return Err("rpc_timeout must be > 0".to_string());
+        }
+        if let Some(path) = self.local_journal_path.as_deref()
+            && path.trim().is_empty()
+        {
+            return Err("local_journal_path cannot be empty".to_string());
         }
         Ok(())
     }
@@ -102,6 +111,7 @@ pub struct RuntimeDiagnostics {
     pub replay_failures: u64,
     pub consensus_rejections: u64,
     pub network_failures: u64,
+    pub journal_failures: u64,
     pub execution_failures: u64,
     pub commit_failures: u64,
     pub reorg_events: u64,
@@ -110,6 +120,101 @@ pub struct RuntimeDiagnostics {
 }
 
 type RuntimeNode = StarknetNode<ThreadSafeStorage<InMemoryStorage>, DualExecutionBackend>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LocalJournalEntry {
+    block: StarknetBlock,
+    state_diff: StarknetStateDiff,
+}
+
+#[derive(Debug, Clone)]
+struct LocalChainJournal {
+    path: PathBuf,
+}
+
+impl LocalChainJournal {
+    fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn load_entries(&self) -> Result<Vec<LocalJournalEntry>, String> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let raw = fs::read_to_string(&self.path).map_err(|error| {
+            format!(
+                "failed to read local journal {}: {error}",
+                self.path.display()
+            )
+        })?;
+        let mut entries = Vec::new();
+        for (idx, line) in raw.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let entry = serde_json::from_str::<LocalJournalEntry>(trimmed).map_err(|error| {
+                format!(
+                    "failed to decode local journal {} line {}: {error}",
+                    self.path.display(),
+                    idx + 1
+                )
+            })?;
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
+    fn append_entry(&self, entry: &LocalJournalEntry) -> Result<(), String> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "failed to create local journal directory {}: {error}",
+                    parent.display()
+                )
+            })?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|error| {
+                format!(
+                    "failed to open local journal for append {}: {error}",
+                    self.path.display()
+                )
+            })?;
+        let encoded = serde_json::to_string(entry).map_err(|error| {
+            format!(
+                "failed to encode local journal entry for {}: {error}",
+                self.path.display()
+            )
+        })?;
+        file.write_all(encoded.as_bytes()).map_err(|error| {
+            format!(
+                "failed to write local journal entry to {}: {error}",
+                self.path.display()
+            )
+        })?;
+        file.write_all(b"\n").map_err(|error| {
+            format!(
+                "failed to write local journal newline to {}: {error}",
+                self.path.display()
+            )
+        })?;
+        file.sync_data().map_err(|error| {
+            format!(
+                "failed to fsync local journal {}: {error}",
+                self.path.display()
+            )
+        })?;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone)]
 struct RuntimeBlockReplay {
@@ -212,6 +317,7 @@ pub struct NodeRuntime {
     network: Arc<dyn NetworkBackend>,
     node: RuntimeNode,
     execution_state: InMemoryState,
+    journal: Option<LocalChainJournal>,
     replay: ReplayPipeline,
     poll_interval: Duration,
     retry: RpcRetryConfig,
@@ -243,7 +349,15 @@ impl NodeRuntime {
         network: Arc<dyn NetworkBackend>,
     ) -> Result<Self, String> {
         config.validate()?;
-        let node = build_runtime_node(config.chain_id.clone());
+        let mut node = build_runtime_node(config.chain_id.clone());
+        let mut execution_state = InMemoryState::default();
+        let journal = config
+            .local_journal_path
+            .as_deref()
+            .map(LocalChainJournal::new);
+        if let Some(journal) = journal.as_ref() {
+            restore_storage_from_journal(&mut node, &mut execution_state, journal)?;
+        }
 
         let mut replay = new_replay_pipeline(
             config.replay_window,
@@ -303,7 +417,8 @@ impl NodeRuntime {
             consensus,
             network,
             node,
-            execution_state: InMemoryState::default(),
+            execution_state,
+            journal,
             replay,
             poll_interval: config.poll_interval,
             retry: config.retry,
@@ -427,6 +542,7 @@ impl NodeRuntime {
                 self.record_failure(message.clone());
                 message
             })?;
+            let local_block_for_journal = local_block.clone();
 
             if let Err(error) = self
                 .node
@@ -454,6 +570,21 @@ impl NodeRuntime {
                 );
                 self.record_failure(message.clone());
                 return Err(message);
+            }
+            if let Some(journal) = &self.journal {
+                let journal_entry = LocalJournalEntry {
+                    block: local_block_for_journal,
+                    state_diff: fetch.state_diff.clone(),
+                };
+                if let Err(error) = journal.append_entry(&journal_entry) {
+                    self.diagnostics.journal_failures =
+                        self.diagnostics.journal_failures.saturating_add(1);
+                    let message = format!(
+                        "local journal append failed after committing local block {local_block_number}: {error}"
+                    );
+                    self.record_failure(message.clone());
+                    return Err(message);
+                }
             }
 
             if let Err(error) = self
@@ -756,6 +887,54 @@ fn new_replay_pipeline(
             pipeline.with_checkpoint_store(Arc::new(FileReplayCheckpointStore::new(path)))
         }
         None => Ok(pipeline),
+    }
+}
+
+fn restore_storage_from_journal(
+    node: &mut RuntimeNode,
+    execution_state: &mut InMemoryState,
+    journal: &LocalChainJournal,
+) -> Result<(), String> {
+    let entries = journal.load_entries()?;
+    for (idx, entry) in entries.into_iter().enumerate() {
+        let expected = node
+            .storage
+            .latest_block_number()
+            .map_err(|error| {
+                format!("failed to read storage tip while replaying journal: {error}")
+            })?
+            .saturating_add(1);
+        if entry.block.number != expected {
+            return Err(format!(
+                "local journal {} entry {} is non-sequential: expected block {}, found {}",
+                journal.path().display(),
+                idx + 1,
+                expected,
+                entry.block.number
+            ));
+        }
+        node.storage
+            .insert_block(entry.block, entry.state_diff.clone())
+            .map_err(|error| {
+                format!(
+                    "failed to restore local journal {} entry {}: {error}",
+                    journal.path().display(),
+                    idx + 1
+                )
+            })?;
+        apply_state_diff_to_in_memory_state(execution_state, &entry.state_diff);
+    }
+    Ok(())
+}
+
+fn apply_state_diff_to_in_memory_state(state: &mut InMemoryState, diff: &StarknetStateDiff) {
+    for (contract, writes) in &diff.storage_diffs {
+        for (key, value) in writes {
+            state.set_storage(contract.clone(), key.clone(), *value);
+        }
+    }
+    for (contract, nonce) in &diff.nonces {
+        state.set_nonce(contract.clone(), *nonce);
     }
 }
 
@@ -1291,6 +1470,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
+    use tempfile::tempdir;
+
     use super::*;
 
     #[derive(Clone)]
@@ -1381,6 +1562,7 @@ mod tests {
             retry: RpcRetryConfig::default(),
             peer_count_hint: 0,
             require_peers: false,
+            local_journal_path: None,
         }
     }
 
@@ -1506,5 +1688,63 @@ mod tests {
                 .expect("storage read should work"),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_restores_local_chain_from_journal_on_restart() {
+        let dir = tempdir().expect("tempdir");
+        let journal_path = dir.path().join("local-journal.jsonl");
+        let checkpoint_path = dir.path().join("replay-checkpoint.json");
+
+        let mut config = runtime_config();
+        config.local_journal_path = Some(journal_path.display().to_string());
+        config.replay_checkpoint_path = Some(checkpoint_path.display().to_string());
+
+        let consensus = Arc::new(HealthyConsensus);
+        let network = Arc::new(MockNetwork {
+            healthy: true,
+            peers: 3,
+        });
+        let mut runtime = NodeRuntime::new_with_backends(
+            config.clone(),
+            Arc::new(MockSyncSource::with_blocks(
+                "SN_MAIN",
+                1,
+                vec![sample_fetch(1, "0x0", "0x1")],
+            )),
+            consensus.clone(),
+            network.clone(),
+        )
+        .expect("runtime should initialize");
+        runtime.poll_once().await.expect("first poll should commit");
+        assert_eq!(
+            runtime
+                .storage()
+                .latest_block_number()
+                .expect("storage read should work"),
+            1
+        );
+
+        let restarted = NodeRuntime::new_with_backends(
+            config,
+            Arc::new(MockSyncSource::with_blocks("SN_MAIN", 1, Vec::new())),
+            consensus,
+            network,
+        )
+        .expect("runtime should restore from journal");
+        assert_eq!(
+            restarted
+                .storage()
+                .latest_block_number()
+                .expect("restored storage read should work"),
+            1
+        );
+        let progress = restarted
+            .sync_progress_handle()
+            .lock()
+            .expect("sync progress lock should not be poisoned")
+            .clone();
+        assert_eq!(progress.starting_block, 1);
+        assert_eq!(progress.current_block, 1);
     }
 }

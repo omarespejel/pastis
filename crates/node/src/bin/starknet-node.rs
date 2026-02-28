@@ -22,6 +22,7 @@ use starknet_node_storage::{InMemoryStorage, ThreadSafeStorage};
 
 const DEFAULT_RPC_BIND: &str = "127.0.0.1:9545";
 const DEFAULT_REPLAY_CHECKPOINT_PATH: &str = ".pastis/node-replay-checkpoint.json";
+const DEFAULT_LOCAL_JOURNAL_PATH: &str = ".pastis/node-local-journal.jsonl";
 const DEFAULT_P2P_HEARTBEAT_MS: u64 = 30_000;
 
 #[derive(Debug, Clone)]
@@ -33,6 +34,7 @@ struct DaemonConfig {
     replay_window: u64,
     max_replay_per_poll: u64,
     replay_checkpoint_path: Option<String>,
+    local_journal_path: Option<String>,
     rpc_timeout_secs: u64,
     rpc_max_retries: u32,
     rpc_retry_backoff_ms: u64,
@@ -70,6 +72,7 @@ async fn main() -> Result<(), String> {
         replay_window: config.replay_window,
         max_replay_per_poll: config.max_replay_per_poll,
         replay_checkpoint_path: config.replay_checkpoint_path.clone(),
+        local_journal_path: config.local_journal_path.clone(),
         poll_interval: Duration::from_millis(config.poll_ms),
         rpc_timeout: Duration::from_secs(config.rpc_timeout_secs),
         retry: RpcRetryConfig {
@@ -123,6 +126,9 @@ async fn main() -> Result<(), String> {
     );
     println!("rpc_bind: {}", config.rpc_bind);
     println!("poll_ms: {}", config.poll_ms);
+    if let Some(path) = &config.local_journal_path {
+        println!("local_journal_path: {path}");
+    }
     println!("require_peers: {}", config.require_peers);
 
     let rpc_handle = tokio::spawn(async move {
@@ -233,6 +239,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
     let mut cli_replay_window: Option<u64> = None;
     let mut cli_max_replay_per_poll: Option<u64> = None;
     let mut cli_replay_checkpoint_path: Option<String> = None;
+    let mut cli_local_journal_path: Option<String> = None;
     let mut cli_rpc_timeout_secs: Option<u64> = None;
     let mut cli_rpc_max_retries: Option<u32> = None;
     let mut cli_rpc_retry_backoff_ms: Option<u64> = None;
@@ -285,6 +292,12 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
                 cli_replay_checkpoint_path = Some(
                     args.next()
                         .ok_or_else(|| "--replay-checkpoint requires a value".to_string())?,
+                );
+            }
+            "--local-journal" => {
+                cli_local_journal_path = Some(
+                    args.next()
+                        .ok_or_else(|| "--local-journal requires a value".to_string())?,
                 );
             }
             "--rpc-timeout-secs" => {
@@ -402,6 +415,9 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         replay_checkpoint_path: cli_replay_checkpoint_path
             .or_else(|| env::var("PASTIS_REPLAY_CHECKPOINT_PATH").ok())
             .or_else(|| Some(DEFAULT_REPLAY_CHECKPOINT_PATH.to_string())),
+        local_journal_path: cli_local_journal_path
+            .or_else(|| env::var("PASTIS_LOCAL_JOURNAL_PATH").ok())
+            .or_else(|| Some(DEFAULT_LOCAL_JOURNAL_PATH.to_string())),
         rpc_timeout_secs,
         rpc_max_retries,
         rpc_retry_backoff_ms,
@@ -480,6 +496,7 @@ options:\n\
   --replay-window <blocks>           Replay window size\n\
   --max-replay-per-poll <blocks>     Max blocks to process per poll\n\
   --replay-checkpoint <path>         Replay checkpoint file path\n\
+  --local-journal <path>             Local block/state journal path\n\
   --rpc-timeout-secs <secs>          Upstream RPC timeout\n\
   --rpc-max-retries <n>              Upstream RPC max retries\n\
   --rpc-retry-backoff-ms <ms>        Retry backoff base\n\
@@ -494,6 +511,7 @@ environment:\n\
   PASTIS_REPLAY_WINDOW               Replay window\n\
   PASTIS_MAX_REPLAY_PER_POLL         Max replay per poll\n\
   PASTIS_REPLAY_CHECKPOINT_PATH      Replay checkpoint path\n\
+  PASTIS_LOCAL_JOURNAL_PATH          Local block/state journal path\n\
   PASTIS_RPC_TIMEOUT_SECS            Upstream RPC timeout seconds\n\
   PASTIS_RPC_MAX_RETRIES             Upstream RPC max retries\n\
   PASTIS_RPC_RETRY_BACKOFF_MS        Upstream RPC retry backoff ms\n\
