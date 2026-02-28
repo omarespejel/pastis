@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -35,6 +35,7 @@ use tokio::time::interval;
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
 const DEFAULT_REFRESH_MS: u64 = 2_000;
 const DEMO_API_KEY: &str = "boss-demo-key";
+const MAX_RECENT_ERRORS: usize = 16;
 
 const WBTC_CONTRACT: &str = "0x111";
 const STRKBTC_SHIELDED_POOL: &str = "0x222";
@@ -85,7 +86,7 @@ struct AppState {
 #[derive(Clone)]
 enum DashboardSource {
     Demo { runtime: Arc<Mutex<DemoRuntime>> },
-    Real { client: Arc<RealRpcClient> },
+    Real { runtime: Arc<RealRuntime> },
 }
 
 struct DemoExecution;
@@ -135,6 +136,10 @@ struct DemoRuntime {
     nullifier_count: u64,
     merkle_root: u64,
     last_nullifier_key: Option<String>,
+    tick_successes: u64,
+    tick_failures: u64,
+    last_error: Option<String>,
+    recent_errors: VecDeque<String>,
 }
 
 impl DemoRuntime {
@@ -177,6 +182,10 @@ impl DemoRuntime {
             nullifier_count: 0,
             merkle_root: 0x100,
             last_nullifier_key: None,
+            tick_successes: 0,
+            tick_failures: 0,
+            last_error: None,
+            recent_errors: VecDeque::new(),
         }
     }
 
@@ -185,15 +194,25 @@ impl DemoRuntime {
         let block = demo_block(block_number);
         let diff = self.build_state_diff(block_number);
 
-        self.node
-            .storage
-            .insert_block(block, diff.clone())
-            .map_err(|error| format!("insert block failed: {error}"))?;
+        if let Err(error) = self.node.storage.insert_block(block, diff.clone()) {
+            let message = format!("insert block failed: {error}");
+            self.record_tick_error(message.clone());
+            return Err(message);
+        }
         if let Ok(mut btcfi) = self.btcfi.lock() {
             let _ = btcfi.process_block(block_number, &diff);
+        } else {
+            self.record_tick_error("btcfi lock poisoned while processing block".to_string());
         }
         self.next_block = self.next_block.saturating_add(1);
+        self.tick_successes = self.tick_successes.saturating_add(1);
         Ok(())
+    }
+
+    fn record_tick_error(&mut self, message: String) {
+        self.tick_failures = self.tick_failures.saturating_add(1);
+        self.last_error = Some(message.clone());
+        push_recent_error(&mut self.recent_errors, message);
     }
 
     fn build_state_diff(&mut self, block_number: u64) -> StarknetStateDiff {
@@ -316,15 +335,146 @@ struct RealRpcClient {
     rpc_url: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize)]
 struct RealSnapshot {
     chain_id: String,
     latest_block: u64,
     state_root: String,
     tx_count: u64,
     rpc_latency_ms: u64,
+    captured_unix_seconds: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeDiagnostics {
+    success_count: u64,
+    failure_count: u64,
+    consecutive_failures: u64,
+    last_success_unix_seconds: Option<u64>,
+    last_failure_unix_seconds: Option<u64>,
+    last_error: Option<String>,
+    recent_errors: Vec<String>,
+}
+
+impl RuntimeDiagnostics {
+    fn new() -> Self {
+        Self {
+            success_count: 0,
+            failure_count: 0,
+            consecutive_failures: 0,
+            last_success_unix_seconds: None,
+            last_failure_unix_seconds: None,
+            last_error: None,
+            recent_errors: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RealRuntimeState {
+    snapshot: Option<RealSnapshot>,
+    diagnostics: RuntimeDiagnostics,
+    recent_errors: VecDeque<String>,
+}
+
+#[derive(Clone)]
+struct RealRuntime {
+    client: Arc<RealRpcClient>,
+    state: Arc<Mutex<RealRuntimeState>>,
+}
+
+impl RealRuntime {
+    fn new(client: RealRpcClient) -> Self {
+        Self {
+            client: Arc::new(client),
+            state: Arc::new(Mutex::new(RealRuntimeState {
+                snapshot: None,
+                diagnostics: RuntimeDiagnostics::new(),
+                recent_errors: VecDeque::new(),
+            })),
+        }
+    }
+
+    async fn poll_once(&self) -> Result<RealSnapshot, String> {
+        match self.client.fetch_status().await {
+            Ok(snapshot) => {
+                let mut guard = self
+                    .state
+                    .lock()
+                    .map_err(|_| "real runtime lock poisoned".to_string())?;
+                guard.snapshot = Some(snapshot.clone());
+                guard.diagnostics.success_count = guard.diagnostics.success_count.saturating_add(1);
+                guard.diagnostics.consecutive_failures = 0;
+                guard.diagnostics.last_success_unix_seconds = Some(unix_now());
+                guard.diagnostics.last_error = None;
+                guard.diagnostics.recent_errors = guard.recent_errors.iter().cloned().collect();
+                Ok(snapshot)
+            }
+            Err(error) => {
+                let mut guard = self
+                    .state
+                    .lock()
+                    .map_err(|_| "real runtime lock poisoned".to_string())?;
+                guard.diagnostics.failure_count = guard.diagnostics.failure_count.saturating_add(1);
+                guard.diagnostics.consecutive_failures =
+                    guard.diagnostics.consecutive_failures.saturating_add(1);
+                guard.diagnostics.last_failure_unix_seconds = Some(unix_now());
+                guard.diagnostics.last_error = Some(error.clone());
+                push_recent_error(&mut guard.recent_errors, error.clone());
+                guard.diagnostics.recent_errors = guard.recent_errors.iter().cloned().collect();
+                Err(error)
+            }
+        }
+    }
+
+    fn snapshot(&self) -> Result<Option<RealSnapshot>, String> {
+        let guard = self
+            .state
+            .lock()
+            .map_err(|_| "real runtime lock poisoned".to_string())?;
+        Ok(guard.snapshot.clone())
+    }
+
+    async fn snapshot_or_refresh(&self) -> Result<RealSnapshot, String> {
+        if let Some(snapshot) = self.snapshot()? {
+            return Ok(snapshot);
+        }
+        self.poll_once().await
+    }
+
+    fn diagnostics(&self) -> Result<RuntimeDiagnostics, String> {
+        let guard = self
+            .state
+            .lock()
+            .map_err(|_| "real runtime lock poisoned".to_string())?;
+        Ok(guard.diagnostics.clone())
+    }
+
+    fn anomaly_notes(&self, limit: usize) -> Result<Vec<String>, String> {
+        let diagnostics = self.diagnostics()?;
+        let mut notes = vec![format!(
+            "Real mode connected to {}. MCP anomaly source is not configured in this process yet.",
+            self.client.rpc_url
+        )];
+        if let Some(last_error) = diagnostics.last_error {
+            notes.push(format!("Latest RPC error: {last_error}"));
+        }
+        if diagnostics.consecutive_failures > 0 {
+            notes.push(format!(
+                "Consecutive RPC failures: {}",
+                diagnostics.consecutive_failures
+            ));
+        }
+        if limit > notes.len() {
+            notes.push(
+                "Connect a Pastis MCP anomaly endpoint to replace these notes with live alerts."
+                    .to_string(),
+            );
+        }
+        notes.truncate(limit);
+        Ok(notes)
+    }
+}
 impl RealRpcClient {
     fn new(rpc_url: String) -> Result<Self, String> {
         let http = reqwest::Client::builder()
@@ -369,22 +519,8 @@ impl RealRpcClient {
             state_root,
             tx_count,
             rpc_latency_ms: saturating_u128_to_u64(started.elapsed().as_millis()),
+            captured_unix_seconds: unix_now(),
         })
-    }
-
-    async fn fetch_anomalies(&self, limit: usize) -> Result<Vec<String>, String> {
-        let mut notes = vec![format!(
-            "Real mode connected to {}. No MCP anomaly source configured yet.",
-            self.rpc_url
-        )];
-        if limit > 1 {
-            notes.push(
-                "Connect this dashboard to a Pastis MCP anomaly endpoint for live alerts."
-                    .to_string(),
-            );
-        }
-        notes.truncate(limit);
-        Ok(notes)
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -434,6 +570,10 @@ struct StatusPayload {
     mcp_roundtrip_ok: bool,
     anomaly_source: String,
     recent_anomaly_count: usize,
+    data_age_seconds: Option<u64>,
+    failure_count: u64,
+    consecutive_failures: u64,
+    last_error: Option<String>,
     refresh_ms: u64,
 }
 
@@ -441,6 +581,20 @@ struct StatusPayload {
 struct AnomaliesPayload {
     source: String,
     anomalies: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DebugPayload {
+    mode: String,
+    refresh_ms: u64,
+    success_count: u64,
+    failure_count: u64,
+    consecutive_failures: u64,
+    last_success_unix_seconds: Option<u64>,
+    last_failure_unix_seconds: Option<u64>,
+    last_error: Option<String>,
+    recent_errors: Vec<String>,
+    snapshot_available: bool,
 }
 
 #[tokio::main]
@@ -469,10 +623,21 @@ async fn main() -> Result<(), String> {
             let rpc_url = config.rpc_url.clone().ok_or_else(|| {
                 "real mode requires --rpc-url <url> or STARKNET_RPC_URL".to_string()
             })?;
-            let client = RealRpcClient::new(rpc_url)?;
-            DashboardSource::Real {
-                client: Arc::new(client),
+            let runtime = Arc::new(RealRuntime::new(RealRpcClient::new(rpc_url)?));
+            let poll_runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                let mut ticker = interval(Duration::from_millis(refresh_ms));
+                loop {
+                    ticker.tick().await;
+                    if let Err(error) = poll_runtime.poll_once().await {
+                        eprintln!("warning: real runtime poll failed: {error}");
+                    }
+                }
+            });
+            if let Err(error) = runtime.poll_once().await {
+                eprintln!("warning: initial real runtime poll failed: {error}");
             }
+            DashboardSource::Real { runtime }
         }
     };
 
@@ -480,6 +645,7 @@ async fn main() -> Result<(), String> {
         .route("/", get(index))
         .route("/api/status", get(status))
         .route("/api/anomalies", get(anomalies))
+        .route("/api/debug", get(debug))
         .with_state(AppState { source, refresh_ms });
 
     let listener = TcpListener::bind(&config.bind_addr)
@@ -508,7 +674,7 @@ async fn status(
 ) -> Result<Json<StatusPayload>, (StatusCode, String)> {
     let payload = match &state.source {
         DashboardSource::Demo { runtime } => demo_status(runtime, state.refresh_ms),
-        DashboardSource::Real { client } => real_status(client, state.refresh_ms).await,
+        DashboardSource::Real { runtime } => real_status(runtime, state.refresh_ms).await,
     };
     payload
         .map(Json)
@@ -520,7 +686,17 @@ async fn anomalies(
 ) -> Result<Json<AnomaliesPayload>, (StatusCode, String)> {
     let payload = match &state.source {
         DashboardSource::Demo { runtime } => demo_anomalies(runtime),
-        DashboardSource::Real { client } => real_anomalies(client).await,
+        DashboardSource::Real { runtime } => real_anomalies(runtime).await,
+    };
+    payload
+        .map(Json)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))
+}
+
+async fn debug(State(state): State<AppState>) -> Result<Json<DebugPayload>, (StatusCode, String)> {
+    let payload = match &state.source {
+        DashboardSource::Demo { runtime } => demo_debug(runtime, state.refresh_ms),
+        DashboardSource::Real { runtime } => real_debug(runtime, state.refresh_ms),
     };
     payload
         .map(Json)
@@ -556,6 +732,10 @@ fn demo_status(
         mcp_roundtrip_ok: true,
         anomaly_source: "mcp:get_anomalies".to_string(),
         recent_anomaly_count: anomalies.len(),
+        data_age_seconds: Some(0),
+        failure_count: guard.tick_failures,
+        consecutive_failures: 0,
+        last_error: guard.last_error.clone(),
         refresh_ms,
     })
 }
@@ -574,12 +754,30 @@ fn demo_anomalies(runtime: &Arc<Mutex<DemoRuntime>>) -> Result<AnomaliesPayload,
     })
 }
 
-async fn real_status(
-    client: &Arc<RealRpcClient>,
-    refresh_ms: u64,
-) -> Result<StatusPayload, String> {
-    let snapshot = client.fetch_status().await?;
-    let anomalies = client.fetch_anomalies(1).await?;
+fn demo_debug(runtime: &Arc<Mutex<DemoRuntime>>, refresh_ms: u64) -> Result<DebugPayload, String> {
+    let guard = runtime
+        .lock()
+        .map_err(|_| "runtime lock poisoned".to_string())?;
+    Ok(DebugPayload {
+        mode: DashboardModeKind::Demo.as_str().to_string(),
+        refresh_ms,
+        success_count: guard.tick_successes,
+        failure_count: guard.tick_failures,
+        consecutive_failures: 0,
+        last_success_unix_seconds: None,
+        last_failure_unix_seconds: None,
+        last_error: guard.last_error.clone(),
+        recent_errors: guard.recent_errors.iter().cloned().collect(),
+        snapshot_available: guard.tick_successes > 0,
+    })
+}
+
+async fn real_status(runtime: &Arc<RealRuntime>, refresh_ms: u64) -> Result<StatusPayload, String> {
+    let snapshot = runtime.snapshot_or_refresh().await?;
+    let diagnostics = runtime.diagnostics()?;
+    let anomalies = runtime.anomaly_notes(1)?;
+    let now = unix_now();
+    let data_age_seconds = now.checked_sub(snapshot.captured_unix_seconds);
     Ok(StatusPayload {
         mode: DashboardModeKind::Real.as_str().to_string(),
         chain_id: snapshot.chain_id,
@@ -590,15 +788,35 @@ async fn real_status(
         mcp_roundtrip_ok: false,
         anomaly_source: "unconfigured".to_string(),
         recent_anomaly_count: anomalies.len(),
+        data_age_seconds,
+        failure_count: diagnostics.failure_count,
+        consecutive_failures: diagnostics.consecutive_failures,
+        last_error: diagnostics.last_error,
         refresh_ms,
     })
 }
 
-async fn real_anomalies(client: &Arc<RealRpcClient>) -> Result<AnomaliesPayload, String> {
-    let anomalies = client.fetch_anomalies(25).await?;
+async fn real_anomalies(runtime: &Arc<RealRuntime>) -> Result<AnomaliesPayload, String> {
+    let anomalies = runtime.anomaly_notes(25)?;
     Ok(AnomaliesPayload {
         source: "unconfigured".to_string(),
         anomalies,
+    })
+}
+
+fn real_debug(runtime: &Arc<RealRuntime>, refresh_ms: u64) -> Result<DebugPayload, String> {
+    let diagnostics = runtime.diagnostics()?;
+    Ok(DebugPayload {
+        mode: DashboardModeKind::Real.as_str().to_string(),
+        refresh_ms,
+        success_count: diagnostics.success_count,
+        failure_count: diagnostics.failure_count,
+        consecutive_failures: diagnostics.consecutive_failures,
+        last_success_unix_seconds: diagnostics.last_success_unix_seconds,
+        last_failure_unix_seconds: diagnostics.last_failure_unix_seconds,
+        last_error: diagnostics.last_error,
+        recent_errors: diagnostics.recent_errors,
+        snapshot_available: runtime.snapshot()?.is_some(),
     })
 }
 
@@ -629,29 +847,41 @@ fn demo_block(number: u64) -> StarknetBlock {
 }
 
 fn parse_dashboard_config() -> Result<DashboardConfig, String> {
-    let env_mode = env::var("PASTIS_DASHBOARD_MODE")
-        .ok()
+    let args: Vec<String> = env::args().skip(1).collect();
+    parse_dashboard_config_from(
+        args,
+        env::var("PASTIS_DASHBOARD_MODE").ok(),
+        env::var("PASTIS_DASHBOARD_BIND").ok(),
+        env::var("PASTIS_DASHBOARD_REFRESH_MS").ok(),
+        env::var("STARKNET_RPC_URL").ok(),
+    )
+}
+
+fn parse_dashboard_config_from(
+    args: Vec<String>,
+    env_mode: Option<String>,
+    env_bind: Option<String>,
+    env_refresh: Option<String>,
+    env_rpc: Option<String>,
+) -> Result<DashboardConfig, String> {
+    let mode = env_mode
         .as_deref()
         .map(DashboardModeKind::parse)
         .transpose()?
         .unwrap_or(DashboardModeKind::Demo);
-
-    let env_refresh = env::var("PASTIS_DASHBOARD_REFRESH_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
+    let refresh_ms = env_refresh
+        .as_deref()
+        .map(parse_refresh_ms)
+        .transpose()?
         .unwrap_or(DEFAULT_REFRESH_MS);
-    let env_bind =
-        env::var("PASTIS_DASHBOARD_BIND").unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_string());
-    let env_rpc = env::var("STARKNET_RPC_URL").ok();
-
     let mut config = DashboardConfig {
-        mode: env_mode,
-        bind_addr: env_bind,
-        refresh_ms: env_refresh,
+        mode,
+        bind_addr: env_bind.unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string()),
+        refresh_ms,
         rpc_url: env_rpc,
     };
 
-    let mut args = env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--mode" => {
@@ -676,9 +906,7 @@ fn parse_dashboard_config() -> Result<DashboardConfig, String> {
                 let raw = args
                     .next()
                     .ok_or_else(|| "--refresh-ms requires a value".to_string())?;
-                config.refresh_ms = raw
-                    .parse::<u64>()
-                    .map_err(|error| format!("invalid --refresh-ms value `{raw}`: {error}"))?;
+                config.refresh_ms = parse_refresh_ms(&raw)?;
             }
             "--help" | "-h" => {
                 return Err(help_text());
@@ -696,6 +924,11 @@ fn parse_dashboard_config() -> Result<DashboardConfig, String> {
         );
     }
     Ok(config)
+}
+
+fn parse_refresh_ms(raw: &str) -> Result<u64, String> {
+    raw.parse::<u64>()
+        .map_err(|error| format!("invalid refresh value `{raw}`: {error}"))
 }
 
 fn help_text() -> String {
@@ -724,6 +957,13 @@ fn value_as_u64(value: &Value) -> Option<u64> {
 
 fn saturating_u128_to_u64(value: u128) -> u64 {
     value.try_into().unwrap_or(u64::MAX)
+}
+
+fn push_recent_error(errors: &mut VecDeque<String>, message: String) {
+    if errors.len() >= MAX_RECENT_ERRORS {
+        let _ = errors.pop_front();
+    }
+    errors.push_back(message);
 }
 
 fn unix_now() -> u64 {
@@ -901,6 +1141,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <div class="card"><h3>MCP Roundtrip</h3><div class="value" id="mcpStatus">-</div></div>
       <div class="card"><h3>Anomaly Source</h3><div class="value mono" id="anomalySource">-</div></div>
       <div class="card"><h3>Recent Anomalies</h3><div class="value warn" id="anomalyCount">-</div></div>
+      <div class="card"><h3>Data Age (s)</h3><div class="value" id="dataAge">-</div></div>
+      <div class="card"><h3>Failures</h3><div class="value" id="failureCount">-</div></div>
     </div>
 
     <div class="stack">
@@ -948,17 +1190,19 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
     async function load() {
       const started = performance.now();
-      const [statusRes, anomaliesRes] = await Promise.all([
+      const [statusRes, anomaliesRes, debugRes] = await Promise.all([
         fetch('/api/status'),
         fetch('/api/anomalies'),
+        fetch('/api/debug'),
       ]);
-      if (!statusRes.ok || !anomaliesRes.ok) {
+      if (!statusRes.ok || !anomaliesRes.ok || !debugRes.ok) {
         document.getElementById('meta').textContent = 'Failed to load dashboard data';
         return;
       }
 
       const status = await statusRes.json();
       const anomalies = await anomaliesRes.json();
+      const debug = await debugRes.json();
 
       blockHistory.push(status.latest_block);
       if (blockHistory.length > 24) {
@@ -975,6 +1219,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
       document.getElementById('stateRoot').textContent = status.state_root;
       document.getElementById('anomalySource').textContent = status.anomaly_source;
       document.getElementById('anomalyCount').textContent = status.recent_anomaly_count;
+      document.getElementById('dataAge').textContent =
+        status.data_age_seconds === null ? 'n/a' : String(status.data_age_seconds);
+      document.getElementById('failureCount').textContent =
+        `${status.failure_count} (${status.consecutive_failures}c)`;
 
       const mcp = document.getElementById('mcpStatus');
       if (status.mcp_roundtrip_ok) {
@@ -1002,8 +1250,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
 
       const fetchMs = Math.round(performance.now() - started);
+      const lastError = debug.last_error ? ` | last_error=${debug.last_error}` : '';
       document.getElementById('meta').textContent =
-        `Refreshed in ${fetchMs}ms | API refresh=${status.refresh_ms}ms | anomaly source=${anomalies.source}`;
+        `Refreshed in ${fetchMs}ms | API refresh=${status.refresh_ms}ms | anomaly source=${anomalies.source}${lastError}`;
     }
 
     load();
@@ -1012,3 +1261,88 @@ const INDEX_HTML: &str = r#"<!doctype html>
 </body>
 </html>
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_dashboard_config_requires_rpc_in_real_mode() {
+        let err = parse_dashboard_config_from(
+            vec!["--mode".to_string(), "real".to_string()],
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("real mode without rpc must fail");
+        assert!(err.contains("real mode requires --rpc-url"));
+    }
+
+    #[test]
+    fn parse_dashboard_config_allows_real_mode_with_env_rpc() {
+        let config = parse_dashboard_config_from(
+            vec!["--mode".to_string(), "real".to_string()],
+            None,
+            None,
+            None,
+            Some("https://rpc.example".to_string()),
+        )
+        .expect("config should parse");
+        assert_eq!(config.mode, DashboardModeKind::Real);
+        assert_eq!(config.rpc_url.as_deref(), Some("https://rpc.example"));
+    }
+
+    #[test]
+    fn parse_dashboard_config_cli_overrides_env() {
+        let config = parse_dashboard_config_from(
+            vec![
+                "--mode".to_string(),
+                "real".to_string(),
+                "--bind".to_string(),
+                "0.0.0.0:9999".to_string(),
+                "--refresh-ms".to_string(),
+                "1500".to_string(),
+                "--rpc-url".to_string(),
+                "https://cli.rpc".to_string(),
+            ],
+            Some("demo".to_string()),
+            Some("127.0.0.1:8080".to_string()),
+            Some("2000".to_string()),
+            Some("https://env.rpc".to_string()),
+        )
+        .expect("config should parse");
+
+        assert_eq!(config.mode, DashboardModeKind::Real);
+        assert_eq!(config.bind_addr, "0.0.0.0:9999");
+        assert_eq!(config.refresh_ms, 1500);
+        assert_eq!(config.rpc_url.as_deref(), Some("https://cli.rpc"));
+    }
+
+    #[test]
+    fn value_as_u64_parses_decimal_and_hex() {
+        assert_eq!(value_as_u64(&Value::String("42".to_string())), Some(42));
+        assert_eq!(value_as_u64(&Value::String("0x2a".to_string())), Some(42));
+        assert_eq!(value_as_u64(&Value::String("0X2A".to_string())), Some(42));
+        assert_eq!(
+            value_as_u64(&Value::Number(serde_json::Number::from(7))),
+            Some(7)
+        );
+        assert_eq!(
+            value_as_u64(&Value::String("not-a-number".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn push_recent_error_caps_history() {
+        let mut errors = VecDeque::new();
+        for idx in 0..(MAX_RECENT_ERRORS + 4) {
+            push_recent_error(&mut errors, format!("error-{idx}"));
+        }
+
+        assert_eq!(errors.len(), MAX_RECENT_ERRORS);
+        assert_eq!(errors.front().map(String::as_str), Some("error-4"));
+        assert_eq!(errors.back().map(String::as_str), Some("error-19"));
+    }
+}

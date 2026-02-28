@@ -122,6 +122,7 @@ Open:
 - `http://127.0.0.1:8080/` for the dashboard UI
 - `http://127.0.0.1:8080/api/status` for live node status JSON
 - `http://127.0.0.1:8080/api/anomalies` for live anomaly JSON
+- `http://127.0.0.1:8080/api/debug` for runtime diagnostics (last errors, failure counters, snapshot availability)
 
 What this demo proves on-screen:
 
