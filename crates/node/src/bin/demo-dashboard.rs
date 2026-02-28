@@ -485,6 +485,7 @@ struct RuntimeDiagnostics {
     dual_mismatches: u64,
     dual_fast_executions: u64,
     dual_canonical_executions: u64,
+    last_state_diff: Option<StateDiffSummary>,
 }
 
 impl RuntimeDiagnostics {
@@ -513,8 +514,18 @@ impl RuntimeDiagnostics {
             dual_mismatches: 0,
             dual_fast_executions: 0,
             dual_canonical_executions: 0,
+            last_state_diff: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct StateDiffSummary {
+    fingerprint: String,
+    touched_contracts: u64,
+    storage_writes: u64,
+    nonce_updates: u64,
+    declared_classes: u64,
 }
 
 struct RealRuntimeState {
@@ -779,6 +790,7 @@ impl RealRuntime {
                 .replayed_tx_count
                 .saturating_add(local_block.transactions.len() as u64);
             guard.diagnostics.last_replay_error = None;
+            guard.diagnostics.last_state_diff = Some(summarize_state_diff(&fetch.state_diff));
             if let Err(error) = guard
                 .node
                 .storage
@@ -1189,6 +1201,11 @@ struct DebugPayload {
     replayed_tx_count: u64,
     replay_failures: u64,
     last_replay_error: Option<String>,
+    last_state_diff_fingerprint: Option<String>,
+    last_state_diff_touched_contracts: Option<u64>,
+    last_state_diff_storage_writes: Option<u64>,
+    last_state_diff_nonce_updates: Option<u64>,
+    last_state_diff_declared_classes: Option<u64>,
     last_error: Option<String>,
     recent_errors: Vec<String>,
     snapshot_available: bool,
@@ -1409,6 +1426,11 @@ fn demo_debug(runtime: &Arc<Mutex<DemoRuntime>>, refresh_ms: u64) -> Result<Debu
         replayed_tx_count: guard.replayed_tx_count,
         replay_failures: guard.replay_failures,
         last_replay_error: guard.last_replay_error.clone(),
+        last_state_diff_fingerprint: None,
+        last_state_diff_touched_contracts: None,
+        last_state_diff_storage_writes: None,
+        last_state_diff_nonce_updates: None,
+        last_state_diff_declared_classes: None,
         last_error: guard.last_error.clone(),
         recent_errors: guard.recent_errors.iter().cloned().collect(),
         snapshot_available: guard.tick_successes > 0,
@@ -1486,6 +1508,26 @@ fn real_debug(runtime: &Arc<RealRuntime>, refresh_ms: u64) -> Result<DebugPayloa
         replayed_tx_count: diagnostics.replayed_tx_count,
         replay_failures: diagnostics.replay_failures,
         last_replay_error: diagnostics.last_replay_error,
+        last_state_diff_fingerprint: diagnostics
+            .last_state_diff
+            .as_ref()
+            .map(|summary| summary.fingerprint.clone()),
+        last_state_diff_touched_contracts: diagnostics
+            .last_state_diff
+            .as_ref()
+            .map(|summary| summary.touched_contracts),
+        last_state_diff_storage_writes: diagnostics
+            .last_state_diff
+            .as_ref()
+            .map(|summary| summary.storage_writes),
+        last_state_diff_nonce_updates: diagnostics
+            .last_state_diff
+            .as_ref()
+            .map(|summary| summary.nonce_updates),
+        last_state_diff_declared_classes: diagnostics
+            .last_state_diff
+            .as_ref()
+            .map(|summary| summary.declared_classes),
         last_error: diagnostics.last_error,
         recent_errors: diagnostics.recent_errors,
         snapshot_available: runtime.snapshot()?.is_some(),
@@ -2182,6 +2224,76 @@ fn value_as_u64(value: &Value) -> Option<u64> {
 
 fn saturating_u128_to_u64(value: u128) -> u64 {
     value.try_into().unwrap_or(u64::MAX)
+}
+
+const FNV64_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV64_PRIME: u64 = 0x100000001b3;
+
+#[derive(Debug, Clone, Copy)]
+struct Fnv64Hasher {
+    state: u64,
+}
+
+impl Fnv64Hasher {
+    fn new() -> Self {
+        Self {
+            state: FNV64_OFFSET_BASIS,
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.state ^= u64::from(*byte);
+            self.state = self.state.wrapping_mul(FNV64_PRIME);
+        }
+    }
+
+    fn update_str(&mut self, value: &str) {
+        self.update(value.as_bytes());
+        // Separator to avoid accidental collisions when concatenating adjacent fields.
+        self.update(&[0xff]);
+    }
+
+    fn finish_hex(self) -> String {
+        format!("fnv64:{:016x}", self.state)
+    }
+}
+
+fn summarize_state_diff(diff: &StarknetStateDiff) -> StateDiffSummary {
+    let mut hasher = Fnv64Hasher::new();
+    let mut storage_writes = 0_u64;
+
+    for (contract, writes) in &diff.storage_diffs {
+        hasher.update_str("contract");
+        hasher.update_str(contract.as_ref());
+        for (key, value) in writes {
+            storage_writes = storage_writes.saturating_add(1);
+            hasher.update_str("storage-key");
+            hasher.update_str(key);
+            hasher.update_str("storage-value");
+            hasher.update_str(&format!("{:#x}", value));
+        }
+    }
+
+    for (contract, nonce) in &diff.nonces {
+        hasher.update_str("nonce-contract");
+        hasher.update_str(contract.as_ref());
+        hasher.update_str("nonce-value");
+        hasher.update_str(&format!("{:#x}", nonce));
+    }
+
+    for class_hash in &diff.declared_classes {
+        hasher.update_str("declared-class");
+        hasher.update_str(class_hash.as_ref());
+    }
+
+    StateDiffSummary {
+        fingerprint: hasher.finish_hex(),
+        touched_contracts: diff.storage_diffs.len() as u64,
+        storage_writes,
+        nonce_updates: diff.nonces.len() as u64,
+        declared_classes: diff.declared_classes.len() as u64,
+    }
 }
 
 fn push_recent_error(errors: &mut VecDeque<String>, message: String) {
@@ -3119,6 +3231,45 @@ mod tests {
     }
 
     #[test]
+    fn state_diff_summary_fingerprint_is_order_stable() {
+        let mut diff_a = StarknetStateDiff::default();
+        diff_a.storage_diffs.insert(
+            ContractAddress::from("0x2"),
+            BTreeMap::from([
+                ("0x2".to_string(), StarknetFelt::from(2_u64)),
+                ("0x1".to_string(), StarknetFelt::from(1_u64)),
+            ]),
+        );
+        diff_a.storage_diffs.insert(
+            ContractAddress::from("0x1"),
+            BTreeMap::from([("0x3".to_string(), StarknetFelt::from(3_u64))]),
+        );
+        diff_a
+            .nonces
+            .insert(ContractAddress::from("0x1"), StarknetFelt::from(9_u64));
+        diff_a.declared_classes.push("0xa".into());
+
+        let mut diff_b = StarknetStateDiff::default();
+        diff_b.storage_diffs.insert(
+            ContractAddress::from("0x1"),
+            BTreeMap::from([("0x3".to_string(), StarknetFelt::from(3_u64))]),
+        );
+        diff_b.storage_diffs.insert(
+            ContractAddress::from("0x2"),
+            BTreeMap::from([
+                ("0x1".to_string(), StarknetFelt::from(1_u64)),
+                ("0x2".to_string(), StarknetFelt::from(2_u64)),
+            ]),
+        );
+        diff_b
+            .nonces
+            .insert(ContractAddress::from("0x1"), StarknetFelt::from(9_u64));
+        diff_b.declared_classes.push("0xa".into());
+
+        assert_eq!(summarize_state_diff(&diff_a), summarize_state_diff(&diff_b));
+    }
+
+    #[test]
     fn replay_pipeline_reset_for_reorg_rewinds_window() {
         let mut replay = new_replay_pipeline(5, 2, None).expect("pipeline");
         let _ = replay.plan(20);
@@ -3547,6 +3698,105 @@ mod tests {
             ingested.state_root,
             "0x25a23d7704a148a505fcd1d25c58c5a2f4847fbd3a739d809a1d0cfb25f7494"
         );
+    }
+
+    #[test]
+    fn replay_state_diff_fingerprint_snapshots_for_rpc_fixtures() {
+        let fixtures = [
+            (
+                "mainnet_block_7242623_get_block_with_txs.json",
+                "mainnet_block_7242623_get_state_update.json",
+                StateDiffSummary {
+                    fingerprint: "fnv64:1a0c346877abcc58".to_string(),
+                    touched_contracts: 7,
+                    storage_writes: 26,
+                    nonce_updates: 3,
+                    declared_classes: 0,
+                },
+            ),
+            (
+                "mainnet_block_7242624_get_block_with_txs.json",
+                "mainnet_block_7242624_get_state_update.json",
+                StateDiffSummary {
+                    fingerprint: "fnv64:75568546f8968975".to_string(),
+                    touched_contracts: 16,
+                    storage_writes: 59,
+                    nonce_updates: 6,
+                    declared_classes: 0,
+                },
+            ),
+            (
+                "mainnet_block_7242625_get_block_with_txs.json",
+                "mainnet_block_7242625_get_state_update.json",
+                StateDiffSummary {
+                    fingerprint: "fnv64:53f2210220632692".to_string(),
+                    touched_contracts: 8,
+                    storage_writes: 27,
+                    nonce_updates: 4,
+                    declared_classes: 0,
+                },
+            ),
+        ];
+
+        for (block_fixture, state_fixture, expected_summary) in fixtures {
+            let fetch = fetch_from_rpc_fixtures(block_fixture, state_fixture);
+            let summary = summarize_state_diff(&fetch.state_diff);
+            assert_eq!(
+                summary, expected_summary,
+                "state diff summary drifted for fixture {}",
+                state_fixture
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn real_runtime_records_last_state_diff_summary_in_diagnostics() {
+        let fetch_623 = fetch_from_rpc_fixtures(
+            "mainnet_block_7242623_get_block_with_txs.json",
+            "mainnet_block_7242623_get_state_update.json",
+        );
+
+        let runtime = Arc::new(
+            RealRuntime::new_with_rpc_source(
+                Arc::new(MockRpcSource::new(
+                    "mock://rpc",
+                    vec![Ok(7_242_623)],
+                    vec![(7_242_623, Ok(fetch_623.clone()))],
+                )),
+                None,
+                1,
+                1,
+                None,
+                RpcRetryConfig {
+                    max_retries: 0,
+                    base_backoff: Duration::ZERO,
+                },
+            )
+            .expect("runtime should initialize"),
+        );
+
+        runtime.poll_once().await.expect("poll should succeed");
+        let diagnostics = runtime
+            .diagnostics()
+            .expect("diagnostics should be readable");
+        let summary = diagnostics
+            .last_state_diff
+            .expect("state diff summary should be captured after replay commit");
+        assert_eq!(summary.fingerprint, "fnv64:1a0c346877abcc58");
+        assert_eq!(summary.touched_contracts, 7);
+        assert_eq!(summary.storage_writes, 26);
+        assert_eq!(summary.nonce_updates, 3);
+        assert_eq!(summary.declared_classes, 0);
+
+        let debug = real_debug(&runtime, 2_000).expect("debug payload should be generated");
+        assert_eq!(
+            debug.last_state_diff_fingerprint.as_deref(),
+            Some("fnv64:1a0c346877abcc58")
+        );
+        assert_eq!(debug.last_state_diff_touched_contracts, Some(7));
+        assert_eq!(debug.last_state_diff_storage_writes, Some(26));
+        assert_eq!(debug.last_state_diff_nonce_updates, Some(3));
+        assert_eq!(debug.last_state_diff_declared_classes, Some(0));
     }
 
     #[test]
