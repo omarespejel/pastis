@@ -29,7 +29,7 @@ starknet-node-rpc = { path = "../rpc" }
 starknet-node-storage = { path = "../storage" }
 starknet-node-types = { path = "../types" }
 thiserror = { workspace = true }
-tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "time", "net"] }
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "time", "net", "signal"] }
 
 # Keep production adapter dependencies aligned with sequencer monorepo revisions.
 apollo_storage = { git = "https://github.com/starkware-libs/sequencer", rev = "69b4c8d378580a1aec345f23dadd4766e036fe3b", package = "apollo_storage", optional = true }

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod replay;
+pub mod runtime;
 
 #[cfg(feature = "production-adapters")]
 use std::cell::RefCell;
@@ -871,13 +872,14 @@ mod tests {
         .with_rpc(true)
         .build();
         let rpc = node.new_rpc_server();
-        let response = rpc.handle_request(JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            method: "starknet_chainId".to_string(),
-            params: serde_json::json!([]),
-            id: Some(serde_json::json!(7)),
-        })
-        .expect("request with id should produce response");
+        let response = rpc
+            .handle_request(JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "starknet_chainId".to_string(),
+                params: serde_json::json!([]),
+                id: Some(serde_json::json!(7)),
+            })
+            .expect("request with id should produce response");
         assert_eq!(response.result, Some(serde_json::json!("SN_SEPOLIA")));
     }
 

@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use starknet_node_storage::{StorageBackend, StorageError};
-use starknet_node_types::{BlockId, StarknetBlock};
+use starknet_node_types::{BlockId, StarknetBlock, StarknetStateDiff, TxHash};
 
 const JSONRPC_VERSION: &str = "2.0";
 const ERR_PARSE: i64 = -32700;
@@ -12,6 +12,14 @@ const ERR_METHOD_NOT_FOUND: i64 = -32601;
 const ERR_INVALID_PARAMS: i64 = -32602;
 const ERR_INTERNAL: i64 = -32603;
 const ERR_BLOCK_NOT_FOUND: i64 = -32001;
+const ERR_TX_NOT_FOUND: i64 = -32003;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncStatus {
+    pub starting_block_num: u64,
+    pub current_block_num: u64,
+    pub highest_block_num: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
@@ -49,6 +57,8 @@ pub enum RpcError {
     InvalidParams(String),
     #[error("requested block was not found")]
     BlockNotFound,
+    #[error("requested transaction was not found")]
+    TxNotFound,
     #[error(transparent)]
     Storage(#[from] StorageError),
 }
@@ -56,6 +66,7 @@ pub enum RpcError {
 pub struct StarknetRpcServer<'a> {
     storage: &'a dyn StorageBackend,
     chain_id: String,
+    sync_status: Option<SyncStatus>,
 }
 
 impl<'a> StarknetRpcServer<'a> {
@@ -63,7 +74,13 @@ impl<'a> StarknetRpcServer<'a> {
         Self {
             storage,
             chain_id: chain_id.into(),
+            sync_status: None,
         }
+    }
+
+    pub fn with_sync_status(mut self, sync_status: SyncStatus) -> Self {
+        self.sync_status = Some(sync_status);
+        self
     }
 
     pub fn handle_raw(&self, raw: &str) -> String {
@@ -174,6 +191,10 @@ impl<'a> StarknetRpcServer<'a> {
             "starknet_blockNumber" => self.block_number(params),
             "starknet_chainId" => self.chain_id(params),
             "starknet_getBlockWithTxs" => self.get_block_with_txs(params),
+            "starknet_getBlockTransactionCount" => self.get_block_transaction_count(params),
+            "starknet_getStateUpdate" => self.get_state_update(params),
+            "starknet_getTransactionByHash" => self.get_transaction_by_hash(params),
+            "starknet_syncing" => self.syncing(params),
             _ => Err(RpcError::MethodNotFound(method.to_string())),
         }
     }
@@ -196,6 +217,80 @@ impl<'a> StarknetRpcServer<'a> {
             .get_block(block_id)?
             .ok_or(RpcError::BlockNotFound)?;
         Ok(block_to_json(&block))
+    }
+
+    fn get_block_transaction_count(&self, params: &Value) -> Result<Value, RpcError> {
+        let block_id = parse_block_id_param(params)?;
+        let block = self
+            .storage
+            .get_block(block_id)?
+            .ok_or(RpcError::BlockNotFound)?;
+        Ok(json!(block.transactions.len() as u64))
+    }
+
+    fn get_state_update(&self, params: &Value) -> Result<Value, RpcError> {
+        let block_id = parse_block_id_param(params)?;
+        let block = self
+            .storage
+            .get_block(block_id.clone())?
+            .ok_or(RpcError::BlockNotFound)?;
+        let state_diff = self
+            .storage
+            .get_state_diff(block.number)?
+            .ok_or(RpcError::BlockNotFound)?;
+        let old_root = if block.number <= 1 {
+            "0x0".to_string()
+        } else {
+            self.storage
+                .get_block(BlockId::Number(block.number.saturating_sub(1)))?
+                .map(|parent| parent.state_root)
+                .unwrap_or_else(|| "0x0".to_string())
+        };
+        Ok(json!({
+            "block_hash": format!("0x{:x}", block.number),
+            "new_root": block.state_root,
+            "old_root": old_root,
+            "state_diff": state_diff_to_json(&state_diff),
+        }))
+    }
+
+    fn get_transaction_by_hash(&self, params: &Value) -> Result<Value, RpcError> {
+        let requested_hash = parse_tx_hash_param(params)?;
+        let latest = self.storage.latest_block_number()?;
+        for number in (1..=latest).rev() {
+            let Some(block) = self.storage.get_block(BlockId::Number(number))? else {
+                continue;
+            };
+            if let Some((index, tx)) = block
+                .transactions
+                .iter()
+                .enumerate()
+                .find(|(_, tx)| tx.hash == requested_hash)
+            {
+                return Ok(json!({
+                    "transaction_hash": tx.hash,
+                    "block_number": block.number,
+                    "transaction_index": index as u64,
+                    "type": "INVOKE",
+                }));
+            }
+        }
+        Err(RpcError::TxNotFound)
+    }
+
+    fn syncing(&self, params: &Value) -> Result<Value, RpcError> {
+        ensure_no_params(params)?;
+        let Some(status) = &self.sync_status else {
+            return Ok(json!(false));
+        };
+        if status.current_block_num >= status.highest_block_num {
+            return Ok(json!(false));
+        }
+        Ok(json!({
+            "starting_block_num": status.starting_block_num,
+            "current_block_num": status.current_block_num,
+            "highest_block_num": status.highest_block_num,
+        }))
     }
 }
 
@@ -255,6 +350,38 @@ fn parse_block_id_param(params: &Value) -> Result<BlockId, RpcError> {
     }
 }
 
+fn parse_tx_hash_param(params: &Value) -> Result<TxHash, RpcError> {
+    let tx_hash_value = match params {
+        Value::Array(values) if values.len() == 1 => &values[0],
+        Value::Array(values) => {
+            return Err(RpcError::InvalidParams(format!(
+                "expected exactly one positional param, got {}",
+                values.len()
+            )));
+        }
+        Value::Object(map) => map.get("transaction_hash").ok_or_else(|| {
+            RpcError::InvalidParams("missing required key 'transaction_hash'".to_string())
+        })?,
+        Value::Null => {
+            return Err(RpcError::InvalidParams(
+                "missing required transaction_hash param".to_string(),
+            ));
+        }
+        _ => {
+            return Err(RpcError::InvalidParams(
+                "params must be array or object".to_string(),
+            ));
+        }
+    };
+
+    let raw_hash = tx_hash_value
+        .as_str()
+        .ok_or_else(|| RpcError::InvalidParams("transaction_hash must be a string".to_string()))?;
+    TxHash::parse(raw_hash).map_err(|error| {
+        RpcError::InvalidParams(format!("invalid transaction_hash '{raw_hash}': {error}"))
+    })
+}
+
 fn block_to_json(block: &StarknetBlock) -> Value {
     json!({
         "number": block.number,
@@ -269,6 +396,27 @@ fn block_to_json(block: &StarknetBlock) -> Value {
     })
 }
 
+fn state_diff_to_json(diff: &StarknetStateDiff) -> Value {
+    json!({
+        "storage_diffs": diff.storage_diffs.iter().map(|(contract, writes)| {
+            json!({
+                "address": contract.as_ref(),
+                "storage_entries": writes.iter().map(|(key, value)| json!({
+                    "key": key,
+                    "value": format!("{:#x}", value),
+                })).collect::<Vec<_>>(),
+            })
+        }).collect::<Vec<_>>(),
+        "nonces": diff.nonces.iter().map(|(contract, nonce)| json!({
+            "contract_address": contract.as_ref(),
+            "nonce": format!("{:#x}", nonce),
+        })).collect::<Vec<_>>(),
+        "declared_classes": diff.declared_classes.iter().map(|class_hash| json!({
+            "class_hash": class_hash.as_ref(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
 fn map_error_to_response(id: Value, error: RpcError) -> JsonRpcResponse {
     match error {
         RpcError::InvalidRequest(message) => error_response(id, ERR_INVALID_REQUEST, message),
@@ -279,6 +427,7 @@ fn map_error_to_response(id: Value, error: RpcError) -> JsonRpcResponse {
         ),
         RpcError::InvalidParams(message) => error_response(id, ERR_INVALID_PARAMS, message),
         RpcError::BlockNotFound => error_response(id, ERR_BLOCK_NOT_FOUND, "block not found"),
+        RpcError::TxNotFound => error_response(id, ERR_TX_NOT_FOUND, "transaction not found"),
         RpcError::Storage(error) => {
             error_response(id, ERR_INTERNAL, format!("storage backend error: {error}"))
         }
@@ -307,7 +456,7 @@ mod tests {
     use starknet_node_storage::InMemoryStorage;
     use starknet_node_types::{
         BlockGasPrices, ContractAddress, GasPricePerToken, InMemoryState, StarknetBlock,
-        StarknetStateDiff, StarknetTransaction,
+        StarknetFelt, StarknetStateDiff, StarknetTransaction,
     };
 
     use super::*;
@@ -347,11 +496,27 @@ mod tests {
 
     fn seeded_server() -> StarknetRpcServer<'static> {
         let mut storage = InMemoryStorage::new(InMemoryState::default());
+        let mut diff_1 = StarknetStateDiff::default();
+        let contract_1 = ContractAddress::parse("0x1").expect("valid contract");
+        diff_1
+            .storage_diffs
+            .entry(contract_1.clone())
+            .or_default()
+            .insert("0x10".to_string(), StarknetFelt::from(10_u64));
+        diff_1.nonces.insert(contract_1, StarknetFelt::from(1_u64));
         storage
-            .insert_block(sample_block(1), StarknetStateDiff::default())
+            .insert_block(sample_block(1), diff_1)
             .expect("insert");
+        let mut diff_2 = StarknetStateDiff::default();
+        let contract_2 = ContractAddress::parse("0x2").expect("valid contract");
+        diff_2
+            .storage_diffs
+            .entry(contract_2.clone())
+            .or_default()
+            .insert("0x20".to_string(), StarknetFelt::from(20_u64));
+        diff_2.nonces.insert(contract_2, StarknetFelt::from(2_u64));
         storage
-            .insert_block(sample_block(2), StarknetStateDiff::default())
+            .insert_block(sample_block(2), diff_2)
             .expect("insert");
         let leaked: &'static mut InMemoryStorage = Box::leak(Box::new(storage));
         StarknetRpcServer::new(leaked, "SN_MAIN")
@@ -390,6 +555,67 @@ mod tests {
         let raw = r#"{"jsonrpc":"2.0","id":2,"method":"starknet_getBlockWithTxs","params":[{"block_number":1}]}"#;
         let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
         assert_eq!(value["result"]["number"], json!(1));
+    }
+
+    #[test]
+    fn get_block_transaction_count_works() {
+        let server = seeded_server();
+        let raw = r#"{"jsonrpc":"2.0","id":7,"method":"starknet_getBlockTransactionCount","params":[{"block_number":2}]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["result"], json!(1));
+    }
+
+    #[test]
+    fn get_state_update_works() {
+        let server = seeded_server();
+        let raw = r#"{"jsonrpc":"2.0","id":8,"method":"starknet_getStateUpdate","params":[{"block_number":2}]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["result"]["new_root"], json!("0x66"));
+        assert_eq!(value["result"]["old_root"], json!("0x65"));
+        assert_eq!(
+            value["result"]["state_diff"]["storage_diffs"][0]["address"],
+            json!("0x2")
+        );
+    }
+
+    #[test]
+    fn get_transaction_by_hash_works() {
+        let server = seeded_server();
+        let raw = r#"{"jsonrpc":"2.0","id":10,"method":"starknet_getTransactionByHash","params":["0x1f6"]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["result"]["transaction_hash"], json!("0x1f6"));
+        assert_eq!(value["result"]["block_number"], json!(2));
+        assert_eq!(value["result"]["transaction_index"], json!(0));
+    }
+
+    #[test]
+    fn get_transaction_by_hash_returns_not_found() {
+        let server = seeded_server();
+        let raw = r#"{"jsonrpc":"2.0","id":11,"method":"starknet_getTransactionByHash","params":["0xdead"]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["error"]["code"], json!(ERR_TX_NOT_FOUND));
+    }
+
+    #[test]
+    fn syncing_returns_false_without_status() {
+        let server = seeded_server();
+        let raw = r#"{"jsonrpc":"2.0","id":12,"method":"starknet_syncing","params":[]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["result"], json!(false));
+    }
+
+    #[test]
+    fn syncing_returns_object_when_behind() {
+        let server = seeded_server().with_sync_status(SyncStatus {
+            starting_block_num: 10,
+            current_block_num: 12,
+            highest_block_num: 20,
+        });
+        let raw = r#"{"jsonrpc":"2.0","id":13,"method":"starknet_syncing","params":[]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["result"]["starting_block_num"], json!(10));
+        assert_eq!(value["result"]["current_block_num"], json!(12));
+        assert_eq!(value["result"]["highest_block_num"], json!(20));
     }
 
     #[test]
