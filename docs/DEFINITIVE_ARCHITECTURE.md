@@ -180,7 +180,7 @@ The repository currently includes core and phase-aligned scaffolding crates that
 - L1 finality gating and unfinalized reorg invalidation
 - MCP batch recursion/size validation
 - MCP access control hardened with Argon2id API-key derivation (legacy PBKDF2 fallback only on derivation failure)
-- MCP server request execution path with authenticated tool handling and deterministic batch response ordering
+- MCP server request execution path with authenticated tool handling, deterministic batch response ordering, and BTCFi anomaly retrieval (`GetAnomalies`)
 - Bounded block/state-diff validation (`MAX_TRANSACTIONS_PER_BLOCK`, bounded storage writes/nonces/classes) at ingest boundaries
 - In-memory state guardrails against contract/slot/entry explosion with explicit state-limit errors
 - Storage backend behavior (sequential inserts, block snapshots, deterministic state roots)

@@ -20,6 +20,7 @@ pub enum ApiKeyKdf {
 pub enum McpTool {
     QueryState,
     GetNodeStatus,
+    GetAnomalies { limit: u64 },
     BatchQuery { queries: Vec<McpTool> },
 }
 
@@ -27,6 +28,7 @@ pub enum McpTool {
 pub enum ToolPermission {
     QueryState,
     GetNodeStatus,
+    GetAnomalies,
 }
 
 impl McpTool {
@@ -37,6 +39,9 @@ impl McpTool {
             }
             McpTool::GetNodeStatus => {
                 permissions.insert(ToolPermission::GetNodeStatus);
+            }
+            McpTool::GetAnomalies { .. } => {
+                permissions.insert(ToolPermission::GetAnomalies);
             }
             McpTool::BatchQuery { queries } => {
                 for query in queries {
@@ -65,7 +70,11 @@ pub enum ValidationError {
         count: usize,
         max_total_tools: usize,
     },
+    #[error("anomaly query limit {limit} exceeds max {max_limit}")]
+    AnomalyLimitExceeded { limit: u64, max_limit: u64 },
 }
+
+const MAX_GET_ANOMALIES_LIMIT: u64 = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPolicy {
@@ -319,6 +328,15 @@ fn validate_tool_inner(
             }
             Ok(total)
         }
+        McpTool::GetAnomalies { limit } => {
+            if *limit > MAX_GET_ANOMALIES_LIMIT {
+                return Err(ValidationError::AnomalyLimitExceeded {
+                    limit: *limit,
+                    max_limit: MAX_GET_ANOMALIES_LIMIT,
+                });
+            }
+            Ok(1)
+        }
         McpTool::QueryState | McpTool::GetNodeStatus => Ok(1),
     }
 }
@@ -330,7 +348,11 @@ mod tests {
     #[test]
     fn allows_non_recursive_batch() {
         let tool = McpTool::BatchQuery {
-            queries: vec![McpTool::QueryState, McpTool::GetNodeStatus],
+            queries: vec![
+                McpTool::QueryState,
+                McpTool::GetNodeStatus,
+                McpTool::GetAnomalies { limit: 10 },
+            ],
         };
 
         validate_tool(
@@ -445,6 +467,31 @@ mod tests {
             BTreeSet::from([ToolPermission::QueryState]),
             limit,
         )
+    }
+
+    #[test]
+    fn rejects_excessive_anomaly_query_limit() {
+        let tool = McpTool::GetAnomalies {
+            limit: MAX_GET_ANOMALIES_LIMIT + 1,
+        };
+
+        let err = validate_tool(
+            &tool,
+            ValidationLimits {
+                max_batch_size: 10,
+                max_depth: 2,
+                max_total_tools: 10,
+            },
+        )
+        .expect_err("must reject excessive anomaly query");
+
+        assert_eq!(
+            err,
+            ValidationError::AnomalyLimitExceeded {
+                limit: MAX_GET_ANOMALIES_LIMIT + 1,
+                max_limit: MAX_GET_ANOMALIES_LIMIT,
+            }
+        );
     }
 
     #[test]

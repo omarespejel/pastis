@@ -4181,6 +4181,7 @@ version = "0.1.0"
 dependencies = [
  "node-spec-core",
  "semver",
+ "starknet-node-exex-btcfi",
  "starknet-node-storage",
  "starknet-node-types",
  "thiserror 2.0.18",

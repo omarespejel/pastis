@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 node-spec-core = { path = "../node-spec-core" }
+starknet-node-exex-btcfi = { path = "../exex-btcfi" }
 starknet-node-storage = { path = "../storage" }
 starknet-node-types = { path = "../types" }
 thiserror = { workspace = true }

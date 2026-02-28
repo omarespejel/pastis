@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use node_spec_core::mcp::{
     AccessError, McpAccessController, McpTool, ValidationError, ValidationLimits, validate_tool,
 };
+use starknet_node_exex_btcfi::{BtcfiAnomaly, BtcfiExEx};
 use starknet_node_storage::{StateRootSemantics, StorageBackend, StorageError};
 use starknet_node_types::{BlockNumber, ComponentHealth};
 
@@ -32,6 +33,7 @@ pub struct NodeStatusResponse {
 pub enum McpResponse {
     QueryState(QueryStateResponse),
     GetNodeStatus(NodeStatusResponse),
+    GetAnomalies { anomalies: Vec<BtcfiAnomaly> },
     BatchQuery { responses: Vec<McpResponse> },
 }
 
@@ -49,12 +51,30 @@ pub enum McpServerError {
     Validation(#[from] ValidationError),
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error("anomaly source is unavailable for this node")]
+    AnomalySourceUnavailable,
+    #[error("anomaly source failed: {0}")]
+    AnomalySource(String),
     #[error("mcp access controller lock poisoned")]
     AccessControllerPoisoned,
 }
 
+pub trait AnomalySource: Send + Sync {
+    fn recent_anomalies(&self, limit: usize) -> Result<Vec<BtcfiAnomaly>, String>;
+}
+
+impl AnomalySource for Mutex<BtcfiExEx> {
+    fn recent_anomalies(&self, limit: usize) -> Result<Vec<BtcfiAnomaly>, String> {
+        let guard = self
+            .lock()
+            .map_err(|_| "btcfi anomaly source lock poisoned".to_string())?;
+        Ok(guard.recent_anomalies(limit))
+    }
+}
+
 pub struct McpServer<'a> {
     storage: &'a dyn StorageBackend,
+    anomaly_source: Option<&'a dyn AnomalySource>,
     access: Mutex<McpAccessController>,
     validation_limits: ValidationLimits,
 }
@@ -67,9 +87,15 @@ impl<'a> McpServer<'a> {
     ) -> Self {
         Self {
             storage,
+            anomaly_source: None,
             access: Mutex::new(access_controller),
             validation_limits,
         }
+    }
+
+    pub fn with_anomaly_source(mut self, anomaly_source: &'a dyn AnomalySource) -> Self {
+        self.anomaly_source = Some(anomaly_source);
+        self
     }
 
     pub fn handle_request(
@@ -105,6 +131,16 @@ impl<'a> McpServer<'a> {
                     state_root_semantics: self.storage.state_root_semantics(),
                 }))
             }
+            McpTool::GetAnomalies { limit } => {
+                let source = self
+                    .anomaly_source
+                    .ok_or(McpServerError::AnomalySourceUnavailable)?;
+                let limit = (*limit).min(10_000) as usize;
+                let anomalies = source
+                    .recent_anomalies(limit)
+                    .map_err(McpServerError::AnomalySource)?;
+                Ok(McpResponse::GetAnomalies { anomalies })
+            }
             McpTool::BatchQuery { queries } => {
                 let mut responses = Vec::with_capacity(queries.len());
                 for query in queries {
@@ -120,9 +156,11 @@ impl<'a> McpServer<'a> {
 mod tests {
     use std::collections::BTreeSet;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::Mutex;
 
     use node_spec_core::mcp::{AgentPolicy, ToolPermission};
     use semver::Version;
+    use starknet_node_exex_btcfi::{BtcfiExEx, StandardWrapperMonitor, StrkBtcMonitor};
     use starknet_node_storage::InMemoryStorage;
     use starknet_node_types::{
         BlockGasPrices, ContractAddress, GasPricePerToken, InMemoryState, StarknetBlock,
@@ -235,33 +273,106 @@ mod tests {
     #[test]
     fn batch_query_executes_in_declared_order() {
         let storage = InMemoryStorage::new(InMemoryState::default());
+        let btcfi = Mutex::new(BtcfiExEx::new(
+            Vec::<StandardWrapperMonitor>::new(),
+            StrkBtcMonitor::new(starknet_node_exex_btcfi::StrkBtcMonitorConfig {
+                shielded_pool_contract: ContractAddress::from("0x222"),
+                merkle_root_key: "0x10".to_string(),
+                commitment_count_key: "0x11".to_string(),
+                nullifier_count_key: "0x12".to_string(),
+                nullifier_key_prefix: "0xdead".to_string(),
+                commitment_flood_threshold: 8,
+                unshield_cluster_threshold: 4,
+                unshield_cluster_window_blocks: 3,
+                light_client_max_lag_blocks: 6,
+                bridge_timeout_blocks: 20,
+                max_tracked_nullifiers: 100,
+            }),
+            8,
+        ));
         let server = server_with_storage(
             &storage,
             [(
                 "agent-a".to_string(),
                 read_policy(
-                    BTreeSet::from([ToolPermission::QueryState, ToolPermission::GetNodeStatus]),
+                    BTreeSet::from([
+                        ToolPermission::QueryState,
+                        ToolPermission::GetNodeStatus,
+                        ToolPermission::GetAnomalies,
+                    ]),
                     5,
                 ),
             )],
-        );
+        )
+        .with_anomaly_source(&btcfi);
         let response = server
             .handle_request(McpRequest {
                 api_key: "api-key".to_string(),
                 tool: McpTool::BatchQuery {
-                    queries: vec![McpTool::QueryState, McpTool::GetNodeStatus],
+                    queries: vec![
+                        McpTool::QueryState,
+                        McpTool::GetNodeStatus,
+                        McpTool::GetAnomalies { limit: 10 },
+                    ],
                 },
                 now_unix_seconds: 1_000,
             })
             .expect("batch query succeeds");
         match response.response {
             McpResponse::BatchQuery { responses } => {
-                assert_eq!(responses.len(), 2);
+                assert_eq!(responses.len(), 3);
                 assert!(matches!(responses[0], McpResponse::QueryState(_)));
                 assert!(matches!(responses[1], McpResponse::GetNodeStatus(_)));
+                assert!(matches!(responses[2], McpResponse::GetAnomalies { .. }));
             }
             other => panic!("expected batch response, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn get_anomalies_requires_permission() {
+        let storage = InMemoryStorage::new(InMemoryState::default());
+        let server = server_with_storage(
+            &storage,
+            [(
+                "agent-a".to_string(),
+                read_policy(BTreeSet::from([ToolPermission::QueryState]), 5),
+            )],
+        );
+        let err = server
+            .handle_request(McpRequest {
+                api_key: "api-key".to_string(),
+                tool: McpTool::GetAnomalies { limit: 10 },
+                now_unix_seconds: 1_000,
+            })
+            .expect_err("must deny missing permission");
+        assert_eq!(
+            err,
+            McpServerError::Access(AccessError::PermissionDenied {
+                agent_id: "agent-a".to_string(),
+                permission: ToolPermission::GetAnomalies,
+            })
+        );
+    }
+
+    #[test]
+    fn get_anomalies_fails_when_source_is_missing() {
+        let storage = InMemoryStorage::new(InMemoryState::default());
+        let server = server_with_storage(
+            &storage,
+            [(
+                "agent-a".to_string(),
+                read_policy(BTreeSet::from([ToolPermission::GetAnomalies]), 5),
+            )],
+        );
+        let err = server
+            .handle_request(McpRequest {
+                api_key: "api-key".to_string(),
+                tool: McpTool::GetAnomalies { limit: 10 },
+                now_unix_seconds: 1_000,
+            })
+            .expect_err("missing anomaly source should fail");
+        assert_eq!(err, McpServerError::AnomalySourceUnavailable);
     }
 
     #[test]
