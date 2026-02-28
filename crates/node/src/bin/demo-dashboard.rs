@@ -2362,7 +2362,24 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+
+    fn load_rpc_fixture(name: &str) -> Value {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("replay")
+            .join("rpc")
+            .join(name);
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!("failed to read RPC fixture {}: {error}", path.display());
+        });
+        serde_json::from_str(&raw).unwrap_or_else(|error| {
+            panic!("failed to parse RPC fixture {}: {error}", path.display());
+        })
+    }
 
     #[test]
     fn parse_dashboard_config_requires_rpc_in_real_mode() {
@@ -2756,5 +2773,162 @@ mod tests {
         let roundtrip_ok =
             nonfatal_anomaly_probe(Err("mcp unavailable".to_string()), "test anomaly probe");
         assert!(!roundtrip_ok);
+    }
+
+    #[test]
+    fn replay_fixture_mainnet_7242623_ingests_deterministically() {
+        let block_with_txs = load_rpc_fixture("mainnet_block_7242623_get_block_with_txs.json");
+        let state_update = load_rpc_fixture("mainnet_block_7242623_get_state_update.json");
+
+        let mut warnings = Vec::new();
+        let replay = parse_block_with_txs(&block_with_txs, &mut warnings)
+            .expect("block fixture must parse successfully");
+        assert!(
+            warnings.is_empty(),
+            "unexpected parse warnings: {warnings:?}"
+        );
+        assert_eq!(replay.external_block_number, 7_242_623);
+        assert_eq!(
+            replay.block_hash,
+            "0x3f2981fad7283a0af9212c1cc4a6c78ec7040dce2abf82a5b389e7aa18a4bb"
+        );
+        assert_eq!(replay.transaction_hashes.len(), 3);
+        assert_eq!(
+            replay.transaction_hashes[0],
+            "0x16208227ebe3964d9a055c2995986eb77a53d6a3cc492ca5a5c3a249cd7ec76"
+        );
+
+        let (state_diff, state_warnings) =
+            state_update_to_diff(&state_update).expect("state update fixture must parse");
+        assert!(
+            state_warnings.is_empty(),
+            "unexpected state diff warnings: {state_warnings:?}"
+        );
+        assert_eq!(state_diff.storage_diffs.len(), 7);
+        assert_eq!(state_diff.nonces.len(), 3);
+        assert!(state_diff.declared_classes.is_empty());
+
+        let expected_contract = ContractAddress::from(
+            "0x2dd3209b948554421cdb9bb8791c69d92154aa279e7eb52e9647335072a132d",
+        );
+        let expected_key = "0x6dfe00e4de355a406222fd8f14f4fa4a266ad915291694ae2827ed3b10b8d1";
+        let expected_value = StarknetFelt::from_str("0x69a2dee7").expect("valid felt");
+        assert_eq!(
+            state_diff
+                .storage_diffs
+                .get(&expected_contract)
+                .and_then(|writes| writes.get(expected_key))
+                .copied(),
+            Some(expected_value)
+        );
+
+        let (state_diff_repeat, repeat_warnings) =
+            state_update_to_diff(&state_update).expect("repeat parse must succeed");
+        assert_eq!(state_diff_repeat, state_diff);
+        assert_eq!(repeat_warnings, state_warnings);
+
+        let fetch = RealFetch {
+            snapshot: RealSnapshot {
+                chain_id: "SN_MAIN".to_string(),
+                latest_block: replay.external_block_number,
+                state_root: state_update
+                    .get("new_root")
+                    .and_then(Value::as_str)
+                    .expect("fixture must expose new_root")
+                    .to_string(),
+                tx_count: replay.transaction_hashes.len() as u64,
+                rpc_latency_ms: 0,
+                captured_unix_seconds: 0,
+            },
+            replay,
+            state_diff,
+            parse_warnings: Vec::new(),
+        };
+        let ingested = ingest_block_from_fetch(1, &fetch).expect("ingestion must succeed");
+        ingested.validate().expect("ingested block must be valid");
+        assert_eq!(ingested.transactions.len(), 3);
+        assert_eq!(
+            ingested.parent_hash,
+            "0x8c503be721489518c3dca57399a23581c1ca6ce6e06bb6d9e05896feec30d2"
+        );
+    }
+
+    #[test]
+    fn replay_fixture_mainnet_7242624_ingests_deterministically() {
+        let previous_block = load_rpc_fixture("mainnet_block_7242623_get_block_with_txs.json");
+        let block_with_txs = load_rpc_fixture("mainnet_block_7242624_get_block_with_txs.json");
+        let state_update = load_rpc_fixture("mainnet_block_7242624_get_state_update.json");
+
+        let mut previous_warnings = Vec::new();
+        let previous_replay = parse_block_with_txs(&previous_block, &mut previous_warnings)
+            .expect("previous fixture must parse");
+        assert!(previous_warnings.is_empty());
+
+        let mut warnings = Vec::new();
+        let replay = parse_block_with_txs(&block_with_txs, &mut warnings)
+            .expect("block fixture must parse successfully");
+        assert!(
+            warnings.is_empty(),
+            "unexpected parse warnings: {warnings:?}"
+        );
+        assert_eq!(replay.external_block_number, 7_242_624);
+        assert_eq!(
+            replay.parent_hash, previous_replay.block_hash,
+            "captured fixture chain continuity must hold"
+        );
+        assert_eq!(replay.transaction_hashes.len(), 6);
+        assert_eq!(
+            replay.transaction_hashes[0],
+            "0x183aa10ea20213b3426375d223d667a129e1b1cc03b09e6332c11d3858fda22"
+        );
+
+        let (state_diff, state_warnings) =
+            state_update_to_diff(&state_update).expect("state update fixture must parse");
+        assert!(
+            state_warnings.is_empty(),
+            "unexpected state diff warnings: {state_warnings:?}"
+        );
+        assert_eq!(state_diff.storage_diffs.len(), 16);
+        assert_eq!(state_diff.nonces.len(), 6);
+        assert!(state_diff.declared_classes.is_empty());
+
+        let expected_contract = ContractAddress::from(
+            "0x7229d1454093674673a530cd0d37beef3fc0f1b3116d95c62c5c032f1827d87",
+        );
+        let expected_key = "0x333aaabd0e6d8fa946806a7af3989c1138cc653163215838c0ef3a9a7f60018";
+        let expected_value = StarknetFelt::from_str("0x802ddac7").expect("valid felt");
+        assert_eq!(
+            state_diff
+                .storage_diffs
+                .get(&expected_contract)
+                .and_then(|writes| writes.get(expected_key))
+                .copied(),
+            Some(expected_value)
+        );
+
+        let fetch = RealFetch {
+            snapshot: RealSnapshot {
+                chain_id: "SN_MAIN".to_string(),
+                latest_block: replay.external_block_number,
+                state_root: state_update
+                    .get("new_root")
+                    .and_then(Value::as_str)
+                    .expect("fixture must expose new_root")
+                    .to_string(),
+                tx_count: replay.transaction_hashes.len() as u64,
+                rpc_latency_ms: 0,
+                captured_unix_seconds: 0,
+            },
+            replay,
+            state_diff,
+            parse_warnings: Vec::new(),
+        };
+        let ingested = ingest_block_from_fetch(2, &fetch).expect("ingestion must succeed");
+        ingested.validate().expect("ingested block must be valid");
+        assert_eq!(ingested.transactions.len(), 6);
+        assert_eq!(
+            ingested.state_root,
+            "0x25a23d7704a148a505fcd1d25c58c5a2f4847fbd3a739d809a1d0cfb25f7494"
+        );
     }
 }

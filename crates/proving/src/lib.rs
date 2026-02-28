@@ -38,9 +38,7 @@ impl StwoVerifyOnly {
 impl ProvingBackend for StwoVerifyOnly {
     fn verify_proof(&self, proof: &StarkProof) -> Result<bool, ProvingError> {
         if proof.proof_bytes.is_empty() {
-            return Err(ProvingError::InvalidProof(
-                "empty proof payload is not accepted".to_string(),
-            ));
+            return Ok(false);
         }
         Ok(true)
     }
@@ -128,18 +126,15 @@ mod tests {
     }
 
     #[test]
-    fn verify_only_rejects_empty_proof_payload() {
+    fn verify_only_returns_false_for_empty_proof_payload() {
         let verifier = StwoVerifyOnly::new();
-        let err = verifier
+        let valid = verifier
             .verify_proof(&StarkProof {
                 block_number: 7,
                 proof_bytes: Vec::new(),
             })
-            .expect_err("empty proofs must fail");
-        assert_eq!(
-            err,
-            ProvingError::InvalidProof("empty proof payload is not accepted".to_string())
-        );
+            .expect("empty payload should be treated as invalid, not an execution error");
+        assert!(!valid);
     }
 
     #[test]

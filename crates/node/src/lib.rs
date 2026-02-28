@@ -208,6 +208,8 @@ pub struct StarknetNodeBuilder<Stor, Exec> {
 #[cfg(feature = "production-adapters")]
 #[derive(Debug, Error)]
 pub enum NodeInitError {
+    #[error("mainnet production builder requires SN_MAIN chain id, got {0}")]
+    ChainIdMismatch(String),
     #[error("storage bootstrap check failed: {0}")]
     StorageCheck(String),
     #[error("storage backend reported unhealthy status")]
@@ -246,11 +248,15 @@ fn validate_bootstrap_storage<S: StorageBackend>(
     storage
         .get_state_reader(0)
         .map_err(|error| NodeInitError::StorageIntegrity(error.to_string()))?;
-    if config.chain_id.is_mainnet()
-        && let Some(genesis) = storage
+    if config.chain_id.is_mainnet() {
+        let genesis = storage
             .get_block(BlockId::Number(0))
             .map_err(|error| NodeInitError::StorageIntegrity(error.to_string()))?
-    {
+            .ok_or_else(|| {
+                NodeInitError::StorageIntegrity(
+                    "mainnet bootstrap requires block 0 to be present in storage".to_string(),
+                )
+            })?;
         let expected = normalize_hex(STARKNET_MAINNET_GENESIS_STATE_ROOT);
         let actual = normalize_hex(&genesis.state_root);
         if actual != expected {
@@ -539,6 +545,11 @@ pub fn build_mainnet_production_node_with_dual_config(
     storage: ApolloStorageAdapter,
     dual_config: ProductionDualExecutionConfig,
 ) -> Result<StarknetNode<ApolloStorageAdapter, DualExecutionBackend>, NodeInitError> {
+    if !config.chain_id.is_mainnet() {
+        return Err(NodeInitError::ChainIdMismatch(
+            config.chain_id.as_str().to_string(),
+        ));
+    }
     validate_bootstrap_storage(&storage, &config)?;
     let class_provider: Arc<dyn BlockifierClassProvider> =
         Arc::new(ApolloBlockifierClassProvider::new(storage.reader_handle()));
@@ -1271,6 +1282,28 @@ mod tests {
     }
 
     #[cfg(feature = "production-adapters")]
+    #[test]
+    fn production_node_rejects_non_mainnet_chain_config() {
+        let dir = tempdir().expect("temp dir");
+        let (reader, mut writer) =
+            open_apollo_storage(apollo_config(dir.path())).expect("open apollo storage");
+        seed_mainnet_genesis_header(&mut writer);
+        let adapter = ApolloStorageAdapter::from_parts(reader, writer);
+        let config = NodeConfig {
+            chain_id: ChainId::Sepolia,
+        };
+
+        let err = build_mainnet_production_node_with_dual_config(
+            config,
+            adapter,
+            ProductionDualExecutionConfig::default(),
+        )
+        .err()
+        .expect("mainnet production builder must reject non-mainnet chain config");
+        assert!(matches!(err, NodeInitError::ChainIdMismatch(_)));
+    }
+
+    #[cfg(feature = "production-adapters")]
     struct UnhealthyStorage(InMemoryStorage);
 
     #[cfg(feature = "production-adapters")]
@@ -1335,8 +1368,13 @@ mod tests {
     #[test]
     fn bootstrap_validation_rejects_unhealthy_storage() {
         let storage = UnhealthyStorage(InMemoryStorage::new(InMemoryState::default()));
-        let err =
-            validate_bootstrap_storage(&storage, &NodeConfig::default()).expect_err("must fail");
+        let err = validate_bootstrap_storage(
+            &storage,
+            &NodeConfig {
+                chain_id: ChainId::Sepolia,
+            },
+        )
+        .expect_err("must fail");
         assert!(matches!(err, NodeInitError::StorageUnhealthy));
     }
 
@@ -1344,7 +1382,13 @@ mod tests {
     #[test]
     fn bootstrap_validation_accepts_healthy_storage() {
         let storage = InMemoryStorage::new(InMemoryState::default());
-        validate_bootstrap_storage(&storage, &NodeConfig::default()).expect("healthy storage");
+        validate_bootstrap_storage(
+            &storage,
+            &NodeConfig {
+                chain_id: ChainId::Sepolia,
+            },
+        )
+        .expect("healthy storage");
     }
 
     #[cfg(feature = "production-adapters")]
@@ -1535,5 +1579,18 @@ mod tests {
 
         validate_bootstrap_storage(&storage, &NodeConfig::default())
             .expect("matching mainnet genesis root");
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn bootstrap_validation_rejects_mainnet_when_genesis_block_is_missing() {
+        let storage = InMemoryStorage::new(InMemoryState::default());
+        let err =
+            validate_bootstrap_storage(&storage, &NodeConfig::default()).expect_err("must fail");
+        assert!(matches!(err, NodeInitError::StorageIntegrity(_)));
+        assert!(
+            err.to_string().contains("block 0"),
+            "expected missing genesis error, got: {err}"
+        );
     }
 }
