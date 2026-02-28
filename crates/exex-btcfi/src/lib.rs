@@ -146,6 +146,7 @@ pub struct StrkBtcMonitor {
     last_commitment_count: Option<u64>,
     last_nullifier_count: Option<u64>,
     seen_nullifiers: BTreeSet<String>,
+    nullifier_order: VecDeque<String>,
     recent_unshield_deltas: VecDeque<(BlockNumber, u64)>,
 }
 
@@ -158,6 +159,7 @@ impl StrkBtcMonitor {
             last_commitment_count: None,
             last_nullifier_count: None,
             seen_nullifiers: BTreeSet::new(),
+            nullifier_order: VecDeque::new(),
             recent_unshield_deltas: VecDeque::new(),
         }
     }
@@ -195,9 +197,12 @@ impl StrkBtcMonitor {
             }
             if self.seen_nullifiers.len() >= self.config.max_tracked_nullifiers {
                 nullifier_tracking_saturated = true;
-                continue;
+                if let Some(evicted) = self.nullifier_order.pop_front() {
+                    self.seen_nullifiers.remove(&evicted);
+                }
             }
             self.seen_nullifiers.insert(key.clone());
+            self.nullifier_order.push_back(key.clone());
         }
 
         if nullifier_tracking_saturated {
@@ -208,7 +213,9 @@ impl StrkBtcMonitor {
             });
         }
 
-        let next_merkle_root = writes.get(&self.config.merkle_root_key).map(felt_to_hex);
+        let next_merkle_root = writes
+            .get(&self.config.merkle_root_key)
+            .map(felt_to_hex_prefixed);
         let next_commitment_count = match writes.get(&self.config.commitment_count_key) {
             Some(value) => match felt_to_u64(value) {
                 Ok(parsed) => Some(parsed),
@@ -410,22 +417,22 @@ impl BtcfiExEx {
     }
 }
 
-fn felt_to_hex(value: &StarknetFelt) -> String {
+fn felt_to_hex_prefixed(value: &StarknetFelt) -> String {
     format!("{:#x}", value)
 }
 
 fn felt_to_u64(value: &StarknetFelt) -> Result<u64, String> {
-    let hex = felt_to_hex(value);
+    let hex = felt_to_hex_prefixed(value);
     u64::from_str_radix(hex.trim_start_matches("0x"), 16).map_err(|_| hex)
 }
 
 fn felt_to_u128(value: &StarknetFelt) -> Result<u128, String> {
-    let hex = felt_to_hex(value);
+    let hex = felt_to_hex_prefixed(value);
     u128::from_str_radix(hex.trim_start_matches("0x"), 16).map_err(|_| hex)
 }
 
 fn felt_is_zero(value: &StarknetFelt) -> bool {
-    felt_to_hex(value) == "0x0"
+    felt_to_hex_prefixed(value) == "0x0"
 }
 
 #[cfg(test)]
@@ -576,6 +583,52 @@ mod tests {
             }]
         ));
         assert_eq!(monitor.seen_nullifiers.len(), 1);
+    }
+
+    #[test]
+    fn strkbtc_monitor_keeps_reuse_detection_after_tracking_saturation() {
+        let mut cfg = strkbtc_config();
+        cfg.max_tracked_nullifiers = 2;
+        let mut monitor = StrkBtcMonitor::new(cfg);
+
+        let mut first = StarknetStateDiff::default();
+        first.storage_diffs.insert(
+            ContractAddress::from("0x222"),
+            BTreeMap::from([
+                ("0xdead01".to_string(), StarknetFelt::from(1_u64)),
+                ("0xdead02".to_string(), StarknetFelt::from(1_u64)),
+            ]),
+        );
+        assert!(monitor.process_state_diff(40, &first).is_empty());
+
+        let second = diff_with_write(
+            ContractAddress::from("0x222"),
+            "0xdead03",
+            StarknetFelt::from(1_u64),
+        );
+        let saturated = monitor.process_state_diff(41, &second);
+        assert!(saturated.iter().any(|anomaly| matches!(
+            anomaly,
+            BtcfiAnomaly::StrkBtcNullifierTrackingSaturated {
+                block_number: 41,
+                tracked: 2,
+                max: 2,
+            }
+        )));
+
+        let reused_tracked = diff_with_write(
+            ContractAddress::from("0x222"),
+            "0xdead02",
+            StarknetFelt::from(1_u64),
+        );
+        let anomalies = monitor.process_state_diff(42, &reused_tracked);
+        assert!(anomalies.iter().any(|anomaly| matches!(
+            anomaly,
+            BtcfiAnomaly::StrkBtcNullifierReuse {
+                block_number: 42,
+                nullifier_key,
+            } if nullifier_key == "0xdead02"
+        )));
     }
 
     #[test]

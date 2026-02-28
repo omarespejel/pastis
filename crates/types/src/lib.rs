@@ -88,6 +88,7 @@ pub const MAX_CONTRACTS_IN_MEMORY_STATE: usize = 100_000;
 pub const MAX_STORAGE_SLOTS_PER_CONTRACT: usize = 1_000_000;
 pub const MAX_TOTAL_STORAGE_ENTRIES: usize = 10_000_000;
 const MAX_FELT_INPUT_LEN: usize = 256;
+const MAX_ERROR_VALUE_LEN: usize = 64;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum IdentifierValidationError {
@@ -215,9 +216,18 @@ fn canonicalize_felt_hex(
         .map(|felt| format!("{:#x}", felt))
         .map_err(|error| IdentifierValidationError::InvalidHexFelt {
             field,
-            value: value.to_string(),
+            value: preview_value(value),
             error: error.to_string(),
         })
+}
+
+fn preview_value(value: &str) -> String {
+    let total_chars = value.chars().count();
+    if total_chars <= MAX_ERROR_VALUE_LEN {
+        return value.to_string();
+    }
+    let prefix: String = value.chars().take(MAX_ERROR_VALUE_LEN).collect();
+    format!("{}...(truncated, {} chars total)", prefix, total_chars)
 }
 
 fn validate_hex_felt(field: &'static str, value: &str) -> Result<(), IdentifierValidationError> {
@@ -535,12 +545,6 @@ pub trait MutableState: StateReader {
     fn boxed_clone(&self) -> Box<dyn MutableState>;
 }
 
-fn normalize_felt_hex(input: &str) -> String {
-    StarknetFelt::from_str(input)
-        .map(|felt| format!("{:#x}", felt))
-        .unwrap_or_else(|_| input.to_string())
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InMemoryState {
     pub storage: Arc<BTreeMap<ContractAddress, BTreeMap<String, StarknetFelt>>>,
@@ -551,75 +555,72 @@ impl InMemoryState {
     pub fn apply_state_diff(&mut self, diff: &StarknetStateDiff) -> Result<(), StateLimitError> {
         diff.validate()?;
 
-        let mut contract_count = self.storage.len();
-        let mut total_storage_entries = self
-            .storage
-            .values()
-            .fold(0usize, |acc, slots| acc.saturating_add(slots.len()));
-        let mut new_slots_by_contract: BTreeMap<ContractAddress, usize> = BTreeMap::new();
-        let mut seen_new_slots: std::collections::BTreeSet<(ContractAddress, String)> =
-            std::collections::BTreeSet::new();
+        let mut staged_storage = (*self.storage).clone();
+        let mut staged_nonces = (*self.nonces).clone();
 
         for (contract, writes) in &diff.storage_diffs {
-            let normalized_contract = ContractAddress::from(normalize_felt_hex(contract));
-            if !self.storage.contains_key(&normalized_contract)
-                && !new_slots_by_contract.contains_key(&normalized_contract)
-            {
-                contract_count = contract_count.saturating_add(1);
-                if contract_count > MAX_CONTRACTS_IN_MEMORY_STATE {
-                    return Err(StateLimitError::TooManyContracts {
-                        count: contract_count,
-                        max: MAX_CONTRACTS_IN_MEMORY_STATE,
-                    });
-                }
-            }
-
+            let normalized_contract = ContractAddress::from(
+                canonicalize_felt_hex("contract_address", contract.as_ref()).map_err(|source| {
+                    StateLimitError::InvalidStateDiff(StateDiffValidationError::InvalidIdentifier {
+                        field: "contract_address",
+                        source,
+                    })
+                })?,
+            );
+            let slots = staged_storage.entry(normalized_contract).or_default();
             for (key, value) in writes {
-                let normalized_key = normalize_felt_hex(key);
-                let slot_marker = (normalized_contract.clone(), normalized_key.clone());
-                if seen_new_slots.contains(&slot_marker) {
-                    continue;
-                }
-
-                let exists = self
-                    .storage
-                    .get(&normalized_contract)
-                    .and_then(|slots| slots.get(&normalized_key))
-                    .is_some();
-                if !exists {
-                    seen_new_slots.insert(slot_marker);
-                    total_storage_entries = total_storage_entries.saturating_add(1);
-                    if total_storage_entries > MAX_TOTAL_STORAGE_ENTRIES {
-                        return Err(StateLimitError::TooManyStorageEntries {
-                            count: total_storage_entries,
-                            max: MAX_TOTAL_STORAGE_ENTRIES,
-                        });
-                    }
-                    let per_contract = new_slots_by_contract
-                        .entry(normalized_contract.clone())
-                        .or_insert(0);
-                    *per_contract = per_contract.saturating_add(1);
-                    let existing_slots = self
-                        .storage
-                        .get(&normalized_contract)
-                        .map(|slots| slots.len())
-                        .unwrap_or_default();
-                    let projected_slots = existing_slots.saturating_add(*per_contract);
-                    if projected_slots > MAX_STORAGE_SLOTS_PER_CONTRACT {
-                        return Err(StateLimitError::TooManyStorageSlotsForContract {
-                            contract: normalized_contract.clone(),
-                            count: projected_slots,
-                            max: MAX_STORAGE_SLOTS_PER_CONTRACT,
-                        });
-                    }
-                }
-
-                self.set_storage(contract.clone(), key.clone(), *value);
+                let normalized_key =
+                    canonicalize_felt_hex("storage_key", key).map_err(|source| {
+                        StateLimitError::InvalidStateDiff(
+                            StateDiffValidationError::InvalidIdentifier {
+                                field: "storage_key",
+                                source,
+                            },
+                        )
+                    })?;
+                slots.insert(normalized_key, *value);
             }
         }
         for (contract, nonce) in &diff.nonces {
-            self.set_nonce(contract.clone(), *nonce);
+            let normalized_contract = ContractAddress::from(
+                canonicalize_felt_hex("contract_address", contract.as_ref()).map_err(|source| {
+                    StateLimitError::InvalidStateDiff(StateDiffValidationError::InvalidIdentifier {
+                        field: "contract_address",
+                        source,
+                    })
+                })?,
+            );
+            staged_nonces.insert(normalized_contract, *nonce);
         }
+
+        let contract_count = staged_storage.len();
+        if contract_count > MAX_CONTRACTS_IN_MEMORY_STATE {
+            return Err(StateLimitError::TooManyContracts {
+                count: contract_count,
+                max: MAX_CONTRACTS_IN_MEMORY_STATE,
+            });
+        }
+
+        let mut total_storage_entries = 0usize;
+        for (contract, slots) in &staged_storage {
+            if slots.len() > MAX_STORAGE_SLOTS_PER_CONTRACT {
+                return Err(StateLimitError::TooManyStorageSlotsForContract {
+                    contract: contract.clone(),
+                    count: slots.len(),
+                    max: MAX_STORAGE_SLOTS_PER_CONTRACT,
+                });
+            }
+            total_storage_entries = total_storage_entries.saturating_add(slots.len());
+            if total_storage_entries > MAX_TOTAL_STORAGE_ENTRIES {
+                return Err(StateLimitError::TooManyStorageEntries {
+                    count: total_storage_entries,
+                    max: MAX_TOTAL_STORAGE_ENTRIES,
+                });
+            }
+        }
+
+        self.storage = Arc::new(staged_storage);
+        self.nonces = Arc::new(staged_nonces);
         Ok(())
     }
 }
@@ -630,8 +631,12 @@ impl StateReader for InMemoryState {
         contract: &ContractAddress,
         key: &str,
     ) -> Result<Option<StarknetFelt>, StateReadError> {
-        let contract = ContractAddress::from(normalize_felt_hex(contract));
-        let key = normalize_felt_hex(key);
+        let contract = ContractAddress::from(
+            canonicalize_felt_hex("contract_address", contract.as_ref())
+                .map_err(|error| StateReadError::Backend(error.to_string()))?,
+        );
+        let key = canonicalize_felt_hex("storage_key", key)
+            .map_err(|error| StateReadError::Backend(error.to_string()))?;
         Ok(self
             .storage
             .get(&contract)
@@ -639,15 +644,33 @@ impl StateReader for InMemoryState {
     }
 
     fn nonce_of(&self, contract: &ContractAddress) -> Result<Option<StarknetFelt>, StateReadError> {
-        let contract = ContractAddress::from(normalize_felt_hex(contract));
+        let contract = ContractAddress::from(
+            canonicalize_felt_hex("contract_address", contract.as_ref())
+                .map_err(|error| StateReadError::Backend(error.to_string()))?,
+        );
         Ok(self.nonces.get(&contract).copied())
     }
 }
 
 impl MutableState for InMemoryState {
     fn set_storage(&mut self, contract: ContractAddress, key: String, value: StarknetFelt) {
-        let contract = ContractAddress::from(normalize_felt_hex(&contract));
-        let key = normalize_felt_hex(&key);
+        let contract = match canonicalize_felt_hex("contract_address", contract.as_ref()) {
+            Ok(value) => ContractAddress::from(value),
+            Err(error) => {
+                debug_assert!(
+                    false,
+                    "set_storage rejected invalid contract address: {error}"
+                );
+                return;
+            }
+        };
+        let key = match canonicalize_felt_hex("storage_key", &key) {
+            Ok(value) => value,
+            Err(error) => {
+                debug_assert!(false, "set_storage rejected invalid storage key: {error}");
+                return;
+            }
+        };
         Arc::make_mut(&mut self.storage)
             .entry(contract)
             .or_default()
@@ -655,7 +678,16 @@ impl MutableState for InMemoryState {
     }
 
     fn set_nonce(&mut self, contract: ContractAddress, nonce: StarknetFelt) {
-        let contract = ContractAddress::from(normalize_felt_hex(&contract));
+        let contract = match canonicalize_felt_hex("contract_address", contract.as_ref()) {
+            Ok(value) => ContractAddress::from(value),
+            Err(error) => {
+                debug_assert!(
+                    false,
+                    "set_nonce rejected invalid contract address: {error}"
+                );
+                return;
+            }
+        };
         Arc::make_mut(&mut self.nonces).insert(contract, nonce);
     }
 
@@ -850,12 +882,43 @@ mod tests {
     }
 
     #[test]
+    fn truncates_invalid_identifier_value_in_error_message() {
+        let invalid = format!("0x{}", "g".repeat(120));
+        let tx = StarknetTransaction::new(invalid);
+        let err = tx.validate_hash().expect_err("must reject invalid felt");
+        match err {
+            IdentifierValidationError::InvalidHexFelt { value, .. } => {
+                assert!(value.contains("truncated"));
+                assert!(value.starts_with("0x"));
+                assert!(value.len() < 120);
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
     fn rejects_excessively_long_transaction_hash_input() {
         let tx = StarknetTransaction::new(format!("0x{}", "a".repeat(MAX_FELT_INPUT_LEN + 1)));
         let err = tx
             .validate_hash()
             .expect_err("must reject excessively long felt string");
         assert!(matches!(err, IdentifierValidationError::TooLong { .. }));
+    }
+
+    #[test]
+    fn state_reader_rejects_invalid_lookup_identifiers() {
+        let state = InMemoryState::default();
+        let err = state
+            .get_storage(&ContractAddress::from("not-a-felt"), "0x1")
+            .expect_err("invalid contract identifier must fail");
+        assert!(
+            matches!(err, StateReadError::Backend(message) if message.contains("contract_address"))
+        );
+
+        let err = state
+            .get_storage(&ContractAddress::from("0x1"), "not-a-key")
+            .expect_err("invalid storage key must fail");
+        assert!(matches!(err, StateReadError::Backend(message) if message.contains("storage_key")));
     }
 
     #[test]

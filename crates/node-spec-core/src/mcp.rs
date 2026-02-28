@@ -108,10 +108,8 @@ impl AgentPolicy {
     ) -> Result<Self, AgentPolicyBuildError> {
         let mut api_key_salt = [0_u8; 16];
         OsRng.fill_bytes(&mut api_key_salt);
-        let api_key_hash =
-            hash_api_key_argon2id(api_key.as_ref(), &api_key_salt).map_err(|error| {
-                AgentPolicyBuildError::ApiKeyDerivation(error.to_string())
-            })?;
+        let api_key_hash = hash_api_key_argon2id(api_key.as_ref(), &api_key_salt)
+            .map_err(|error| AgentPolicyBuildError::ApiKeyDerivation(error.to_string()))?;
         Ok(Self {
             api_key_salt,
             api_key_hash,
@@ -172,7 +170,22 @@ pub struct McpAccessController {
 
 impl McpAccessController {
     pub fn new(policies: impl IntoIterator<Item = (String, AgentPolicy)>) -> Self {
-        Self::try_new(policies).expect("mcp policy construction must reject duplicate api salts")
+        let mut salts: BTreeMap<[u8; 16], String> = BTreeMap::new();
+        let mut policy_map = BTreeMap::new();
+        for (agent_id, policy) in policies {
+            if salts.contains_key(&policy.api_key_salt) {
+                // Keep the first policy bound to a salt and drop duplicates to avoid
+                // ambiguous API-key resolution or constructor panics.
+                continue;
+            }
+            salts.insert(policy.api_key_salt, agent_id.clone());
+            policy_map.insert(agent_id, policy);
+        }
+        Self {
+            policies: policy_map,
+            requests: BTreeMap::new(),
+            latest_request_time: BTreeMap::new(),
+        }
     }
 
     pub fn try_new(
@@ -529,6 +542,28 @@ mod tests {
                 second_agent: "agent-b".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn infallible_controller_constructor_drops_duplicate_policy_salts() {
+        let first = read_only_policy(1);
+        let duplicate = AgentPolicy {
+            api_key_salt: first.api_key_salt,
+            api_key_hash: first.api_key_hash,
+            api_key_kdf: first.api_key_kdf,
+            permissions: first.permissions.clone(),
+            max_requests_per_minute: first.max_requests_per_minute,
+        };
+
+        let mut access = McpAccessController::new([
+            ("agent-a".to_string(), first),
+            ("agent-b".to_string(), duplicate),
+        ]);
+
+        let resolved = access
+            .authorize("secret", &McpTool::QueryState, 1_000)
+            .expect("first policy should remain active");
+        assert_eq!(resolved, "agent-a");
     }
 
     #[test]

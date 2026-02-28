@@ -139,7 +139,48 @@ pub struct DualExecutionBackend {
     verification_shadow_state: Mutex<Option<Box<dyn MutableState>>>,
 }
 
+struct VerificationTipScope<'a> {
+    backend: &'a DualExecutionBackend,
+    active: bool,
+}
+
+impl<'a> VerificationTipScope<'a> {
+    fn enter(backend: &'a DualExecutionBackend, tip: u64) -> Result<Self, ExecutionError> {
+        backend.set_verification_tip(tip)?;
+        Ok(Self {
+            backend,
+            active: true,
+        })
+    }
+
+    fn close(mut self) -> Result<(), ExecutionError> {
+        self.backend.clear_verification_tip()?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for VerificationTipScope<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Err(error) = self.backend.clear_verification_tip() {
+            log::error!("failed to clear verification tip during scope teardown: {error}");
+        }
+        self.active = false;
+    }
+}
+
 impl DualExecutionBackend {
+    fn poisoned_lock(name: &'static str) -> ExecutionError {
+        log::error!(
+            "invariant violation: dual execution {} mutex poisoned; aborting affected operation",
+            name
+        );
+        ExecutionError::Backend(format!("invariant violation: {name} mutex poisoned"))
+    }
+
     pub fn new(
         fast: Option<Box<dyn ExecutionBackend>>,
         canonical: Box<dyn ExecutionBackend>,
@@ -162,7 +203,7 @@ impl DualExecutionBackend {
         let mut guard = self
             .verification_tip
             .lock()
-            .map_err(|_| ExecutionError::Backend("verification tip mutex poisoned".to_string()))?;
+            .map_err(|_| Self::poisoned_lock("verification tip"))?;
         *guard = Some(tip);
         Ok(())
     }
@@ -171,16 +212,34 @@ impl DualExecutionBackend {
         let mut guard = self
             .verification_tip
             .lock()
-            .map_err(|_| ExecutionError::Backend("verification tip mutex poisoned".to_string()))?;
+            .map_err(|_| Self::poisoned_lock("verification tip"))?;
         *guard = None;
         Ok(())
+    }
+
+    pub fn with_verification_tip<T>(
+        &self,
+        tip: u64,
+        f: impl FnOnce(&Self) -> Result<T, ExecutionError>,
+    ) -> Result<T, ExecutionError> {
+        let scope = VerificationTipScope::enter(self, tip)?;
+        let result = f(self);
+        let clear_result = scope.close();
+        match (result, clear_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(clear_error)) => Err(clear_error),
+            (Err(run_error), Ok(())) => Err(run_error),
+            (Err(run_error), Err(clear_error)) => Err(ExecutionError::Backend(format!(
+                "verification tip scope failed: run_error={run_error}; clear_error={clear_error}"
+            ))),
+        }
     }
 
     pub fn metrics(&self) -> Result<DualExecutionMetrics, ExecutionError> {
         let guard = self
             .metrics
             .lock()
-            .map_err(|_| ExecutionError::Backend("metrics mutex poisoned".to_string()))?;
+            .map_err(|_| Self::poisoned_lock("metrics"))?;
         Ok(guard.clone())
     }
 
@@ -191,7 +250,7 @@ impl DualExecutionBackend {
         let mut guard = self
             .metrics
             .lock()
-            .map_err(|_| ExecutionError::Backend("metrics mutex poisoned".to_string()))?;
+            .map_err(|_| Self::poisoned_lock("metrics"))?;
         f(&mut guard);
         Ok(())
     }
@@ -208,7 +267,7 @@ impl DualExecutionBackend {
         let tip = *self
             .verification_tip
             .lock()
-            .map_err(|_| ExecutionError::Backend("verification tip mutex poisoned".to_string()))?;
+            .map_err(|_| Self::poisoned_lock("verification tip"))?;
         let Some(tip) = tip else {
             return Ok(true);
         };
@@ -242,9 +301,10 @@ impl DualExecutionBackend {
         &self,
         diff: &starknet_node_types::StarknetStateDiff,
     ) -> Result<(), ExecutionError> {
-        let mut guard = self.verification_shadow_state.lock().map_err(|_| {
-            ExecutionError::Backend("verification shadow state mutex poisoned".to_string())
-        })?;
+        let mut guard = self
+            .verification_shadow_state
+            .lock()
+            .map_err(|_| Self::poisoned_lock("verification shadow state"))?;
         if let Some(shadow) = guard.as_mut() {
             Self::apply_state_diff(shadow.as_mut(), diff);
         }
@@ -255,16 +315,18 @@ impl DualExecutionBackend {
         &self,
         state: &dyn MutableState,
     ) -> Result<Box<dyn MutableState>, ExecutionError> {
-        let mut guard = self.verification_shadow_state.lock().map_err(|_| {
-            ExecutionError::Backend("verification shadow state mutex poisoned".to_string())
-        })?;
+        let mut guard = self
+            .verification_shadow_state
+            .lock()
+            .map_err(|_| Self::poisoned_lock("verification shadow state"))?;
         Ok(guard.take().unwrap_or_else(|| state.boxed_clone()))
     }
 
     fn store_shadow(&self, shadow: Box<dyn MutableState>) -> Result<(), ExecutionError> {
-        let mut guard = self.verification_shadow_state.lock().map_err(|_| {
-            ExecutionError::Backend("verification shadow state mutex poisoned".to_string())
-        })?;
+        let mut guard = self
+            .verification_shadow_state
+            .lock()
+            .map_err(|_| Self::poisoned_lock("verification shadow state"))?;
         *guard = Some(shadow);
         Ok(())
     }
@@ -281,7 +343,7 @@ impl DualExecutionBackend {
         let mut cooldown = self
             .cooldown_remaining
             .lock()
-            .map_err(|_| ExecutionError::Backend("cooldown mutex poisoned".to_string()))?;
+            .map_err(|_| Self::poisoned_lock("cooldown"))?;
         let forced_canonical = if *cooldown > 0 {
             *cooldown -= 1;
             true
@@ -361,9 +423,10 @@ impl DualExecutionBackend {
                     MismatchPolicy::WarnAndFallback => Ok(canonical_output),
                     MismatchPolicy::Halt => Err(ExecutionError::Halted),
                     MismatchPolicy::CooldownThenRetry { cooldown_blocks } => {
-                        let mut cooldown = self.cooldown_remaining.lock().map_err(|_| {
-                            ExecutionError::Backend("cooldown mutex poisoned".to_string())
-                        })?;
+                        let mut cooldown = self
+                            .cooldown_remaining
+                            .lock()
+                            .map_err(|_| Self::poisoned_lock("cooldown"))?;
                         *cooldown = cooldown_blocks;
                         Ok(canonical_output)
                     }
@@ -1272,7 +1335,6 @@ impl ExecutionBackend for BlockifierVmBackend {
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -1840,6 +1902,30 @@ mod tests {
             .expect("inside verification window should use canonical on mismatch");
         assert_eq!(old_block.receipts[0].gas_consumed, 2);
         assert_eq!(recent_block.receipts[0].gas_consumed, 30);
+    }
+
+    #[test]
+    fn verification_tip_scope_clears_tip_when_inner_operation_fails() {
+        let backend = DualExecutionBackend::new(
+            None,
+            Box::new(ScriptedBackend::new(
+                "canonical",
+                BTreeMap::new(),
+                output(1),
+            )),
+            ExecutionMode::CanonicalOnly,
+            MismatchPolicy::WarnAndFallback,
+        );
+
+        let err: Result<(), ExecutionError> = backend
+            .with_verification_tip(123, |_| Err(ExecutionError::Backend("boom".to_string())));
+        assert!(matches!(err, Err(ExecutionError::Backend(message)) if message == "boom"));
+        assert!(
+            backend
+                .should_verify_block(1, 1)
+                .expect("scope teardown should clear tip"),
+            "verification tip must be cleared after scoped failure"
+        );
     }
 
     #[test]

@@ -4,11 +4,13 @@ use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 pub const REPLAY_CHECKPOINT_VERSION: u32 = 1;
+static CHECKPOINT_TMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayHashWindowEntry {
@@ -104,22 +106,29 @@ impl ReplayCheckpointStore for FileReplayCheckpointStore {
             }
         })?;
 
-        let tmp_nonce = SystemTime::now()
+        let timestamp_nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let tmp_path = self
-            .path
-            .with_extension(format!("tmp-{}-{tmp_nonce}", std::process::id()));
+        let sequence_nonce = CHECKPOINT_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = self.path.with_extension(format!(
+            "tmp-{}-{timestamp_nonce}-{sequence_nonce}",
+            std::process::id()
+        ));
         fs::write(&tmp_path, encoded).map_err(|error| ReplayCheckpointError::Io {
             path: tmp_path.display().to_string(),
             error: error.to_string(),
         })?;
-        fs::rename(&tmp_path, &self.path).map_err(|error| ReplayCheckpointError::Io {
-            path: self.path.display().to_string(),
-            error: error.to_string(),
-        })?;
-        Ok(())
+        match fs::rename(&tmp_path, &self.path) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = fs::remove_file(&tmp_path);
+                Err(ReplayCheckpointError::Io {
+                    path: self.path.display().to_string(),
+                    error: error.to_string(),
+                })
+            }
+        }
     }
 }
 
@@ -438,8 +447,12 @@ impl ReplayPipeline {
         };
 
         let depth = external_block_number.saturating_sub(ancestor_external_block.saturating_add(1));
+        let previous_engine = self.engine.clone();
         let reorg = self.engine.force_reorg(external_block_number);
-        self.persist_checkpoint()?;
+        if let Err(error) = self.persist_checkpoint() {
+            self.engine = previous_engine;
+            return Err(error);
+        }
         match reorg {
             ReplayCheck::Reorg {
                 conflicting_external_block,
@@ -553,15 +566,45 @@ fn validate_checkpoint_recent_hashes(
                 "recent_hashes contains empty block hash".to_string(),
             ));
         }
-        if let Some(previous) = previous_block
-            && entry.external_block_number <= previous
-        {
-            return Err(ReplayCheckpointError::InvalidCheckpoint(format!(
-                "recent_hashes must be strictly increasing; saw {} then {}",
-                previous, entry.external_block_number
-            )));
+        if let Some(previous) = previous_block {
+            if entry.external_block_number <= previous {
+                return Err(ReplayCheckpointError::InvalidCheckpoint(format!(
+                    "recent_hashes must be strictly increasing; saw {} then {}",
+                    previous, entry.external_block_number
+                )));
+            }
+            if entry.external_block_number != previous.saturating_add(1) {
+                return Err(ReplayCheckpointError::InvalidCheckpoint(format!(
+                    "recent_hashes must be contiguous; saw {} then {}",
+                    previous, entry.external_block_number
+                )));
+            }
         }
         previous_block = Some(entry.external_block_number);
+    }
+
+    if checkpoint.next_local_block == 0 {
+        return Err(ReplayCheckpointError::InvalidCheckpoint(
+            "next_local_block must be >= 1".to_string(),
+        ));
+    }
+
+    if checkpoint.expected_parent_hash.is_some() && checkpoint.next_external_block.is_none() {
+        return Err(ReplayCheckpointError::InvalidCheckpoint(
+            "expected_parent_hash is set but next_external_block is missing".to_string(),
+        ));
+    }
+
+    if checkpoint.next_local_block > 1 && checkpoint.expected_parent_hash.is_none() {
+        return Err(ReplayCheckpointError::InvalidCheckpoint(
+            "next_local_block > 1 requires expected_parent_hash".to_string(),
+        ));
+    }
+
+    if checkpoint.next_local_block > 1 && checkpoint.recent_hashes.is_empty() {
+        return Err(ReplayCheckpointError::InvalidCheckpoint(
+            "next_local_block > 1 requires at least one recent hash".to_string(),
+        ));
     }
 
     if let Some(expected_parent_hash) = checkpoint.expected_parent_hash.as_ref() {
@@ -578,14 +621,24 @@ fn validate_checkpoint_recent_hashes(
         }
     }
 
-    if let (Some(next_external_block), Some(last)) =
-        (checkpoint.next_external_block, checkpoint.recent_hashes.last())
-        && next_external_block <= last.external_block_number
-    {
-        return Err(ReplayCheckpointError::InvalidCheckpoint(format!(
-            "next_external_block {} must be greater than last recent hash block {}",
-            next_external_block, last.external_block_number
-        )));
+    if let (Some(next_external_block), Some(last)) = (
+        checkpoint.next_external_block,
+        checkpoint.recent_hashes.last(),
+    ) {
+        if next_external_block <= last.external_block_number {
+            return Err(ReplayCheckpointError::InvalidCheckpoint(format!(
+                "next_external_block {} must be greater than last recent hash block {}",
+                next_external_block, last.external_block_number
+            )));
+        }
+        if checkpoint.expected_parent_hash.is_some()
+            && next_external_block != last.external_block_number.saturating_add(1)
+        {
+            return Err(ReplayCheckpointError::InvalidCheckpoint(format!(
+                "next_external_block {} must equal last recent hash block {} + 1 when expected_parent_hash is set",
+                next_external_block, last.external_block_number
+            )));
+        }
     }
 
     Ok(())
@@ -593,6 +646,7 @@ fn validate_checkpoint_recent_hashes(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::Arc;
 
     use tempfile::tempdir;
@@ -694,6 +748,46 @@ mod tests {
             .expect("checkpoint exists");
         assert_eq!(loaded, checkpoint);
         assert_eq!(store.path(), path.as_path());
+    }
+
+    #[test]
+    fn replay_checkpoint_file_store_cleans_up_tmp_file_when_rename_fails() {
+        let dir = tempdir().expect("tempdir");
+        let target_path = dir.path().join("checkpoint-target");
+        fs::create_dir_all(&target_path).expect("create conflicting directory");
+        let store = FileReplayCheckpointStore::new(target_path.clone());
+
+        let checkpoint = ReplayCheckpoint {
+            version: REPLAY_CHECKPOINT_VERSION,
+            replay_window: 8,
+            max_replay_per_poll: 4,
+            next_external_block: Some(10),
+            expected_parent_hash: Some("0x9".to_string()),
+            next_local_block: 2,
+            reorg_events: 0,
+            recent_hashes: vec![ReplayHashWindowEntry {
+                external_block_number: 9,
+                block_hash: "0x9".to_string(),
+            }],
+        };
+        let err = store
+            .save(&checkpoint)
+            .expect_err("rename to existing directory must fail");
+        assert!(matches!(err, ReplayCheckpointError::Io { .. }));
+
+        let leaked_tmp = fs::read_dir(dir.path())
+            .expect("list checkpoint directory")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("checkpoint-target.tmp-")
+            });
+        assert!(
+            !leaked_tmp,
+            "tmp checkpoint file must be removed on rename failure"
+        );
     }
 
     #[test]
@@ -875,6 +969,44 @@ mod tests {
     }
 
     #[test]
+    fn replay_pipeline_rejects_checkpoint_with_non_contiguous_recent_hashes() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("replay-checkpoint.json");
+        let store = FileReplayCheckpointStore::new(path.clone());
+        store
+            .save(&ReplayCheckpoint {
+                version: REPLAY_CHECKPOINT_VERSION,
+                replay_window: 8,
+                max_replay_per_poll: 8,
+                next_external_block: Some(103),
+                expected_parent_hash: Some("0x102".to_string()),
+                next_local_block: 4,
+                reorg_events: 0,
+                recent_hashes: vec![
+                    ReplayHashWindowEntry {
+                        external_block_number: 100,
+                        block_hash: "0x100".to_string(),
+                    },
+                    ReplayHashWindowEntry {
+                        external_block_number: 102,
+                        block_hash: "0x102".to_string(),
+                    },
+                ],
+            })
+            .expect("seed checkpoint");
+
+        let err = ReplayPipeline::new(8, 8)
+            .with_checkpoint_store(Arc::new(FileReplayCheckpointStore::new(path)))
+            .err()
+            .expect("checkpoint with non-contiguous hash window must fail");
+        assert!(matches!(
+            err,
+            ReplayPipelineError::Checkpoint(ReplayCheckpointError::InvalidCheckpoint(message))
+                if message.contains("contiguous")
+        ));
+    }
+
+    #[test]
     fn replay_pipeline_rejects_checkpoint_with_parent_hash_mismatch() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("replay-checkpoint.json");
@@ -903,6 +1035,38 @@ mod tests {
             err,
             ReplayPipelineError::Checkpoint(ReplayCheckpointError::InvalidCheckpoint(message))
                 if message.contains("expected_parent_hash")
+        ));
+    }
+
+    #[test]
+    fn replay_pipeline_rejects_checkpoint_with_missing_expected_parent_after_progress() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("replay-checkpoint.json");
+        let store = FileReplayCheckpointStore::new(path.clone());
+        store
+            .save(&ReplayCheckpoint {
+                version: REPLAY_CHECKPOINT_VERSION,
+                replay_window: 8,
+                max_replay_per_poll: 8,
+                next_external_block: Some(101),
+                expected_parent_hash: None,
+                next_local_block: 2,
+                reorg_events: 0,
+                recent_hashes: vec![ReplayHashWindowEntry {
+                    external_block_number: 100,
+                    block_hash: "0x100".to_string(),
+                }],
+            })
+            .expect("seed checkpoint");
+
+        let err = ReplayPipeline::new(8, 8)
+            .with_checkpoint_store(Arc::new(FileReplayCheckpointStore::new(path)))
+            .err()
+            .expect("checkpoint missing expected parent hash must fail");
+        assert!(matches!(
+            err,
+            ReplayPipelineError::Checkpoint(ReplayCheckpointError::InvalidCheckpoint(message))
+                if message.contains("next_local_block > 1")
         ));
     }
 }

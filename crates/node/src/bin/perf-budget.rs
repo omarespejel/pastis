@@ -191,27 +191,25 @@ fn run_dual_execution_benchmark(iterations: usize) -> Result<MetricResult, Strin
         MismatchPolicy::Halt,
     );
     backend
-        .set_verification_tip(iterations as u64 + 1)
-        .map_err(|error| error.to_string())?;
+        .with_verification_tip(iterations as u64 + 1, |backend| {
+            let mut state = InMemoryState::default();
+            let mut samples_us = Vec::with_capacity(iterations);
+            let started = Instant::now();
+            for idx in 0..iterations {
+                let block = sample_block(idx as u64 + 1);
+                let t0 = Instant::now();
+                let out = backend.execute_verified(&block, &mut state)?;
+                black_box(out);
+                samples_us.push(t0.elapsed().as_micros() as u64);
+            }
 
-    let mut state = InMemoryState::default();
-    let mut samples_us = Vec::with_capacity(iterations);
-    let started = Instant::now();
-    for idx in 0..iterations {
-        let block = sample_block(idx as u64 + 1);
-        let t0 = Instant::now();
-        let out = backend
-            .execute_verified(&block, &mut state)
-            .map_err(|error| error.to_string())?;
-        black_box(out);
-        samples_us.push(t0.elapsed().as_micros() as u64);
-    }
-
-    Ok(build_metric(
-        "dual_execute_verified",
-        samples_us,
-        started.elapsed(),
-    ))
+            Ok(build_metric(
+                "dual_execute_verified",
+                samples_us,
+                started.elapsed(),
+            ))
+        })
+        .map_err(|error| error.to_string())
 }
 
 fn run_notification_decode_benchmark(iterations: usize) -> Result<MetricResult, String> {

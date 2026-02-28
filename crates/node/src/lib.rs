@@ -36,6 +36,8 @@ use starknet_api::core::{
     ContractAddress as StarknetApiContractAddress,
 };
 #[cfg(feature = "production-adapters")]
+use starknet_api::hash::StarkHash as StarknetApiFelt;
+#[cfg(feature = "production-adapters")]
 use starknet_api::state::StateNumber as StarknetApiStateNumber;
 use starknet_node_execution::ExecutionBackend;
 #[cfg(feature = "production-adapters")]
@@ -235,18 +237,14 @@ const STARKNET_MAINNET_GENESIS_STATE_ROOT: &str =
     "0x21870ba80540e7831fb21c591ee93481f5ae1bb71ff85a86ddd465be4eddee6";
 
 #[cfg(feature = "production-adapters")]
-fn normalize_hex(input: &str) -> String {
-    let raw = input.trim();
-    let stripped = raw
-        .strip_prefix("0x")
-        .or_else(|| raw.strip_prefix("0X"))
-        .unwrap_or(raw);
-    let normalized = stripped.trim_start_matches('0').to_ascii_lowercase();
-    if normalized.is_empty() {
-        "0x0".to_string()
-    } else {
-        format!("0x{normalized}")
-    }
+fn normalize_hex(input: &str) -> Result<String, NodeInitError> {
+    StarknetApiFelt::from_hex(input)
+        .map(|felt| format!("{:#x}", felt))
+        .map_err(|error| {
+            NodeInitError::StorageIntegrity(format!(
+                "invalid felt encoding for state root '{input}': {error}"
+            ))
+        })
 }
 
 #[cfg(feature = "production-adapters")]
@@ -269,8 +267,8 @@ fn validate_bootstrap_storage<S: StorageBackend>(
                     "mainnet bootstrap requires block 0 to be present in storage".to_string(),
                 )
             })?;
-        let expected = normalize_hex(STARKNET_MAINNET_GENESIS_STATE_ROOT);
-        let actual = normalize_hex(&genesis.state_root);
+        let expected = normalize_hex(STARKNET_MAINNET_GENESIS_STATE_ROOT)?;
+        let actual = normalize_hex(&genesis.state_root)?;
         if actual != expected {
             return Err(NodeInitError::StorageIntegrity(format!(
                 "mainnet genesis state root mismatch: expected {expected}, got {actual}"
@@ -433,17 +431,14 @@ impl ApolloBlockifierClassProvider {
 
     fn read_state_number(&self) -> Result<StarknetApiStateNumber, StateError> {
         Self::with_thread_local_state(|state| {
-            state
-                .get(&self.instance_id)
-                .copied()
-                .ok_or_else(|| {
-                    StateError::StateReadError(format!(
-                        "apollo class provider state is uninitialized on this thread; \
+            state.get(&self.instance_id).copied().ok_or_else(|| {
+                StateError::StateReadError(format!(
+                    "apollo class provider state is uninitialized on this thread; \
                          call prepare_for_block_execution/prepare_for_simulation before reads \
                          (provider_id={})",
-                        self.instance_id
-                    ))
-                })
+                    self.instance_id
+                ))
+            })
         })
     }
 
@@ -1159,7 +1154,9 @@ mod tests {
         let err = provider
             .get_class_hash_at(contract)
             .expect_err("must fail when prepare_* was not called on this thread");
-        assert!(matches!(err, StateError::StateReadError(message) if message.contains("uninitialized")));
+        assert!(
+            matches!(err, StateError::StateReadError(message) if message.contains("uninitialized"))
+        );
     }
 
     #[cfg(feature = "production-adapters")]
@@ -1383,7 +1380,9 @@ mod tests {
         )
         .err()
         .expect("must reject unsafe production dual config");
-        assert!(matches!(err, NodeInitError::InvalidDualConfig(message) if message.contains("shadow verification")));
+        assert!(
+            matches!(err, NodeInitError::InvalidDualConfig(message) if message.contains("shadow verification"))
+        );
     }
 
     #[cfg(feature = "production-adapters")]
@@ -1406,7 +1405,9 @@ mod tests {
         )
         .err()
         .expect("must reject zero verification depth for production");
-        assert!(matches!(err, NodeInitError::InvalidDualConfig(message) if message.contains("verification_depth")));
+        assert!(
+            matches!(err, NodeInitError::InvalidDualConfig(message) if message.contains("verification_depth"))
+        );
     }
 
     #[cfg(feature = "production-adapters")]
@@ -1673,6 +1674,22 @@ mod tests {
         let err =
             validate_bootstrap_storage(&storage, &NodeConfig::default()).expect_err("must fail");
         assert!(matches!(err, NodeInitError::StorageIntegrity(_)));
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn bootstrap_validation_rejects_invalid_genesis_root_encoding() {
+        let storage = GenesisBlockStorage {
+            inner: InMemoryStorage::new(InMemoryState::default()),
+            block0: block_zero_with_state_root("0xGG"),
+        };
+
+        let err =
+            validate_bootstrap_storage(&storage, &NodeConfig::default()).expect_err("must fail");
+        assert!(matches!(
+            err,
+            NodeInitError::StorageIntegrity(message) if message.contains("invalid felt encoding")
+        ));
     }
 
     #[cfg(feature = "production-adapters")]

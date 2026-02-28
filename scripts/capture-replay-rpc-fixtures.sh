@@ -54,6 +54,11 @@ if [[ -z "$RPC_URL" ]]; then
   exit 1
 fi
 
+if [[ ! "$RPC_URL" =~ ^https?:// ]]; then
+  echo "RPC URL must use http or https scheme: $RPC_URL" >&2
+  exit 1
+fi
+
 if [[ ${#BLOCKS[@]} -eq 0 ]]; then
   BLOCKS=(7242623 7242624 7242625)
 fi
