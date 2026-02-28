@@ -2558,6 +2558,9 @@ mod tests {
     use super::*;
     use starknet_node_types::BlockId;
 
+    type HeadResponse = (Duration, Result<u64, String>);
+    type BlockResponse = (u64, Duration, Result<RealFetch, String>);
+
     fn load_rpc_fixture(name: &str) -> Value {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
@@ -2629,8 +2632,8 @@ mod tests {
 
     struct MockRpcSource {
         rpc_url: String,
-        head_responses: Mutex<VecDeque<Result<u64, String>>>,
-        block_responses: Mutex<VecDeque<(u64, Result<RealFetch, String>)>>,
+        head_responses: Mutex<VecDeque<HeadResponse>>,
+        block_responses: Mutex<VecDeque<BlockResponse>>,
     }
 
     impl MockRpcSource {
@@ -2638,6 +2641,24 @@ mod tests {
             rpc_url: &str,
             head_responses: Vec<Result<u64, String>>,
             block_responses: Vec<(u64, Result<RealFetch, String>)>,
+        ) -> Self {
+            Self::new_with_delays(
+                rpc_url,
+                head_responses
+                    .into_iter()
+                    .map(|response| (Duration::ZERO, response))
+                    .collect(),
+                block_responses
+                    .into_iter()
+                    .map(|(block, response)| (block, Duration::ZERO, response))
+                    .collect(),
+            )
+        }
+
+        fn new_with_delays(
+            rpc_url: &str,
+            head_responses: Vec<HeadResponse>,
+            block_responses: Vec<BlockResponse>,
         ) -> Self {
             Self {
                 rpc_url: rpc_url.to_string(),
@@ -2654,21 +2675,31 @@ mod tests {
 
         fn fetch_latest_block_number(&self) -> RpcFuture<'_, u64> {
             Box::pin(async move {
-                self.head_responses
+                let (delay, response) = self
+                    .head_responses
                     .lock()
                     .map_err(|_| "mock head responses lock poisoned".to_string())?
                     .pop_front()
-                    .unwrap_or_else(|| Err("no scripted head response".to_string()))
+                    .unwrap_or_else(|| {
+                        (Duration::ZERO, Err("no scripted head response".to_string()))
+                    });
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                response
             })
         }
 
         fn fetch_block(&self, block_number: u64) -> RpcFuture<'_, RealFetch> {
             Box::pin(async move {
-                let mut guard = self
-                    .block_responses
-                    .lock()
-                    .map_err(|_| "mock block responses lock poisoned".to_string())?;
-                let Some((expected_block, response)) = guard.pop_front() else {
+                let next = {
+                    let mut guard = self
+                        .block_responses
+                        .lock()
+                        .map_err(|_| "mock block responses lock poisoned".to_string())?;
+                    guard.pop_front()
+                };
+                let Some((expected_block, delay, response)) = next else {
                     return Err(format!(
                         "no scripted block response for request block {block_number}"
                     ));
@@ -2677,6 +2708,9 @@ mod tests {
                     return Err(format!(
                         "mock block request mismatch: expected {expected_block}, got {block_number}"
                     ));
+                }
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
                 }
                 response
             })
@@ -2835,12 +2869,17 @@ mod tests {
         let snapshot = runtime.poll_once().await.expect("poll should succeed");
         assert_eq!(snapshot.latest_block, 7_242_623);
 
-        let diagnostics = runtime.diagnostics().expect("diagnostics should be readable");
+        let diagnostics = runtime
+            .diagnostics()
+            .expect("diagnostics should be readable");
         assert_eq!(diagnostics.success_count, 1);
         assert_eq!(diagnostics.failure_count, 0);
         assert_eq!(diagnostics.consecutive_failures, 0);
         assert_eq!(diagnostics.last_local_block, Some(1));
-        assert_eq!(diagnostics.replayed_tx_count, fetch_623.replay.transaction_hashes.len() as u64);
+        assert_eq!(
+            diagnostics.replayed_tx_count,
+            fetch_623.replay.transaction_hashes.len() as u64
+        );
     }
 
     #[tokio::test]
@@ -2871,14 +2910,18 @@ mod tests {
             "unexpected error: {error}"
         );
 
-        let diagnostics = runtime.diagnostics().expect("diagnostics should be readable");
+        let diagnostics = runtime
+            .diagnostics()
+            .expect("diagnostics should be readable");
         assert_eq!(diagnostics.success_count, 0);
         assert_eq!(diagnostics.failure_count, 1);
         assert_eq!(diagnostics.consecutive_failures, 1);
-        assert!(diagnostics
-            .last_error
-            .as_deref()
-            .is_some_and(|msg| msg.contains("after 2 attempts")));
+        assert!(
+            diagnostics
+                .last_error
+                .as_deref()
+                .is_some_and(|msg| msg.contains("after 2 attempts"))
+        );
     }
 
     #[tokio::test]
@@ -2913,13 +2956,21 @@ mod tests {
         )
         .expect("runtime should initialize");
 
-        let first = runtime.poll_once().await.expect("first poll should succeed");
+        let first = runtime
+            .poll_once()
+            .await
+            .expect("first poll should succeed");
         assert_eq!(first.latest_block, 7_242_623);
 
-        let second = runtime.poll_once().await.expect("second poll should succeed");
+        let second = runtime
+            .poll_once()
+            .await
+            .expect("second poll should succeed");
         assert_eq!(second.latest_block, 7_242_624);
 
-        let diagnostics = runtime.diagnostics().expect("diagnostics should be readable");
+        let diagnostics = runtime
+            .diagnostics()
+            .expect("diagnostics should be readable");
         assert_eq!(diagnostics.success_count, 2);
         assert_eq!(diagnostics.failure_count, 0);
         assert_eq!(diagnostics.consecutive_failures, 0);
@@ -2930,6 +2981,122 @@ mod tests {
             (fetch_623.replay.transaction_hashes.len() + fetch_624.replay.transaction_hashes.len())
                 as u64
         );
+    }
+
+    #[tokio::test]
+    async fn real_runtime_backpressure_lag_decreases_as_polls_drain_backlog() {
+        let fetch_623 = fetch_from_rpc_fixtures(
+            "mainnet_block_7242623_get_block_with_txs.json",
+            "mainnet_block_7242623_get_state_update.json",
+        );
+        let fetch_624 = fetch_from_rpc_fixtures(
+            "mainnet_block_7242624_get_block_with_txs.json",
+            "mainnet_block_7242624_get_state_update.json",
+        );
+        let fetch_625 = fetch_from_rpc_fixtures(
+            "mainnet_block_7242625_get_block_with_txs.json",
+            "mainnet_block_7242625_get_state_update.json",
+        );
+
+        let runtime = RealRuntime::new_with_rpc_source(
+            Arc::new(MockRpcSource::new_with_delays(
+                "mock://rpc",
+                vec![
+                    (Duration::from_millis(4), Ok(7_242_625)),
+                    (Duration::from_millis(1), Ok(7_242_625)),
+                    (Duration::from_millis(3), Ok(7_242_625)),
+                ],
+                vec![
+                    (7_242_623, Duration::from_millis(8), Ok(fetch_623.clone())),
+                    (7_242_624, Duration::from_millis(2), Ok(fetch_624.clone())),
+                    (7_242_625, Duration::from_millis(6), Ok(fetch_625.clone())),
+                ],
+            )),
+            None,
+            3,
+            1,
+            None,
+            RpcRetryConfig {
+                max_retries: 0,
+                base_backoff: Duration::ZERO,
+            },
+        )
+        .expect("runtime should initialize");
+
+        runtime.poll_once().await.expect("poll 1 should succeed");
+        let lag_after_first = runtime
+            .diagnostics()
+            .expect("diagnostics should be readable")
+            .replay_lag_blocks;
+        runtime.poll_once().await.expect("poll 2 should succeed");
+        let lag_after_second = runtime
+            .diagnostics()
+            .expect("diagnostics should be readable")
+            .replay_lag_blocks;
+        runtime.poll_once().await.expect("poll 3 should succeed");
+        let diagnostics = runtime
+            .diagnostics()
+            .expect("diagnostics should be readable");
+
+        assert_eq!(lag_after_first, Some(2));
+        assert_eq!(lag_after_second, Some(1));
+        assert_eq!(diagnostics.replay_lag_blocks, Some(0));
+        assert_eq!(diagnostics.success_count, 3);
+        assert_eq!(diagnostics.failure_count, 0);
+        assert_eq!(diagnostics.last_local_block, Some(3));
+        assert_eq!(diagnostics.last_external_replayed_block, Some(7_242_625));
+    }
+
+    #[tokio::test]
+    async fn real_runtime_backpressure_persists_when_head_growth_matches_capacity() {
+        let fetch_623 = fetch_from_rpc_fixtures(
+            "mainnet_block_7242623_get_block_with_txs.json",
+            "mainnet_block_7242623_get_state_update.json",
+        );
+        let fetch_624 = fetch_from_rpc_fixtures(
+            "mainnet_block_7242624_get_block_with_txs.json",
+            "mainnet_block_7242624_get_state_update.json",
+        );
+
+        let runtime = RealRuntime::new_with_rpc_source(
+            Arc::new(MockRpcSource::new_with_delays(
+                "mock://rpc",
+                vec![
+                    (Duration::from_millis(2), Ok(7_242_624)),
+                    (Duration::from_millis(2), Ok(7_242_625)),
+                ],
+                vec![
+                    (7_242_623, Duration::from_millis(5), Ok(fetch_623.clone())),
+                    (7_242_624, Duration::from_millis(5), Ok(fetch_624.clone())),
+                ],
+            )),
+            None,
+            2,
+            1,
+            None,
+            RpcRetryConfig {
+                max_retries: 0,
+                base_backoff: Duration::ZERO,
+            },
+        )
+        .expect("runtime should initialize");
+
+        runtime.poll_once().await.expect("poll 1 should succeed");
+        let lag_after_first = runtime
+            .diagnostics()
+            .expect("diagnostics should be readable")
+            .replay_lag_blocks;
+        runtime.poll_once().await.expect("poll 2 should succeed");
+        let diagnostics = runtime
+            .diagnostics()
+            .expect("diagnostics should be readable");
+
+        assert_eq!(lag_after_first, Some(1));
+        assert_eq!(diagnostics.replay_lag_blocks, Some(1));
+        assert_eq!(diagnostics.success_count, 2);
+        assert_eq!(diagnostics.failure_count, 0);
+        assert_eq!(diagnostics.last_local_block, Some(2));
+        assert_eq!(diagnostics.last_external_replayed_block, Some(7_242_624));
     }
 
     #[test]
