@@ -1,0 +1,92 @@
+{
+  "replay_window": 4,
+  "max_replay_per_poll": 3,
+  "polls": [
+    {
+      "external_head": 12,
+      "expected_plan": [9, 10, 11],
+      "blocks": [
+        {
+          "number": 9,
+          "parent_hash": "0x0",
+          "block_hash": "0x9a",
+          "expected": "apply",
+          "expected_local": 1
+        },
+        {
+          "number": 10,
+          "parent_hash": "0x9a",
+          "block_hash": "0xaa",
+          "expected": "apply",
+          "expected_local": 2
+        },
+        {
+          "number": 11,
+          "parent_hash": "0xaa",
+          "block_hash": "0xba",
+          "expected": "apply",
+          "expected_local": 3
+        }
+      ]
+    },
+    {
+      "external_head": 12,
+      "expected_plan": [12],
+      "blocks": [
+        {
+          "number": 12,
+          "parent_hash": "0xdeadbeef",
+          "block_hash": "0xca",
+          "expected": "reorg",
+          "restart_external_block": 9
+        }
+      ]
+    },
+    {
+      "external_head": 12,
+      "expected_plan": [9, 10, 11],
+      "blocks": [
+        {
+          "number": 9,
+          "parent_hash": "0x0",
+          "block_hash": "0x9b",
+          "expected": "apply",
+          "expected_local": 1
+        },
+        {
+          "number": 10,
+          "parent_hash": "0x9b",
+          "block_hash": "0xab",
+          "expected": "apply",
+          "expected_local": 2
+        },
+        {
+          "number": 11,
+          "parent_hash": "0xab",
+          "block_hash": "0xbb",
+          "expected": "apply",
+          "expected_local": 3
+        }
+      ]
+    },
+    {
+      "external_head": 12,
+      "expected_plan": [12],
+      "blocks": [
+        {
+          "number": 12,
+          "parent_hash": "0xbb",
+          "block_hash": "0xcb",
+          "expected": "apply",
+          "expected_local": 4
+        }
+      ]
+    }
+  ],
+  "expected": {
+    "reorg_events": 1,
+    "next_local_block": 5,
+    "next_external_block": 13,
+    "replay_lag_blocks_at_final_head": 0
+  }
+}

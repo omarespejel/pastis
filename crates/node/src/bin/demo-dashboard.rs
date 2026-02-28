@@ -17,6 +17,7 @@ use node_spec_core::mcp::{
 use semver::Version;
 use serde::Serialize;
 use serde_json::{Value, json};
+use starknet_node::replay::{ReplayCheck, ReplayEngine};
 use starknet_node::{NodeConfig, StarknetNode, StarknetNodeBuilder};
 use starknet_node_execution::{
     DualExecutionBackend, DualExecutionMetrics, ExecutionBackend, ExecutionError, ExecutionMode,
@@ -417,67 +418,6 @@ struct RealFetch {
     parse_warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-struct ReplayCursor {
-    next_external_block: Option<u64>,
-    expected_parent_hash: Option<String>,
-    replay_window: u64,
-    max_replay_per_poll: u64,
-}
-
-impl ReplayCursor {
-    fn new(replay_window: u64, max_replay_per_poll: u64) -> Self {
-        Self {
-            next_external_block: None,
-            expected_parent_hash: None,
-            replay_window: replay_window.max(1),
-            max_replay_per_poll: max_replay_per_poll.max(1),
-        }
-    }
-
-    fn plan(&mut self, external_head_block: u64) -> Vec<u64> {
-        if self.next_external_block.is_none() {
-            let start = external_head_block.saturating_sub(self.replay_window.saturating_sub(1));
-            self.next_external_block = Some(start);
-        }
-        let Some(start) = self.next_external_block else {
-            return Vec::new();
-        };
-        if start > external_head_block {
-            return Vec::new();
-        }
-        let end = start
-            .saturating_add(self.max_replay_per_poll.saturating_sub(1))
-            .min(external_head_block);
-        (start..=end).collect()
-    }
-
-    fn parent_hash_matches(&self, observed_parent_hash: &str) -> bool {
-        match &self.expected_parent_hash {
-            Some(expected) => expected == observed_parent_hash,
-            None => true,
-        }
-    }
-
-    fn mark_processed(&mut self, external_block_number: u64, block_hash: &str) {
-        self.next_external_block = Some(external_block_number.saturating_add(1));
-        self.expected_parent_hash = Some(block_hash.to_string());
-    }
-
-    fn reset_for_reorg(&mut self, conflicting_external_block: u64) {
-        let start = conflicting_external_block.saturating_sub(self.replay_window.saturating_sub(1));
-        self.next_external_block = Some(start);
-        self.expected_parent_hash = None;
-    }
-
-    fn replay_lag_blocks(&self, external_head_block: u64) -> u64 {
-        match self.next_external_block {
-            Some(next) if next <= external_head_block => external_head_block - next + 1,
-            _ => 0,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 struct RuntimeDiagnostics {
     success_count: u64,
@@ -539,10 +479,9 @@ struct RealRuntimeState {
     node: StarknetNode<InMemoryStorage, DualExecutionBackend>,
     execution_state: InMemoryState,
     snapshot: Option<RealSnapshot>,
-    replay_cursor: ReplayCursor,
+    replay: ReplayEngine,
     diagnostics: RuntimeDiagnostics,
     recent_errors: VecDeque<String>,
-    next_local_block: u64,
 }
 
 #[derive(Clone)]
@@ -580,10 +519,9 @@ impl RealRuntime {
                 node: build_dashboard_node(),
                 execution_state: InMemoryState::default(),
                 snapshot: None,
-                replay_cursor: ReplayCursor::new(replay_window, max_replay_per_poll),
+                replay: ReplayEngine::new(replay_window, max_replay_per_poll),
                 diagnostics,
                 recent_errors: VecDeque::new(),
-                next_local_block: 1,
             })),
         }
     }
@@ -607,9 +545,9 @@ impl RealRuntime {
                 .lock()
                 .map_err(|_| "real runtime lock poisoned".to_string())?;
             guard.diagnostics.external_head_block = Some(external_head_block);
-            let plan = guard.replay_cursor.plan(external_head_block);
+            let plan = guard.replay.plan(external_head_block);
             guard.diagnostics.replay_lag_blocks =
-                Some(guard.replay_cursor.replay_lag_blocks(external_head_block));
+                Some(guard.replay.replay_lag_blocks(external_head_block));
             plan
         };
 
@@ -637,37 +575,41 @@ impl RealRuntime {
                 push_recent_error(&mut guard.recent_errors, format!("warning: {warning}"));
             }
 
-            if !guard
-                .replay_cursor
-                .parent_hash_matches(&fetch.replay.parent_hash)
+            let local_block_number = match guard
+                .replay
+                .check_block(external_block, &fetch.replay.parent_hash)
             {
-                let message = format!(
-                    "reorg detected at external block {external_block}: parent {} did not match expected parent",
-                    fetch.replay.parent_hash
-                );
-                guard.diagnostics.reorg_events = guard.diagnostics.reorg_events.saturating_add(1);
-                guard.diagnostics.replay_failures =
-                    guard.diagnostics.replay_failures.saturating_add(1);
-                guard.diagnostics.last_replay_error = Some(message.clone());
-                guard.diagnostics.last_error = Some(message.clone());
-                push_recent_error(&mut guard.recent_errors, message);
-                guard.node = build_dashboard_node();
-                guard.execution_state = InMemoryState::default();
-                guard.next_local_block = 1;
-                guard.diagnostics.last_local_block = None;
-                guard.diagnostics.last_external_replayed_block = None;
-                guard.replay_cursor.reset_for_reorg(external_block);
-                guard.diagnostics.replay_lag_blocks =
-                    Some(guard.replay_cursor.replay_lag_blocks(external_head_block));
-                guard.diagnostics.recent_errors = guard.recent_errors.iter().cloned().collect();
-                break;
-            }
+                ReplayCheck::Continue { local_block_number } => local_block_number,
+                ReplayCheck::Reorg {
+                    conflicting_external_block,
+                    ..
+                } => {
+                    let message = format!(
+                        "reorg detected at external block {conflicting_external_block}: parent {} did not match expected parent",
+                        fetch.replay.parent_hash
+                    );
+                    guard.diagnostics.reorg_events = guard.replay.reorg_events();
+                    guard.diagnostics.replay_failures =
+                        guard.diagnostics.replay_failures.saturating_add(1);
+                    guard.diagnostics.last_replay_error = Some(message.clone());
+                    guard.diagnostics.last_error = Some(message.clone());
+                    push_recent_error(&mut guard.recent_errors, message);
+                    guard.node = build_dashboard_node();
+                    guard.execution_state = InMemoryState::default();
+                    guard.diagnostics.last_local_block = None;
+                    guard.diagnostics.last_external_replayed_block = None;
+                    guard.diagnostics.replay_lag_blocks =
+                        Some(guard.replay.replay_lag_blocks(external_head_block));
+                    guard.diagnostics.recent_errors = guard.recent_errors.iter().cloned().collect();
+                    break;
+                }
+            };
 
             let local_block =
-                ingest_block_from_fetch(guard.next_local_block, &fetch).map_err(|error| {
+                ingest_block_from_fetch(local_block_number, &fetch).map_err(|error| {
                     let message = format!(
                         "failed to build replay block local={} external={external_block}: {error}",
-                        guard.next_local_block
+                        local_block_number
                     );
                     guard.diagnostics.replay_failures =
                         guard.diagnostics.replay_failures.saturating_add(1);
@@ -685,7 +627,7 @@ impl RealRuntime {
             if let Err(error) = execution_result {
                 let message = format!(
                     "failed to execute local replay block local={} external={external_block}: {error}",
-                    guard.next_local_block
+                    local_block_number
                 );
                 guard.diagnostics.execution_failure_count =
                     guard.diagnostics.execution_failure_count.saturating_add(1);
@@ -708,7 +650,7 @@ impl RealRuntime {
             {
                 let message = format!(
                     "failed to commit local replay block local={} external={external_block}: {error}",
-                    guard.next_local_block
+                    local_block_number
                 );
                 guard.diagnostics.commit_failure_count =
                     guard.diagnostics.commit_failure_count.saturating_add(1);
@@ -743,15 +685,14 @@ impl RealRuntime {
                 ),
             }
 
-            guard.diagnostics.last_local_block = Some(guard.next_local_block);
-            guard.next_local_block = guard.next_local_block.saturating_add(1);
+            guard.diagnostics.last_local_block = Some(local_block_number);
             guard.diagnostics.last_processed_block = Some(external_block);
             guard.diagnostics.last_external_replayed_block = Some(external_block);
             guard
-                .replay_cursor
-                .mark_processed(external_block, &fetch.replay.block_hash);
+                .replay
+                .mark_committed(external_block, &fetch.replay.block_hash);
             guard.diagnostics.replay_lag_blocks =
-                Some(guard.replay_cursor.replay_lag_blocks(external_head_block));
+                Some(guard.replay.replay_lag_blocks(external_head_block));
         }
 
         let mut guard = self
@@ -2466,23 +2407,40 @@ mod tests {
     }
 
     #[test]
-    fn replay_cursor_bootstraps_window_and_tracks_lag() {
-        let mut cursor = ReplayCursor::new(4, 3);
-        assert_eq!(cursor.plan(10), vec![7, 8, 9]);
-        cursor.mark_processed(7, "0xa");
-        assert_eq!(cursor.replay_lag_blocks(10), 3);
-        assert!(cursor.parent_hash_matches("0xa"));
-        assert!(!cursor.parent_hash_matches("0xb"));
+    fn replay_engine_bootstraps_window_and_tracks_lag() {
+        let mut replay = ReplayEngine::new(4, 3);
+        assert_eq!(replay.plan(10), vec![7, 8, 9]);
+        assert_eq!(
+            replay.check_block(7, "0x0"),
+            ReplayCheck::Continue {
+                local_block_number: 1
+            }
+        );
+        replay.mark_committed(7, "0xa");
+        assert_eq!(replay.replay_lag_blocks(10), 3);
+        assert_eq!(replay.expected_parent_hash(), Some("0xa"));
     }
 
     #[test]
-    fn replay_cursor_reset_for_reorg_rewinds_window() {
-        let mut cursor = ReplayCursor::new(5, 2);
-        let _ = cursor.plan(20);
-        cursor.mark_processed(18, "0x18");
-        cursor.reset_for_reorg(19);
-        assert_eq!(cursor.plan(20), vec![15, 16]);
-        assert!(cursor.parent_hash_matches("anything"));
+    fn replay_engine_reset_for_reorg_rewinds_window() {
+        let mut replay = ReplayEngine::new(5, 2);
+        let _ = replay.plan(20);
+        assert_eq!(
+            replay.check_block(16, "0x0"),
+            ReplayCheck::Continue {
+                local_block_number: 1
+            }
+        );
+        replay.mark_committed(16, "0x16");
+        assert_eq!(
+            replay.check_block(17, "0xdead"),
+            ReplayCheck::Reorg {
+                conflicting_external_block: 17,
+                restart_external_block: 13,
+            }
+        );
+        assert_eq!(replay.plan(20), vec![13, 14]);
+        assert_eq!(replay.next_local_block(), 1);
     }
 
     #[test]

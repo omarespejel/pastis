@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod replay;
+
 #[cfg(feature = "production-adapters")]
 use std::cell::RefCell;
 #[cfg(feature = "production-adapters")]
