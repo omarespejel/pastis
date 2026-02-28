@@ -496,6 +496,12 @@ impl ApolloStorageAdapter {
         }
     }
 
+    /// Returns a clonable handle to the underlying Apollo storage reader for
+    /// read-only integrations (for example blockifier class providers).
+    pub fn reader_handle(&self) -> ApolloStorageReader {
+        self.reader.clone()
+    }
+
     pub fn read_current_state_root(&self) -> Result<String, StorageError> {
         let txn = self
             .reader

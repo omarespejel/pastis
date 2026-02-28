@@ -28,6 +28,8 @@ This repository currently ships core, tested building blocks:
 - Protocol-version constant resolution with fail-closed behavior
 - Storage backends with Apollo adapter tests against real Starknet fixture data
 - Dual execution orchestration with canonical fallback/mismatch handling
+- Production node wiring now injects an Apollo-backed Blockifier class provider with
+  block-aware pre-state binding for account-transaction execution paths
 - ExEx manager with bounded WAL replay and failing-sink circuit breaker
 - OTel-style ExEx sink with deterministic per-block metrics capture and regression counters
 - BTCFi/strkBTC ExEx scaffolding with structural anomaly detection primitives and bounded nullifier-tracking state
@@ -180,7 +182,8 @@ Tune limits with environment variables:
 Near-term implementation sequence:
 
 1. Expand Apollo-backed adapters and fixture coverage
-2. Continue hardening Blockifier adapter semantics across protocol versions
+2. Expand Apollo class-provider fixture coverage with declared-class/CASM artifacts and
+   account-transaction replay assertions
 3. Extend RPC method coverage and map full Starknet error taxonomy
 4. Extend MCP server surface beyond control-plane tools (state query params, simulation, submit)
 5. Wire BTCFi ExEx into ExExManager registration flow

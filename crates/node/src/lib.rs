@@ -1,9 +1,37 @@
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "production-adapters")]
+use std::sync::{Arc, Mutex};
+
+#[cfg(feature = "production-adapters")]
+use apollo_storage::StorageReader as ApolloStorageReader;
+#[cfg(feature = "production-adapters")]
+use apollo_storage::class::ClassStorageReader;
+#[cfg(feature = "production-adapters")]
+use apollo_storage::compiled_class::CasmStorageReader;
+#[cfg(feature = "production-adapters")]
+use apollo_storage::state::StateStorageReader;
+#[cfg(feature = "production-adapters")]
+use blockifier::execution::contract_class::RunnableCompiledClass;
+#[cfg(feature = "production-adapters")]
+use blockifier::state::errors::StateError;
 use node_spec_core::mcp::{McpAccessController, ValidationLimits};
 #[cfg(feature = "production-adapters")]
-use starknet_node_execution::BlockifierVmBackend;
+use starknet_api::block::BlockNumber as StarknetApiBlockNumber;
+#[cfg(feature = "production-adapters")]
+use starknet_api::contract_class::{
+    ContractClass as StarknetApiContractClass, SierraVersion as StarknetApiSierraVersion,
+};
+#[cfg(feature = "production-adapters")]
+use starknet_api::core::{
+    ClassHash as StarknetApiClassHash, CompiledClassHash as StarknetApiCompiledClassHash,
+    ContractAddress as StarknetApiContractAddress,
+};
+#[cfg(feature = "production-adapters")]
+use starknet_api::state::StateNumber as StarknetApiStateNumber;
 use starknet_node_execution::ExecutionBackend;
+#[cfg(feature = "production-adapters")]
+use starknet_node_execution::{BlockifierClassProvider, BlockifierVmBackend};
 use starknet_node_mcp_server::{AnomalySource, McpServer};
 use starknet_node_proving::ProvingBackend;
 use starknet_node_rpc::StarknetRpcServer;
@@ -278,27 +306,217 @@ impl<S: StorageBackend, E: ExecutionBackend> StarknetNodeBuilder<WithStorage<S>,
 }
 
 #[cfg(feature = "production-adapters")]
+struct ApolloBlockifierClassProvider {
+    reader: ApolloStorageReader,
+    state_number: Mutex<StarknetApiStateNumber>,
+}
+
+#[cfg(feature = "production-adapters")]
+impl ApolloBlockifierClassProvider {
+    fn new(reader: ApolloStorageReader) -> Self {
+        Self {
+            reader,
+            // Default to pre-genesis; block/simulation hooks will update this before reads.
+            state_number: Mutex::new(StarknetApiStateNumber::right_before_block(
+                StarknetApiBlockNumber(0),
+            )),
+        }
+    }
+
+    fn pre_execution_state_number(block_number: u64) -> StarknetApiStateNumber {
+        if block_number == 0 {
+            StarknetApiStateNumber::right_before_block(StarknetApiBlockNumber(0))
+        } else {
+            StarknetApiStateNumber::unchecked_right_after_block(StarknetApiBlockNumber(
+                block_number.saturating_sub(1),
+            ))
+        }
+    }
+
+    fn simulation_state_number(block_number: u64) -> StarknetApiStateNumber {
+        Self::pre_execution_state_number(block_number)
+    }
+
+    fn read_state_number(&self) -> Result<StarknetApiStateNumber, StateError> {
+        self.state_number
+            .lock()
+            .map(|guard| *guard)
+            .map_err(|_| StateError::StateReadError("class provider mutex poisoned".to_string()))
+    }
+
+    fn write_state_number(&self, state_number: StarknetApiStateNumber) -> Result<(), StateError> {
+        let mut guard = self
+            .state_number
+            .lock()
+            .map_err(|_| StateError::StateReadError("class provider mutex poisoned".to_string()))?;
+        *guard = state_number;
+        Ok(())
+    }
+
+    fn map_storage_error(context: &'static str, error: impl std::fmt::Display) -> StateError {
+        StateError::StateReadError(format!("{context}: {error}"))
+    }
+}
+
+#[cfg(feature = "production-adapters")]
+impl BlockifierClassProvider for ApolloBlockifierClassProvider {
+    fn supports_account_execution(&self) -> bool {
+        true
+    }
+
+    fn prepare_for_block_execution(&self, block_number: u64) -> Result<(), StateError> {
+        self.write_state_number(Self::pre_execution_state_number(block_number))
+    }
+
+    fn prepare_for_simulation(&self, block_number: u64) -> Result<(), StateError> {
+        self.write_state_number(Self::simulation_state_number(block_number))
+    }
+
+    fn get_class_hash_at(
+        &self,
+        contract_address: StarknetApiContractAddress,
+    ) -> Result<StarknetApiClassHash, StateError> {
+        let state_number = self.read_state_number()?;
+        let txn = self.reader.begin_ro_txn().map_err(|error| {
+            Self::map_storage_error("open apollo read txn for class hash", error)
+        })?;
+        let state_reader = txn
+            .get_state_reader()
+            .map_err(|error| Self::map_storage_error("create apollo state reader", error))?;
+        state_reader
+            .get_class_hash_at(state_number, &contract_address)
+            .map_err(|error| Self::map_storage_error("read class hash from apollo", error))
+            .map(|value| value.unwrap_or_default())
+    }
+
+    fn get_compiled_class(
+        &self,
+        class_hash: StarknetApiClassHash,
+    ) -> Result<RunnableCompiledClass, StateError> {
+        let txn = self.reader.begin_ro_txn().map_err(|error| {
+            Self::map_storage_error("open apollo read txn for class fetch", error)
+        })?;
+
+        let (casm, sierra) = txn
+            .get_casm_and_sierra(&class_hash)
+            .map_err(|error| Self::map_storage_error("read CASM/Sierra pair from apollo", error))?;
+        if let Some(casm) = casm {
+            let sierra = sierra.ok_or_else(|| {
+                StateError::StateReadError(format!(
+                    "missing Sierra class for CASM class hash {:#x}",
+                    class_hash.0
+                ))
+            })?;
+            let sierra_version: StarknetApiSierraVersion =
+                sierra.get_sierra_version().map_err(|error| {
+                    StateError::StateReadError(format!(
+                        "failed to derive Sierra version for class hash {:#x}: {}",
+                        class_hash.0, error
+                    ))
+                })?;
+
+            return RunnableCompiledClass::try_from(StarknetApiContractClass::V1((
+                casm,
+                sierra_version,
+            )))
+            .map_err(|error| {
+                StateError::StateReadError(format!(
+                    "failed to build runnable Cairo 1 class for {:#x}: {}",
+                    class_hash.0, error
+                ))
+            });
+        }
+
+        if let Some(deprecated) = txn
+            .get_deprecated_class(&class_hash)
+            .map_err(|error| Self::map_storage_error("read deprecated class from apollo", error))?
+        {
+            return RunnableCompiledClass::try_from(StarknetApiContractClass::V0(deprecated))
+                .map_err(|error| {
+                    StateError::StateReadError(format!(
+                        "failed to build runnable Cairo 0 class for {:#x}: {}",
+                        class_hash.0, error
+                    ))
+                });
+        }
+
+        Err(StateError::UndeclaredClassHash(class_hash))
+    }
+
+    fn get_compiled_class_hash(
+        &self,
+        class_hash: StarknetApiClassHash,
+    ) -> Result<StarknetApiCompiledClassHash, StateError> {
+        let state_number = self.read_state_number()?;
+        let txn = self.reader.begin_ro_txn().map_err(|error| {
+            Self::map_storage_error("open apollo read txn for compiled class hash", error)
+        })?;
+        let state_reader = txn
+            .get_state_reader()
+            .map_err(|error| Self::map_storage_error("create apollo state reader", error))?;
+        state_reader
+            .get_compiled_class_hash_at(state_number, &class_hash)
+            .map_err(|error| Self::map_storage_error("read compiled class hash from apollo", error))
+            .map(|value| value.unwrap_or_default())
+    }
+}
+
+#[cfg(feature = "production-adapters")]
 pub fn build_mainnet_production_node(
     config: NodeConfig,
     storage: ApolloStorageAdapter,
 ) -> Result<StarknetNode<ApolloStorageAdapter, BlockifierVmBackend>, NodeInitError> {
     validate_bootstrap_storage(&storage, &config)?;
+    let class_provider: Arc<dyn BlockifierClassProvider> =
+        Arc::new(ApolloBlockifierClassProvider::new(storage.reader_handle()));
     Ok(StarknetNodeBuilder::new(config)
         .with_storage(storage)
-        .with_execution(BlockifierVmBackend::starknet_mainnet())
+        .with_execution(BlockifierVmBackend::starknet_mainnet().with_class_provider(class_provider))
         .build())
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    #[cfg(feature = "production-adapters")]
+    use std::path::Path;
     use std::time::Duration;
 
+    #[cfg(feature = "production-adapters")]
+    use apollo_storage::db::DbConfig;
+    #[cfg(feature = "production-adapters")]
+    use apollo_storage::header::HeaderStorageWriter;
+    #[cfg(feature = "production-adapters")]
+    use apollo_storage::mmap_file::MmapFileConfig;
+    #[cfg(feature = "production-adapters")]
+    use apollo_storage::state::StateStorageWriter;
+    #[cfg(feature = "production-adapters")]
+    use apollo_storage::{
+        StorageConfig as ApolloStorageConfig, StorageScope, StorageWriter as ApolloStorageWriter,
+        open_storage as open_apollo_storage,
+    };
     use node_spec_core::mcp::{
         AgentPolicy, McpAccessController, McpTool, ToolPermission, ValidationLimits,
     };
     #[cfg(feature = "production-adapters")]
     use semver::Version;
+    #[cfg(feature = "production-adapters")]
+    use starknet_api::block::{
+        BlockHeader as StarknetApiBlockHeader, BlockNumber as StarknetApiBlockNumber,
+        BlockTimestamp as StarknetApiBlockTimestamp, StarknetVersion as StarknetApiVersion,
+    };
+    #[cfg(feature = "production-adapters")]
+    use starknet_api::core::{
+        ChainId as StarknetApiChainId, ClassHash as StarknetApiClassHash,
+        CompiledClassHash as StarknetApiCompiledClassHash,
+        ContractAddress as StarknetApiContractAddress, GlobalRoot, Nonce as StarknetApiNonce,
+    };
+    #[cfg(feature = "production-adapters")]
+    use starknet_api::hash::StarkHash as StarknetApiFelt;
+    #[cfg(feature = "production-adapters")]
+    use starknet_api::state::{
+        StorageKey as StarknetApiStorageKey, ThinStateDiff as StarknetApiThinStateDiff,
+    };
     use starknet_node_execution::ExecutionError;
     use starknet_node_mcp_server::{AnomalySource, BtcfiAnomaly, McpRequest, McpResponse};
     use starknet_node_proving::{ProvingError, StarkProof};
@@ -314,6 +532,8 @@ mod tests {
     use starknet_node_types::{
         BlockGasPrices, BlockId, ComponentHealth, GasPricePerToken, HealthCheck, HealthStatus,
     };
+    #[cfg(feature = "production-adapters")]
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -521,6 +741,146 @@ mod tests {
     fn rejects_invalid_chain_id_format() {
         let err = ChainId::parse("sn_main").expect_err("must reject invalid casing");
         assert!(matches!(err, ChainIdError::InvalidFormat(_)));
+    }
+
+    #[cfg(feature = "production-adapters")]
+    fn apollo_config(path: &Path) -> ApolloStorageConfig {
+        ApolloStorageConfig {
+            db_config: DbConfig {
+                path_prefix: path.to_path_buf(),
+                chain_id: StarknetApiChainId::Other("SN_MAIN".to_string()),
+                enforce_file_exists: false,
+                min_size: 1 << 20,
+                max_size: 1 << 35,
+                growth_step: 1 << 26,
+                max_readers: 1 << 13,
+            },
+            mmap_file_config: MmapFileConfig {
+                max_size: 1 << 24,
+                growth_step: 1 << 20,
+                max_object_size: 1 << 16,
+            },
+            scope: StorageScope::FullArchive,
+        }
+    }
+
+    #[cfg(feature = "production-adapters")]
+    fn seed_header_and_state_with_class_hash(
+        writer: &mut ApolloStorageWriter,
+    ) -> (
+        StarknetApiContractAddress,
+        StarknetApiClassHash,
+        StarknetApiCompiledClassHash,
+    ) {
+        let mut header = StarknetApiBlockHeader::default();
+        header.block_header_without_hash.state_root = GlobalRoot(StarknetApiFelt::from(1_u64));
+        header.block_header_without_hash.starknet_version =
+            StarknetApiVersion::try_from("0.14.2").expect("valid protocol version");
+        header.block_header_without_hash.timestamp = StarknetApiBlockTimestamp(1_700_000_000);
+        writer
+            .begin_rw_txn()
+            .expect("begin rw tx")
+            .append_header(StarknetApiBlockNumber(0), &header)
+            .expect("append header")
+            .commit()
+            .expect("commit header");
+
+        let contract = StarknetApiContractAddress::from(0xabc_u64);
+        let class_hash = StarknetApiClassHash(StarknetApiFelt::from(0x55_u64));
+        let compiled_class_hash = StarknetApiCompiledClassHash(StarknetApiFelt::from(0x66_u64));
+        let diff = StarknetApiThinStateDiff {
+            storage_diffs: std::iter::once((
+                contract,
+                std::iter::once((
+                    StarknetApiStorageKey::from(1_u64),
+                    StarknetApiFelt::from(7_u64),
+                ))
+                .collect(),
+            ))
+            .collect(),
+            deployed_contracts: std::iter::once((contract, class_hash)).collect(),
+            class_hash_to_compiled_class_hash: std::iter::once((class_hash, compiled_class_hash))
+                .collect(),
+            nonces: std::iter::once((contract, StarknetApiNonce(StarknetApiFelt::from(1_u64))))
+                .collect(),
+            ..StarknetApiThinStateDiff::default()
+        };
+        writer
+            .begin_rw_txn()
+            .expect("begin rw tx")
+            .append_state_diff(StarknetApiBlockNumber(0), diff)
+            .expect("append state diff")
+            .commit()
+            .expect("commit state diff");
+
+        (contract, class_hash, compiled_class_hash)
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn apollo_class_provider_reads_class_hashes_from_execution_and_simulation_state() {
+        let dir = tempdir().expect("temp dir");
+        let (reader, mut writer) =
+            open_apollo_storage(apollo_config(dir.path())).expect("open apollo storage");
+        let (contract, class_hash, compiled_class_hash) =
+            seed_header_and_state_with_class_hash(&mut writer);
+        let adapter = ApolloStorageAdapter::from_parts(reader, writer);
+        let provider = ApolloBlockifierClassProvider::new(adapter.reader_handle());
+
+        provider
+            .prepare_for_block_execution(0)
+            .expect("prepare block zero execution");
+        assert_eq!(
+            provider
+                .get_class_hash_at(contract)
+                .expect("read class hash before genesis"),
+            StarknetApiClassHash::default()
+        );
+
+        provider
+            .prepare_for_block_execution(1)
+            .expect("prepare block one execution");
+        assert_eq!(
+            provider
+                .get_class_hash_at(contract)
+                .expect("read class hash at block one"),
+            class_hash
+        );
+        assert_eq!(
+            provider
+                .get_compiled_class_hash(class_hash)
+                .expect("read compiled class hash"),
+            compiled_class_hash
+        );
+
+        provider
+            .prepare_for_simulation(1)
+            .expect("prepare simulation at block one");
+        assert_eq!(
+            provider
+                .get_class_hash_at(contract)
+                .expect("read class hash at simulation state"),
+            class_hash
+        );
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn apollo_class_provider_fails_closed_when_runnable_class_is_unavailable() {
+        let dir = tempdir().expect("temp dir");
+        let (reader, mut writer) =
+            open_apollo_storage(apollo_config(dir.path())).expect("open apollo storage");
+        let (_, class_hash, _) = seed_header_and_state_with_class_hash(&mut writer);
+        let adapter = ApolloStorageAdapter::from_parts(reader, writer);
+        let provider = ApolloBlockifierClassProvider::new(adapter.reader_handle());
+        provider
+            .prepare_for_block_execution(1)
+            .expect("prepare execution state");
+
+        let err = provider
+            .get_compiled_class(class_hash)
+            .expect_err("must fail without declared class artifacts");
+        assert!(matches!(err, StateError::UndeclaredClassHash(hash) if hash == class_hash));
     }
 
     #[cfg(feature = "production-adapters")]

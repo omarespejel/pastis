@@ -12,4 +12,4 @@ semver = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 starknet-types-core = "0.2.4"
-starknet_api = { version = "0.18.0-dev.0", optional = true }
+starknet_api = { git = "https://github.com/starkware-libs/sequencer", rev = "69b4c8d378580a1aec345f23dadd4766e036fe3b", package = "starknet_api", optional = true }

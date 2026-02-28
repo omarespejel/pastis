@@ -186,6 +186,8 @@ The repository currently includes core and phase-aligned scaffolding crates that
 - Storage backend behavior (sequential inserts, block snapshots, deterministic state roots)
 - Dual execution mismatch handling with canonical-state safety
 - Blockifier adapter fail-fast guard for account transactions when class-provider integration is unavailable
+- Apollo-backed Blockifier class-provider integration with per-block pre-state binding
+  (`prepare_for_block_execution` / `prepare_for_simulation`) and fail-closed class loading
 - ExEx registration hardening: per-ExEx credentials, allowlisted identities, trusted in-process sink enforcement, and sink recovery cooldown/re-enable
 - OTel-style ExEx sink implementation with deterministic notification-derived counters and block-regression telemetry
 - BTCFi/strkBTC monitor scaffolding with deterministic structural anomaly detection over state diffs and bounded nullifier tracking

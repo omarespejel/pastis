@@ -8,6 +8,9 @@ default = []
 production-adapters = [
     "starknet-node-storage/apollo-adapter",
     "starknet-node-execution/blockifier-adapter",
+    "dep:apollo_storage",
+    "dep:blockifier",
+    "dep:starknet_api",
 ]
 
 [dependencies]
@@ -27,3 +30,11 @@ starknet-node-storage = { path = "../storage" }
 starknet-node-types = { path = "../types" }
 thiserror = { workspace = true }
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "time", "net"] }
+
+# Keep production adapter dependencies aligned with sequencer monorepo revisions.
+apollo_storage = { git = "https://github.com/starkware-libs/sequencer", rev = "69b4c8d378580a1aec345f23dadd4766e036fe3b", package = "apollo_storage", optional = true }
+blockifier = { git = "https://github.com/starkware-libs/sequencer", rev = "69b4c8d378580a1aec345f23dadd4766e036fe3b", package = "blockifier", optional = true }
+starknet_api = { git = "https://github.com/starkware-libs/sequencer", rev = "69b4c8d378580a1aec345f23dadd4766e036fe3b", package = "starknet_api", optional = true }
+
+[dev-dependencies]
+tempfile = "3.10"

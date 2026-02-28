@@ -524,6 +524,18 @@ pub trait BlockifierClassProvider: Send + Sync {
         false
     }
 
+    /// Called before block execution to let providers bind their lookups to the
+    /// pre-state of `block_number`.
+    fn prepare_for_block_execution(&self, _block_number: u64) -> Result<(), StateError> {
+        Ok(())
+    }
+
+    /// Called before simulation to let providers bind their lookups to the
+    /// requested simulation state at `block_number`.
+    fn prepare_for_simulation(&self, _block_number: u64) -> Result<(), StateError> {
+        Ok(())
+    }
+
     fn get_class_hash_at(
         &self,
         contract_address: BlockifierContractAddress,
@@ -1039,6 +1051,14 @@ impl ExecutionBackend for BlockifierVmBackend {
         self.validate_sequential_block(block.number)?;
         let started_at = Instant::now();
         let block_context = self.build_block_context(block)?;
+        self.class_provider
+            .prepare_for_block_execution(block.number)
+            .map_err(|error| {
+                ExecutionError::Backend(format!(
+                    "class provider preparation failed for block execution {}: {}",
+                    block.number, error
+                ))
+            })?;
         let txs = self.map_block_transactions(block)?;
         let snapshot = self.snapshot_for_execution(state)?;
         let result: Result<ExecutionOutput, ExecutionError> = (|| {
@@ -1165,6 +1185,14 @@ impl ExecutionBackend for BlockifierVmBackend {
         tx.validate_hash()
             .map_err(|error| ExecutionError::Backend(format!("invalid tx hash: {error}")))?;
         let blockifier_context = self.build_simulation_context(block_context)?;
+        self.class_provider
+            .prepare_for_simulation(block_context.block_number)
+            .map_err(|error| {
+                ExecutionError::Backend(format!(
+                    "class provider preparation failed for simulation at block {}: {}",
+                    block_context.block_number, error
+                ))
+            })?;
         let mapped_tx = self.map_transaction_for_block(block_context.block_number, tx)?;
         let mut executor = TransactionExecutor::pre_process_and_create(
             BlockifierReadOnlyStateAdapter::new(state, Arc::clone(&self.class_provider)),
@@ -1214,6 +1242,7 @@ impl ExecutionBackend for BlockifierVmBackend {
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -1532,6 +1561,100 @@ mod tests {
             };
             // Keep calldata empty to ensure adapter guards against upstream underflow panic.
             Ok(ExecutableTx::L1Handler(executable))
+        }
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    #[derive(Default)]
+    struct RecordingClassProvider {
+        execution_blocks: Mutex<Vec<u64>>,
+        simulation_blocks: Mutex<Vec<u64>>,
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    impl BlockifierClassProvider for RecordingClassProvider {
+        fn supports_account_execution(&self) -> bool {
+            true
+        }
+
+        fn prepare_for_block_execution(&self, block_number: u64) -> Result<(), StateError> {
+            self.execution_blocks
+                .lock()
+                .map_err(|_| StateError::StateReadError("recording mutex poisoned".to_string()))?
+                .push(block_number);
+            Ok(())
+        }
+
+        fn prepare_for_simulation(&self, block_number: u64) -> Result<(), StateError> {
+            self.simulation_blocks
+                .lock()
+                .map_err(|_| StateError::StateReadError("recording mutex poisoned".to_string()))?
+                .push(block_number);
+            Ok(())
+        }
+
+        fn get_class_hash_at(
+            &self,
+            _contract_address: BlockifierContractAddress,
+        ) -> Result<BlockifierClassHash, StateError> {
+            Ok(BlockifierClassHash::default())
+        }
+
+        fn get_compiled_class(
+            &self,
+            class_hash: BlockifierClassHash,
+        ) -> Result<RunnableCompiledClass, StateError> {
+            Err(StateError::UndeclaredClassHash(class_hash))
+        }
+
+        fn get_compiled_class_hash(
+            &self,
+            _class_hash: BlockifierClassHash,
+        ) -> Result<BlockifierCompiledClassHash, StateError> {
+            Ok(BlockifierCompiledClassHash::default())
+        }
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    struct FailingPrepareClassProvider;
+
+    #[cfg(feature = "blockifier-adapter")]
+    impl BlockifierClassProvider for FailingPrepareClassProvider {
+        fn supports_account_execution(&self) -> bool {
+            true
+        }
+
+        fn prepare_for_block_execution(&self, _block_number: u64) -> Result<(), StateError> {
+            Err(StateError::StateReadError(
+                "prepare execution failure".to_string(),
+            ))
+        }
+
+        fn prepare_for_simulation(&self, _block_number: u64) -> Result<(), StateError> {
+            Err(StateError::StateReadError(
+                "prepare simulation failure".to_string(),
+            ))
+        }
+
+        fn get_class_hash_at(
+            &self,
+            _contract_address: BlockifierContractAddress,
+        ) -> Result<BlockifierClassHash, StateError> {
+            Ok(BlockifierClassHash::default())
+        }
+
+        fn get_compiled_class(
+            &self,
+            class_hash: BlockifierClassHash,
+        ) -> Result<RunnableCompiledClass, StateError> {
+            Err(StateError::UndeclaredClassHash(class_hash))
+        }
+
+        fn get_compiled_class_hash(
+            &self,
+            _class_hash: BlockifierClassHash,
+        ) -> Result<BlockifierCompiledClassHash, StateError> {
+            Ok(BlockifierCompiledClassHash::default())
         }
     }
 
@@ -2000,6 +2123,68 @@ mod tests {
         match err {
             ExecutionError::Backend(message) => {
                 assert!(message.contains("class-provider integration is required"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    #[test]
+    fn blockifier_backend_prepares_class_provider_for_execution_and_simulation() {
+        let provider = Arc::new(RecordingClassProvider::default());
+        let backend = BlockifierVmBackend::starknet_mainnet()
+            .with_class_provider(Arc::clone(&provider) as Arc<dyn BlockifierClassProvider>);
+        let mut state = InMemoryState::default();
+        let tx = executable_l1_handler_tx("0xabc");
+
+        backend
+            .execute_block(&empty_block(11, "0.14.2"), &mut state)
+            .expect("execute empty block");
+        backend
+            .simulate_tx(&tx, &state, &context(12, "0.14.2"))
+            .expect("simulate tx");
+
+        let execution = provider
+            .execution_blocks
+            .lock()
+            .expect("execution blocks lock")
+            .clone();
+        let simulation = provider
+            .simulation_blocks
+            .lock()
+            .expect("simulation blocks lock")
+            .clone();
+        assert_eq!(execution, vec![11]);
+        assert_eq!(simulation, vec![12]);
+    }
+
+    #[cfg(feature = "blockifier-adapter")]
+    #[test]
+    fn blockifier_backend_fails_closed_when_class_provider_prepare_fails() {
+        let backend = BlockifierVmBackend::starknet_mainnet()
+            .with_class_provider(Arc::new(FailingPrepareClassProvider));
+        let mut state = InMemoryState::default();
+
+        let exec_err = backend
+            .execute_block(&empty_block(11, "0.14.2"), &mut state)
+            .expect_err("prepare failure must abort execution");
+        match exec_err {
+            ExecutionError::Backend(message) => {
+                assert!(message.contains("class provider preparation failed for block execution"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+
+        let sim_err = backend
+            .simulate_tx(
+                &executable_l1_handler_tx("0xabc"),
+                &state,
+                &context(12, "0.14.2"),
+            )
+            .expect_err("prepare failure must abort simulation");
+        match sim_err {
+            ExecutionError::Backend(message) => {
+                assert!(message.contains("class provider preparation failed for simulation"));
             }
             other => panic!("unexpected error variant: {other:?}"),
         }
