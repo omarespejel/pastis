@@ -585,24 +585,57 @@ impl RealRuntime {
         });
         let mut diagnostics = RuntimeDiagnostics::new();
         diagnostics.anomaly_monitor_enabled = btcfi.is_some();
-        let replay = new_replay_pipeline(
+        let mut replay = new_replay_pipeline(
             replay_window,
             max_replay_per_poll,
             replay_checkpoint_path.as_deref(),
         )
         .map_err(|error| format!("failed to initialize replay pipeline: {error}"))?;
+        let node = build_dashboard_node();
+        let storage_tip = node
+            .storage
+            .latest_block_number()
+            .map_err(|error| format!("failed to read local storage tip: {error}"))?;
+        let mut recent_errors = VecDeque::new();
+        let expected_next_local = storage_tip.saturating_add(1);
+        if replay.next_local_block() != expected_next_local {
+            let warning = format!(
+                "replay checkpoint local cursor {} mismatches local storage tip {}; resetting replay cursor",
+                replay.next_local_block(),
+                storage_tip
+            );
+            push_recent_error(&mut recent_errors, warning);
+            if let Some(path) = replay_checkpoint_path.as_deref() {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "failed to remove stale replay checkpoint at {path}: {error}"
+                        ));
+                    }
+                }
+                replay = new_replay_pipeline(replay_window, max_replay_per_poll, Some(path))
+                    .map_err(|error| {
+                        format!("failed to reinitialize replay pipeline after reset: {error}")
+                    })?;
+            } else {
+                replay = ReplayPipeline::new(replay_window, max_replay_per_poll);
+            }
+        }
+        diagnostics.recent_errors = recent_errors.iter().cloned().collect();
 
         Ok(Self {
             client,
             retry_config,
             btcfi,
             state: Arc::new(Mutex::new(RealRuntimeState {
-                node: build_dashboard_node(),
+                node,
                 execution_state: InMemoryState::default(),
                 snapshot: None,
                 replay,
                 diagnostics,
-                recent_errors: VecDeque::new(),
+                recent_errors,
             })),
         })
     }
@@ -3093,6 +3126,74 @@ mod tests {
             (fetch_623.replay.transaction_hashes.len() + fetch_624.replay.transaction_hashes.len())
                 as u64
         );
+    }
+
+    #[tokio::test]
+    async fn real_runtime_restart_reconciles_checkpoint_with_fresh_local_storage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let checkpoint_path = dir.path().join("replay-checkpoint.json");
+        let checkpoint_path_str = checkpoint_path
+            .to_str()
+            .expect("checkpoint path should be valid utf8")
+            .to_string();
+
+        let fetch_623 = fetch_from_rpc_fixtures(
+            "mainnet_block_7242623_get_block_with_txs.json",
+            "mainnet_block_7242623_get_state_update.json",
+        );
+        let fetch_624 = fetch_from_rpc_fixtures(
+            "mainnet_block_7242624_get_block_with_txs.json",
+            "mainnet_block_7242624_get_state_update.json",
+        );
+
+        let first_boot = RealRuntime::new_with_rpc_source(
+            Arc::new(MockRpcSource::new(
+                "mock://rpc",
+                vec![Ok(7_242_623)],
+                vec![(7_242_623, Ok(fetch_623.clone()))],
+            )),
+            None,
+            1,
+            1,
+            Some(checkpoint_path_str.clone()),
+            RpcRetryConfig {
+                max_retries: 0,
+                base_backoff: Duration::ZERO,
+            },
+        )
+        .expect("first runtime should initialize");
+        first_boot
+            .poll_once()
+            .await
+            .expect("first runtime poll should succeed");
+
+        let second_boot = RealRuntime::new_with_rpc_source(
+            Arc::new(MockRpcSource::new(
+                "mock://rpc",
+                vec![Ok(7_242_624)],
+                vec![(7_242_624, Ok(fetch_624.clone()))],
+            )),
+            None,
+            1,
+            1,
+            Some(checkpoint_path_str),
+            RpcRetryConfig {
+                max_retries: 0,
+                base_backoff: Duration::ZERO,
+            },
+        )
+        .expect("second runtime should initialize");
+        second_boot
+            .poll_once()
+            .await
+            .expect("second runtime poll should succeed");
+
+        let diagnostics = second_boot
+            .diagnostics()
+            .expect("diagnostics should be readable");
+        assert_eq!(diagnostics.last_local_block, Some(1));
+        assert_eq!(diagnostics.last_external_replayed_block, Some(7_242_624));
+        assert_eq!(diagnostics.replay_lag_blocks, Some(0));
     }
 
     #[tokio::test]
