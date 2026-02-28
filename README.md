@@ -29,6 +29,7 @@ This repository currently ships core, tested building blocks:
 - Storage backends with Apollo adapter tests against real Starknet fixture data
 - Dual execution orchestration with canonical fallback/mismatch handling
 - ExEx manager with bounded WAL replay and failing-sink circuit breaker
+- MCP server request handler with authenticated tool execution and bounded batch support
 - Type-state node builder that enforces composition order
 
 Source entry points:
@@ -40,6 +41,7 @@ Source entry points:
 - [crates/storage/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/storage/src/lib.rs)
 - [crates/execution/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/execution/src/lib.rs)
 - [crates/exex-manager/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/exex-manager/src/lib.rs)
+- [crates/mcp-server/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/mcp-server/src/lib.rs)
 - [crates/node/src/lib.rs](/Users/espejelomar/StarkNet/pastis/crates/node/src/lib.rs)
 
 ## External Integration Boundaries
@@ -127,7 +129,7 @@ Near-term implementation sequence:
 1. Expand Apollo-backed adapters and fixture coverage
 2. Continue hardening Blockifier adapter semantics across protocol versions
 3. Extend ExEx manager recovery and failure isolation behavior
-4. Land MCP server implementation and tool auth/rate limits
+4. Extend MCP server surface beyond control-plane tools (state query params, simulation, submit)
 5. Add BTCFi/strkBTC monitoring ExEx implementations
 
 Long-term:

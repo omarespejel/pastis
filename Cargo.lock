@@ -4128,6 +4128,7 @@ dependencies = [
  "node-spec-core",
  "semver",
  "starknet-node-execution",
+ "starknet-node-mcp-server",
  "starknet-node-storage",
  "starknet-node-types",
  "thiserror 2.0.18",
@@ -4153,6 +4154,17 @@ dependencies = [
  "bincode 1.3.3",
  "node-spec-core",
  "rayon",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "starknet-node-mcp-server"
+version = "0.1.0"
+dependencies = [
+ "node-spec-core",
+ "semver",
+ "starknet-node-storage",
+ "starknet-node-types",
  "thiserror 2.0.18",
 ]
 

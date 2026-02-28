@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
+use node_spec_core::mcp::{McpAccessController, ValidationLimits};
 #[cfg(feature = "production-adapters")]
 use starknet_node_execution::BlockifierVmBackend;
 use starknet_node_execution::ExecutionBackend;
+use starknet_node_mcp_server::McpServer;
 #[cfg(feature = "production-adapters")]
 use starknet_node_storage::ApolloStorageAdapter;
 use starknet_node_storage::StorageBackend;
@@ -86,6 +88,16 @@ pub struct StarknetNode<S, E> {
     pub execution: E,
     pub rpc_enabled: bool,
     pub mcp_enabled: bool,
+}
+
+impl<S: StorageBackend, E> StarknetNode<S, E> {
+    pub fn new_mcp_server(
+        &self,
+        access_controller: McpAccessController,
+        validation_limits: ValidationLimits,
+    ) -> McpServer<'_> {
+        McpServer::new(&self.storage, access_controller, validation_limits)
+    }
 }
 
 pub struct StarknetNodeBuilder<Stor, Exec> {
@@ -248,11 +260,16 @@ pub fn build_mainnet_production_node(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::time::Duration;
 
+    use node_spec_core::mcp::{
+        AgentPolicy, McpAccessController, McpTool, ToolPermission, ValidationLimits,
+    };
     #[cfg(feature = "production-adapters")]
     use semver::Version;
     use starknet_node_execution::ExecutionError;
+    use starknet_node_mcp_server::{McpRequest, McpResponse};
     use starknet_node_storage::InMemoryStorage;
     #[cfg(feature = "production-adapters")]
     use starknet_node_storage::StorageError;
@@ -319,6 +336,35 @@ mod tests {
         assert!(node.rpc_enabled);
         assert!(node.mcp_enabled);
         assert_eq!(node.config.chain_id, ChainId::Mainnet);
+    }
+
+    #[test]
+    fn node_can_construct_mcp_server_bound_to_storage() {
+        let storage = InMemoryStorage::new(InMemoryState::default());
+        let node = StarknetNodeBuilder::new(NodeConfig::default())
+            .with_storage(storage)
+            .with_execution(DummyExecution)
+            .with_mcp(true)
+            .build();
+        let policies = [(
+            "agent-a".to_string(),
+            AgentPolicy::new("api-key", BTreeSet::from([ToolPermission::QueryState]), 5),
+        )];
+        let limits = ValidationLimits {
+            max_batch_size: 8,
+            max_depth: 2,
+            max_total_tools: 16,
+        };
+        let server = node.new_mcp_server(McpAccessController::new(policies), limits);
+        let response = server
+            .handle_request(McpRequest {
+                api_key: "api-key".to_string(),
+                tool: McpTool::QueryState,
+                now_unix_seconds: 1_000,
+            })
+            .expect("request should succeed");
+        assert_eq!(response.agent_id, "agent-a");
+        assert!(matches!(response.response, McpResponse::QueryState(_)));
     }
 
     #[test]

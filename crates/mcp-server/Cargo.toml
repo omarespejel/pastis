@@ -1,0 +1,14 @@
+[package]
+name = "starknet-node-mcp-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+node-spec-core = { path = "../node-spec-core" }
+starknet-node-storage = { path = "../storage" }
+starknet-node-types = { path = "../types" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+semver = { workspace = true }

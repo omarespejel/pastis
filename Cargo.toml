@@ -4,6 +4,7 @@ members = [
     "crates/types",
     "crates/storage",
     "crates/execution",
+    "crates/mcp-server",
     "crates/node",
     "crates/exex-manager",
 ]
