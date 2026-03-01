@@ -2179,7 +2179,7 @@ fn normalize_chain_id(raw: &str) -> String {
         .or_else(|| trimmed.strip_prefix("0X"))
     {
         let normalized_hex = hex.trim_start_matches('0').to_ascii_lowercase();
-        if let Some(decoded) = decode_ascii_hex(hex) {
+        if let Some(decoded) = decode_ascii_hex(&normalized_hex) {
             return decoded;
         }
         if normalized_hex.is_empty() {
@@ -2952,6 +2952,7 @@ mod tests {
     fn normalize_chain_id_accepts_hex_encoded_ascii() {
         assert_eq!(normalize_chain_id("SN_MAIN"), "SN_MAIN");
         assert_eq!(normalize_chain_id("0x534e5f4d41494e"), "SN_MAIN");
+        assert_eq!(normalize_chain_id("0x00534E5F4D41494E"), "SN_MAIN");
     }
 
     #[tokio::test]

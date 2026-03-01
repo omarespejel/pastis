@@ -296,11 +296,27 @@ impl<'a> StarknetRpcServer<'a> {
         let mut payload = block_to_json(&block);
         let mut receipts = Vec::with_capacity(block.transactions.len());
         for (tx_index, tx) in block.transactions.iter().enumerate() {
-            let receipt = self
+            let (receipt_block, receipt_index, receipt) = self
                 .storage
                 .get_transaction_receipt(&tx.hash)?
-                .map(|(_, _, receipt)| receipt)
-                .unwrap_or_else(|| default_receipt_for_hash(&tx.hash));
+                .ok_or_else(|| {
+                    RpcError::StateRead(format!(
+                        "missing receipt for committed tx {} in block {}",
+                        tx.hash, block.number
+                    ))
+                })?;
+            if receipt_block != block.number || receipt_index != tx_index {
+                return Err(RpcError::StateRead(format!(
+                    "receipt index mismatch for tx {}: expected block/index {}/{}, got {}/{}",
+                    tx.hash, block.number, tx_index, receipt_block, receipt_index
+                )));
+            }
+            if receipt.tx_hash != tx.hash {
+                return Err(RpcError::StateRead(format!(
+                    "receipt hash mismatch for tx {} at block {} index {}: got {}",
+                    tx.hash, block.number, tx_index, receipt.tx_hash
+                )));
+            }
             receipts.push(receipt_to_json(&receipt, block.number, tx_index));
         }
         if let Value::Object(map) = &mut payload {
@@ -360,14 +376,8 @@ impl<'a> StarknetRpcServer<'a> {
 
     fn get_transaction_status(&self, params: &Value) -> Result<Value, RpcError> {
         let requested_hash = parse_tx_hash_param(params)?;
-        self.storage
-            .get_transaction_by_hash(&requested_hash)?
-            .ok_or(RpcError::TxNotFound)?;
-        let execution_status = self
-            .storage
-            .get_transaction_receipt(&requested_hash)?
-            .map(|(_, _, receipt)| receipt_execution_status(receipt.execution_status))
-            .unwrap_or("SUCCEEDED");
+        let (_, _, receipt) = self.receipt_for_committed_tx(&requested_hash)?;
+        let execution_status = receipt_execution_status(receipt.execution_status);
         Ok(json!({
             "finality_status": "ACCEPTED_ON_L2",
             "execution_status": execution_status,
@@ -376,16 +386,7 @@ impl<'a> StarknetRpcServer<'a> {
 
     fn get_transaction_receipt(&self, params: &Value) -> Result<Value, RpcError> {
         let requested_hash = parse_tx_hash_param(params)?;
-        let (block_number, tx_index, receipt) =
-            if let Some(found) = self.storage.get_transaction_receipt(&requested_hash)? {
-                found
-            } else {
-                let (block_number, tx_index, tx) = self
-                    .storage
-                    .get_transaction_by_hash(&requested_hash)?
-                    .ok_or(RpcError::TxNotFound)?;
-                (block_number, tx_index, default_receipt_for_hash(&tx.hash))
-            };
+        let (block_number, tx_index, receipt) = self.receipt_for_committed_tx(&requested_hash)?;
         Ok(receipt_to_json(&receipt, block_number, tx_index))
     }
 
@@ -455,6 +456,36 @@ impl<'a> StarknetRpcServer<'a> {
                 Ok(number)
             }
         }
+    }
+
+    fn receipt_for_committed_tx(
+        &self,
+        hash: &TxHash,
+    ) -> Result<(u64, usize, StarknetReceipt), RpcError> {
+        let (tx_block, tx_index, tx) = self
+            .storage
+            .get_transaction_by_hash(hash)?
+            .ok_or(RpcError::TxNotFound)?;
+        let (receipt_block, receipt_index, receipt) =
+            self.storage.get_transaction_receipt(hash)?.ok_or_else(|| {
+                RpcError::StateRead(format!(
+                    "missing receipt for committed tx {} in block {}",
+                    tx.hash, tx_block
+                ))
+            })?;
+        if receipt_block != tx_block || receipt_index != tx_index {
+            return Err(RpcError::StateRead(format!(
+                "receipt index mismatch for tx {}: expected block/index {}/{}, got {}/{}",
+                tx.hash, tx_block, tx_index, receipt_block, receipt_index
+            )));
+        }
+        if receipt.tx_hash != tx.hash {
+            return Err(RpcError::StateRead(format!(
+                "receipt hash mismatch for tx {} at block {} index {}: got {}",
+                tx.hash, tx_block, tx_index, receipt.tx_hash
+            )));
+        }
+        Ok((receipt_block, receipt_index, receipt))
     }
 }
 
@@ -723,15 +754,6 @@ fn state_diff_to_json(diff: &StarknetStateDiff) -> Value {
     })
 }
 
-fn default_receipt_for_hash(tx_hash: &TxHash) -> StarknetReceipt {
-    StarknetReceipt {
-        tx_hash: tx_hash.clone(),
-        execution_status: true,
-        events: 0,
-        gas_consumed: 0,
-    }
-}
-
 fn receipt_to_json(receipt: &StarknetReceipt, block_number: u64, tx_index: usize) -> Value {
     json!({
         "transaction_hash": receipt.tx_hash,
@@ -798,11 +820,100 @@ mod tests {
     use semver::Version;
     use starknet_node_storage::InMemoryStorage;
     use starknet_node_types::{
-        BlockGasPrices, ContractAddress, GasPricePerToken, InMemoryState, StarknetBlock,
-        StarknetFelt, StarknetReceipt, StarknetStateDiff, StarknetTransaction,
+        BlockGasPrices, ComponentHealth, ContractAddress, GasPricePerToken, HealthCheck,
+        InMemoryState, StarknetBlock, StarknetFelt, StarknetReceipt, StarknetStateDiff,
+        StarknetTransaction, StateReader,
     };
 
     use super::*;
+
+    struct MissingReceiptStorage {
+        inner: InMemoryStorage,
+    }
+
+    impl MissingReceiptStorage {
+        fn new(inner: InMemoryStorage) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl HealthCheck for MissingReceiptStorage {
+        fn is_healthy(&self) -> bool {
+            self.inner.is_healthy()
+        }
+
+        fn detailed_status(&self) -> ComponentHealth {
+            self.inner.detailed_status()
+        }
+    }
+
+    impl StorageBackend for MissingReceiptStorage {
+        fn get_state_reader(
+            &self,
+            block_number: u64,
+        ) -> Result<Box<dyn StateReader>, StorageError> {
+            self.inner.get_state_reader(block_number)
+        }
+
+        fn apply_state_diff(&mut self, diff: &StarknetStateDiff) -> Result<(), StorageError> {
+            self.inner.apply_state_diff(diff)
+        }
+
+        fn insert_block(
+            &mut self,
+            block: StarknetBlock,
+            state_diff: StarknetStateDiff,
+        ) -> Result<(), StorageError> {
+            self.inner.insert_block(block, state_diff)
+        }
+
+        fn insert_block_with_receipts(
+            &mut self,
+            block: StarknetBlock,
+            state_diff: StarknetStateDiff,
+            receipts: Vec<StarknetReceipt>,
+        ) -> Result<(), StorageError> {
+            self.inner
+                .insert_block_with_receipts(block, state_diff, receipts)
+        }
+
+        fn get_block(&self, id: BlockId) -> Result<Option<StarknetBlock>, StorageError> {
+            self.inner.get_block(id)
+        }
+
+        fn get_state_diff(
+            &self,
+            block_number: u64,
+        ) -> Result<Option<StarknetStateDiff>, StorageError> {
+            self.inner.get_state_diff(block_number)
+        }
+
+        fn latest_block_number(&self) -> Result<u64, StorageError> {
+            self.inner.latest_block_number()
+        }
+
+        fn get_transaction_by_hash(
+            &self,
+            hash: &TxHash,
+        ) -> Result<Option<(u64, usize, StarknetTransaction)>, StorageError> {
+            self.inner.get_transaction_by_hash(hash)
+        }
+
+        fn get_transaction_receipt(
+            &self,
+            _hash: &TxHash,
+        ) -> Result<Option<(u64, usize, StarknetReceipt)>, StorageError> {
+            Ok(None)
+        }
+
+        fn current_state_root(&self) -> Result<String, StorageError> {
+            self.inner.current_state_root()
+        }
+
+        fn state_root_semantics(&self) -> starknet_node_storage::StateRootSemantics {
+            self.inner.state_root_semantics()
+        }
+    }
 
     fn sample_block(number: u64) -> StarknetBlock {
         StarknetBlock {
@@ -904,6 +1015,36 @@ mod tests {
         StarknetRpcServer::new(leaked, "SN_MAIN")
     }
 
+    fn seeded_server_with_missing_receipts() -> StarknetRpcServer<'static> {
+        let mut storage = InMemoryStorage::new(InMemoryState::default());
+        let mut diff_1 = StarknetStateDiff::default();
+        let contract_1 = ContractAddress::parse("0x1").expect("valid contract");
+        diff_1
+            .storage_diffs
+            .entry(contract_1.clone())
+            .or_default()
+            .insert("0x10".to_string(), StarknetFelt::from(10_u64));
+        diff_1.nonces.insert(contract_1, StarknetFelt::from(1_u64));
+        storage
+            .insert_block(sample_block(1), diff_1)
+            .expect("insert");
+        let mut diff_2 = StarknetStateDiff::default();
+        let contract_2 = ContractAddress::parse("0x2").expect("valid contract");
+        diff_2
+            .storage_diffs
+            .entry(contract_2.clone())
+            .or_default()
+            .insert("0x20".to_string(), StarknetFelt::from(20_u64));
+        diff_2.nonces.insert(contract_2, StarknetFelt::from(2_u64));
+        storage
+            .insert_block(sample_block(2), diff_2)
+            .expect("insert");
+
+        let leaked: &'static mut MissingReceiptStorage =
+            Box::leak(Box::new(MissingReceiptStorage::new(storage)));
+        StarknetRpcServer::new(leaked, "SN_MAIN")
+    }
+
     #[test]
     fn block_number_works() {
         let server = seeded_server();
@@ -991,6 +1132,20 @@ mod tests {
     }
 
     #[test]
+    fn get_block_with_receipts_fails_closed_when_receipt_is_missing() {
+        let server = seeded_server_with_missing_receipts();
+        let raw = r#"{"jsonrpc":"2.0","id":72,"method":"starknet_getBlockWithReceipts","params":[{"block_number":2}]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["error"]["code"], json!(ERR_INTERNAL));
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .expect("error message")
+                .contains("missing receipt")
+        );
+    }
+
+    #[test]
     fn get_block_transaction_count_works() {
         let server = seeded_server();
         let raw = r#"{"jsonrpc":"2.0","id":7,"method":"starknet_getBlockTransactionCount","params":[{"block_number":2}]}"#;
@@ -1056,6 +1211,20 @@ mod tests {
     }
 
     #[test]
+    fn get_transaction_status_fails_closed_when_receipt_is_missing() {
+        let server = seeded_server_with_missing_receipts();
+        let raw = r#"{"jsonrpc":"2.0","id":73,"method":"starknet_getTransactionStatus","params":["0x1f6"]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["error"]["code"], json!(ERR_INTERNAL));
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .expect("error message")
+                .contains("missing receipt")
+        );
+    }
+
+    #[test]
     fn get_transaction_receipt_works() {
         let server = seeded_server();
         let raw = r#"{"jsonrpc":"2.0","id":24,"method":"starknet_getTransactionReceipt","params":["0x1f6"]}"#;
@@ -1073,6 +1242,20 @@ mod tests {
         let raw = r#"{"jsonrpc":"2.0","id":25,"method":"starknet_getTransactionReceipt","params":["0xdead"]}"#;
         let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
         assert_eq!(value["error"]["code"], json!(ERR_TX_NOT_FOUND));
+    }
+
+    #[test]
+    fn get_transaction_receipt_fails_closed_when_receipt_is_missing() {
+        let server = seeded_server_with_missing_receipts();
+        let raw = r#"{"jsonrpc":"2.0","id":74,"method":"starknet_getTransactionReceipt","params":["0x1f6"]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["error"]["code"], json!(ERR_INTERNAL));
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .expect("error message")
+                .contains("missing receipt")
+        );
     }
 
     #[test]
