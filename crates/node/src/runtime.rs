@@ -720,9 +720,10 @@ impl FailoverSyncSource {
 
     fn start_index(&self) -> usize {
         let total = self.sources.len();
-        if total == 0 {
-            return 0;
-        }
+        debug_assert!(
+            total > 0,
+            "FailoverSyncSource::new validates non-empty sources"
+        );
         self.active_index.load(Ordering::Relaxed) % total
     }
 
@@ -2236,8 +2237,8 @@ fn mix_u64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-fn redact_upstream_url(raw: String, rpc_url: &str) -> String {
-    let redacted = match reqwest::Url::parse(rpc_url) {
+fn format_scheme_host_port(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
         Ok(url) => {
             let host = url.host_str().unwrap_or("unknown-host");
             let port = url
@@ -2246,8 +2247,12 @@ fn redact_upstream_url(raw: String, rpc_url: &str) -> String {
                 .unwrap_or_default();
             format!("{}://{}{port}", url.scheme(), host)
         }
-        Err(_) => "<upstream-rpc-url>".to_string(),
-    };
+        Err(_) => "<invalid-rpc-url>".to_string(),
+    }
+}
+
+fn redact_upstream_url(raw: String, rpc_url: &str) -> String {
+    let redacted = format_scheme_host_port(rpc_url);
     raw.replace(rpc_url, &redacted)
 }
 
@@ -3448,17 +3453,7 @@ fn decode_ascii_hex(hex: &str) -> Option<String> {
 }
 
 fn redact_upstream_endpoint(raw: &str) -> String {
-    match reqwest::Url::parse(raw) {
-        Ok(url) => {
-            let host = url.host_str().unwrap_or("unknown-host");
-            let port = url
-                .port()
-                .map(|value| format!(":{value}"))
-                .unwrap_or_default();
-            format!("{}://{}{port}", url.scheme(), host)
-        }
-        Err(_) => "<invalid-rpc-url>".to_string(),
-    }
+    format_scheme_host_port(raw)
 }
 
 #[cfg(test)]
