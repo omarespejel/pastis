@@ -911,8 +911,18 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         .ok_or_else(|| {
             "missing upstream RPC URL; pass --upstream-rpc-url or set STARKNET_RPC_URL".to_string()
         })?;
-    reqwest::Url::parse(&upstream_rpc_url)
+    let parsed_url = reqwest::Url::parse(&upstream_rpc_url)
         .map_err(|error| format!("invalid upstream RPC URL `{upstream_rpc_url}`: {error}"))?;
+    if !matches!(parsed_url.scheme(), "http" | "https") {
+        return Err(format!(
+            "invalid upstream RPC URL `{upstream_rpc_url}`: scheme must be http or https"
+        ));
+    }
+    if parsed_url.host_str().is_none() {
+        return Err(format!(
+            "invalid upstream RPC URL `{upstream_rpc_url}`: host is required"
+        ));
+    }
 
     let chain_id = match cli_chain_id {
         Some(id) => id,
