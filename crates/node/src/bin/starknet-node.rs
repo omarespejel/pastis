@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
+use std::future::Future;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,6 +37,7 @@ const DEFAULT_P2P_HEARTBEAT_MS: u64 = 30_000;
 const DEFAULT_RPC_MAX_CONCURRENCY: usize = 256;
 const DEFAULT_RPC_RATE_LIMIT_PER_MINUTE: u32 = 1_200;
 const MAX_RPC_RATE_LIMIT_PER_MINUTE: u32 = 100_000;
+const MAX_BOOTNODE_PROBE_CONCURRENCY: usize = 32;
 const DEFAULT_HEALTH_MAX_CONSECUTIVE_FAILURES: u64 = 3;
 const DEFAULT_HEALTH_MAX_SYNC_LAG_BLOCKS: u64 = 64;
 const MAX_RPC_AUTH_TOKEN_BYTES: usize = 4 * 1024;
@@ -536,10 +538,36 @@ fn unix_now_seconds() -> u64 {
 }
 
 async fn probe_bootnodes(endpoints: &[BootnodeEndpoint], timeout: Duration) -> usize {
+    probe_bootnodes_with(endpoints, timeout, &|endpoint, timeout| async move {
+        probe_bootnode(&endpoint, timeout).await
+    })
+    .await
+}
+
+async fn probe_bootnodes_with<F, Fut>(
+    endpoints: &[BootnodeEndpoint],
+    timeout: Duration,
+    probe: &F,
+) -> usize
+where
+    F: Fn(BootnodeEndpoint, Duration) -> Fut + Send + Sync,
+    Fut: Future<Output = bool> + Send + 'static,
+{
+    if endpoints.is_empty() {
+        return 0;
+    }
+
     let mut reachable = 0usize;
-    for endpoint in endpoints {
-        if probe_bootnode(endpoint, timeout).await {
-            reachable = reachable.saturating_add(1);
+    let chunk_size = endpoints.len().clamp(1, MAX_BOOTNODE_PROBE_CONCURRENCY);
+    for chunk in endpoints.chunks(chunk_size) {
+        let mut probes = tokio::task::JoinSet::new();
+        for endpoint in chunk {
+            probes.spawn(probe(endpoint.clone(), timeout));
+        }
+        while let Some(result) = probes.join_next().await {
+            if let Ok(true) = result {
+                reachable = reachable.saturating_add(1);
+            }
         }
     }
     reachable
@@ -1414,6 +1442,9 @@ environment:\n\
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Instant;
+
     use axum::body::to_bytes;
     use axum::http::HeaderValue;
     use serde_json::Value;
@@ -1564,6 +1595,47 @@ mod tests {
         let reachable = probe_bootnode(&endpoint, Duration::from_millis(250)).await;
         assert!(reachable);
         let _ = accept_task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probe_bootnodes_runs_probes_concurrently_with_bounded_fanout() {
+        let endpoints = (0..65_u16)
+            .map(|port| BootnodeEndpoint::Socket(SocketAddr::from(([127, 0, 0, 1], port))))
+            .collect::<Vec<_>>();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let probe = {
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            move |_endpoint: BootnodeEndpoint, timeout: Duration| {
+                let active = Arc::clone(&active);
+                let max_active = Arc::clone(&max_active);
+                async move {
+                    let in_flight = active.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+                    max_active.fetch_max(in_flight, Ordering::SeqCst);
+                    tokio::time::sleep(timeout).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    true
+                }
+            }
+        };
+
+        let started = Instant::now();
+        let reachable = probe_bootnodes_with(&endpoints, Duration::from_millis(40), &probe).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(reachable, endpoints.len());
+        let observed_max = max_active.load(Ordering::SeqCst);
+        assert!(
+            observed_max > 1 && observed_max <= MAX_BOOTNODE_PROBE_CONCURRENCY,
+            "expected bounded concurrency in (1, {}], observed {}",
+            MAX_BOOTNODE_PROBE_CONCURRENCY,
+            observed_max
+        );
+        assert!(
+            elapsed < Duration::from_millis(350),
+            "expected bounded-concurrency probe to finish quickly, elapsed={elapsed:?}"
+        );
     }
 
     #[test]
