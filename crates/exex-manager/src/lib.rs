@@ -390,10 +390,7 @@ impl ExExManager {
         }
 
         if tier_failures.len() == 1 {
-            let (name, message) = tier_failures
-                .into_iter()
-                .next()
-                .expect("exactly one failure");
+            let (name, message) = tier_failures.remove(0);
             return Err(ManagerError::SinkFailure { name, message });
         }
         if !tier_failures.is_empty() {

@@ -120,13 +120,16 @@ impl ExecutionBackend for NoopBackend {
         block: &StarknetBlock,
         _state: &mut dyn MutableState,
     ) -> Result<ExecutionOutput, ExecutionError> {
+        let tx_hash = block
+            .transactions
+            .first()
+            .map(|tx| tx.hash.clone())
+            .ok_or_else(|| {
+                ExecutionError::Backend("benchmark block missing transaction".to_string())
+            })?;
         Ok(ExecutionOutput {
             receipts: vec![StarknetReceipt {
-                tx_hash: block
-                    .transactions
-                    .first()
-                    .map(|tx| tx.hash.clone())
-                    .unwrap_or_else(|| TxHash::parse("0x0").expect("valid tx hash")),
+                tx_hash,
                 execution_status: true,
                 events: 0,
                 gas_consumed: 1,
@@ -155,13 +158,17 @@ impl ExecutionBackend for NoopBackend {
     }
 }
 
-fn sample_block(number: u64) -> StarknetBlock {
-    StarknetBlock {
+fn sample_block(number: u64) -> Result<StarknetBlock, String> {
+    let sequencer_address = ContractAddress::parse("0x1")
+        .map_err(|error| format!("invalid benchmark sequencer address: {error}"))?;
+    let tx_hash = TxHash::parse(format!("0x{number:x}"))
+        .map_err(|error| format!("invalid benchmark tx hash for block {number}: {error}"))?;
+    Ok(StarknetBlock {
         number,
         parent_hash: format!("0x{:x}", number.saturating_sub(1)),
         state_root: format!("0x{number:x}"),
         timestamp: 1_700_000_000 + number,
-        sequencer_address: ContractAddress::parse("0x1").expect("valid contract address"),
+        sequencer_address,
         gas_prices: BlockGasPrices {
             l1_gas: GasPricePerToken {
                 price_in_fri: 2,
@@ -177,10 +184,8 @@ fn sample_block(number: u64) -> StarknetBlock {
             },
         },
         protocol_version: Version::new(0, 14, 2),
-        transactions: vec![StarknetTransaction::new(
-            TxHash::parse(format!("0x{number:x}")).expect("valid benchmark tx hash"),
-        )],
-    }
+        transactions: vec![StarknetTransaction::new(tx_hash)],
+    })
 }
 
 fn run_dual_execution_benchmark(iterations: usize) -> Result<MetricResult, String> {
@@ -198,7 +203,7 @@ fn run_dual_execution_benchmark(iterations: usize) -> Result<MetricResult, Strin
             let mut samples_us = Vec::with_capacity(iterations);
             let started = Instant::now();
             for idx in 0..iterations {
-                let block = sample_block(idx as u64 + 1);
+                let block = sample_block(idx as u64 + 1).map_err(ExecutionError::Backend)?;
                 let t0 = Instant::now();
                 let out = backend.execute_verified(&block, &mut state)?;
                 black_box(out);

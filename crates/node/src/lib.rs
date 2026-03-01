@@ -808,7 +808,8 @@ mod tests {
             .build();
         let policies = [(
             "agent-a".to_string(),
-            AgentPolicy::new("api-key", BTreeSet::from([ToolPermission::QueryState]), 5),
+            AgentPolicy::new("api-key", BTreeSet::from([ToolPermission::QueryState]), 5)
+                .expect("test policy should build"),
         )];
         let limits = ValidationLimits {
             max_batch_size: 8,
@@ -837,7 +838,8 @@ mod tests {
             .build();
         let policies = [(
             "agent-a".to_string(),
-            AgentPolicy::new("api-key", BTreeSet::from([ToolPermission::GetAnomalies]), 5),
+            AgentPolicy::new("api-key", BTreeSet::from([ToolPermission::GetAnomalies]), 5)
+                .expect("test policy should build"),
         )];
         let limits = ValidationLimits {
             max_batch_size: 8,

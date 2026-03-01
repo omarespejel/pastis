@@ -123,9 +123,8 @@ impl AgentPolicy {
         api_key: impl AsRef<str>,
         permissions: BTreeSet<ToolPermission>,
         max_requests_per_minute: u32,
-    ) -> Self {
+    ) -> Result<Self, AgentPolicyBuildError> {
         Self::try_new(api_key, permissions, max_requests_per_minute)
-            .expect("agent policy construction must derive API key with argon2id")
     }
 
     pub fn try_new(
@@ -662,6 +661,7 @@ mod tests {
             BTreeSet::from([ToolPermission::QueryState]),
             limit,
         )
+        .expect("test policy should build")
     }
 
     fn legacy_read_only_policy(api_key: &str, salt_byte: u8, limit: u32) -> AgentPolicy {

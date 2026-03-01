@@ -229,7 +229,7 @@ mod tests {
     }
 
     fn read_policy(perms: BTreeSet<ToolPermission>, rpm: u32) -> AgentPolicy {
-        AgentPolicy::new("api-key", perms, rpm)
+        AgentPolicy::new("api-key", perms, rpm).expect("test policy should build")
     }
 
     fn sample_block(number: u64) -> StarknetBlock {
