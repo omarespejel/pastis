@@ -1,9 +1,10 @@
 use std::env;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -28,11 +29,14 @@ const DEFAULT_P2P_HEARTBEAT_MS: u64 = 30_000;
 const DEFAULT_RPC_MAX_CONCURRENCY: usize = 256;
 const DEFAULT_HEALTH_MAX_CONSECUTIVE_FAILURES: u64 = 3;
 const DEFAULT_HEALTH_MAX_SYNC_LAG_BLOCKS: u64 = 64;
+const MAX_RPC_AUTH_TOKEN_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone)]
 struct DaemonConfig {
     upstream_rpc_url: String,
     rpc_bind: String,
+    rpc_auth_token: Option<String>,
+    allow_public_rpc_bind: bool,
     chain_id: ChainId,
     poll_ms: u64,
     replay_window: u64,
@@ -56,6 +60,7 @@ struct DaemonConfig {
 struct RpcAppState {
     storage: ThreadSafeStorage<InMemoryStorage>,
     chain_id: String,
+    rpc_auth_token: Option<String>,
     sync_progress: Arc<Mutex<SyncProgress>>,
     health_policy: HealthPolicy,
     rpc_slots: Arc<Semaphore>,
@@ -124,6 +129,7 @@ async fn main() -> Result<(), String> {
     let app_state = RpcAppState {
         storage,
         chain_id: chain_id.clone(),
+        rpc_auth_token: config.rpc_auth_token.clone(),
         sync_progress,
         health_policy: HealthPolicy {
             max_consecutive_failures: config.health_max_consecutive_failures,
@@ -156,6 +162,8 @@ async fn main() -> Result<(), String> {
         config.chain_id_revalidate_polls
     );
     println!("rpc_max_concurrency: {}", config.rpc_max_concurrency);
+    println!("rpc_auth_enabled: {}", config.rpc_auth_token.is_some());
+    println!("allow_public_rpc_bind: {}", config.allow_public_rpc_bind);
     println!("exit_on_unhealthy: {}", config.exit_on_unhealthy);
     if let Some(path) = &config.local_journal_path {
         println!("local_journal_path: {path}");
@@ -222,7 +230,20 @@ async fn main() -> Result<(), String> {
     Ok(())
 }
 
-async fn handle_rpc(State(state): State<RpcAppState>, raw: String) -> impl IntoResponse {
+async fn handle_rpc(
+    State(state): State<RpcAppState>,
+    headers: HeaderMap,
+    raw: String,
+) -> impl IntoResponse {
+    if !is_rpc_request_authorized(&headers, state.rpc_auth_token.as_deref()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            "missing or invalid bearer token".to_string(),
+        )
+            .into_response();
+    }
+
     let _rpc_slot = match state.rpc_slots.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
@@ -263,6 +284,39 @@ async fn handle_rpc(State(state): State<RpcAppState>, raw: String) -> impl IntoR
         response,
     )
         .into_response()
+}
+
+fn is_rpc_request_authorized(headers: &HeaderMap, required_token: Option<&str>) -> bool {
+    let Some(required) = required_token else {
+        return true;
+    };
+    let Some(raw_auth) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+
+    let Some((scheme, token)) = raw_auth.split_once(' ') else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return false;
+    }
+    constant_time_eq_str(token, required)
+}
+
+fn constant_time_eq_str(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let mut diff = left.len() ^ right.len();
+    let max_len = left.len().max(right.len());
+    for i in 0..max_len {
+        let lhs = left.get(i).copied().unwrap_or_default();
+        let rhs = right.get(i).copied().unwrap_or_default();
+        diff |= usize::from(lhs ^ rhs);
+    }
+    diff == 0
 }
 
 async fn healthz(State(state): State<RpcAppState>) -> impl IntoResponse {
@@ -330,6 +384,8 @@ async fn status(
 fn parse_daemon_config() -> Result<DaemonConfig, String> {
     let mut cli_upstream_rpc: Option<String> = None;
     let mut cli_rpc_bind: Option<String> = None;
+    let mut cli_rpc_auth_token: Option<String> = None;
+    let mut cli_allow_public_rpc_bind = false;
     let mut cli_chain_id: Option<ChainId> = None;
     let mut cli_poll_ms: Option<u64> = None;
     let mut cli_replay_window: Option<u64> = None;
@@ -360,6 +416,15 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
                     args.next()
                         .ok_or_else(|| "--rpc-bind requires a value".to_string())?,
                 );
+            }
+            "--rpc-auth-token" => {
+                cli_rpc_auth_token = Some(
+                    args.next()
+                        .ok_or_else(|| "--rpc-auth-token requires a value".to_string())?,
+                );
+            }
+            "--allow-public-rpc-bind" => {
+                cli_allow_public_rpc_bind = true;
             }
             "--chain-id" => {
                 let raw = args
@@ -475,6 +540,12 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         }
     };
 
+    let allow_public_rpc_bind = if cli_allow_public_rpc_bind {
+        true
+    } else {
+        parse_env_bool("PASTIS_ALLOW_PUBLIC_RPC_BIND")?.unwrap_or(false)
+    };
+
     let mut bootnodes = cli_bootnodes;
     if let Ok(raw_bootnodes) = env::var("PASTIS_BOOTNODES") {
         for entry in raw_bootnodes.split(',') {
@@ -541,11 +612,22 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         parse_env_bool("PASTIS_EXIT_ON_UNHEALTHY")?.unwrap_or(false)
     };
 
+    let rpc_auth_token = match cli_rpc_auth_token.or_else(|| env::var("PASTIS_RPC_AUTH_TOKEN").ok())
+    {
+        Some(raw) => Some(validate_rpc_auth_token(raw)?),
+        None => None,
+    };
+
+    let rpc_bind = cli_rpc_bind
+        .or_else(|| env::var("PASTIS_NODE_RPC_BIND").ok())
+        .unwrap_or_else(|| DEFAULT_RPC_BIND.to_string());
+    validate_rpc_bind_exposure(&rpc_bind, rpc_auth_token.as_deref(), allow_public_rpc_bind)?;
+
     Ok(DaemonConfig {
         upstream_rpc_url,
-        rpc_bind: cli_rpc_bind
-            .or_else(|| env::var("PASTIS_NODE_RPC_BIND").ok())
-            .unwrap_or_else(|| DEFAULT_RPC_BIND.to_string()),
+        rpc_bind,
+        rpc_auth_token,
+        allow_public_rpc_bind,
         chain_id,
         poll_ms,
         replay_window,
@@ -632,6 +714,46 @@ fn parse_positive_usize(raw: &str, field: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
+fn validate_rpc_auth_token(raw: String) -> Result<String, String> {
+    if raw.is_empty() {
+        return Err("invalid RPC auth token: token must not be empty".to_string());
+    }
+    if raw.len() > MAX_RPC_AUTH_TOKEN_BYTES {
+        return Err(format!(
+            "invalid RPC auth token: exceeds max {} bytes",
+            MAX_RPC_AUTH_TOKEN_BYTES
+        ));
+    }
+    if raw.chars().any(char::is_whitespace) {
+        return Err(
+            "invalid RPC auth token: token must not contain whitespace characters".to_string(),
+        );
+    }
+    Ok(raw)
+}
+
+fn validate_rpc_bind_exposure(
+    rpc_bind: &str,
+    rpc_auth_token: Option<&str>,
+    allow_public_rpc_bind: bool,
+) -> Result<(), String> {
+    if allow_public_rpc_bind {
+        return Ok(());
+    }
+    let Ok(parsed) = rpc_bind.parse::<SocketAddr>() else {
+        return Ok(());
+    };
+    if parsed.ip().is_loopback() {
+        return Ok(());
+    }
+    if rpc_auth_token.is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing non-loopback rpc bind `{rpc_bind}` without auth token; set --rpc-auth-token/PASTIS_RPC_AUTH_TOKEN or --allow-public-rpc-bind/PASTIS_ALLOW_PUBLIC_RPC_BIND=true"
+    ))
+}
+
 fn redact_rpc_url(raw: &str) -> String {
     match reqwest::Url::parse(raw) {
         Ok(url) => {
@@ -709,6 +831,8 @@ fn help_text() -> String {
         "usage: starknet-node --upstream-rpc-url <url> [options]\n\
 options:\n\
   --rpc-bind <addr>                  JSON-RPC bind address (default: {DEFAULT_RPC_BIND})\n\
+  --rpc-auth-token <token>           Require bearer token for POST / JSON-RPC\n\
+  --allow-public-rpc-bind            Allow non-loopback bind without auth token (unsafe)\n\
   --chain-id <id>                    Chain id (default: SN_MAIN)\n\
   --poll-ms <ms>                     Sync poll interval in milliseconds\n\
   --replay-window <blocks>           Replay window size\n\
@@ -727,6 +851,8 @@ options:\n\
 environment:\n\
   STARKNET_RPC_URL                   Upstream Starknet RPC URL\n\
   PASTIS_NODE_RPC_BIND               Local JSON-RPC bind\n\
+  PASTIS_RPC_AUTH_TOKEN              Bearer token required for POST / JSON-RPC\n\
+  PASTIS_ALLOW_PUBLIC_RPC_BIND       Allow non-loopback RPC bind without token (true/false)\n\
   PASTIS_CHAIN_ID                    Node chain id\n\
   PASTIS_NODE_POLL_MS                Sync poll interval\n\
   PASTIS_REPLAY_WINDOW               Replay window\n\
@@ -750,6 +876,7 @@ environment:\n\
 #[cfg(test)]
 mod tests {
     use axum::body::to_bytes;
+    use axum::http::HeaderValue;
     use serde_json::Value;
     use tokio::sync::Semaphore;
 
@@ -844,6 +971,32 @@ mod tests {
     }
 
     #[test]
+    fn validate_rpc_auth_token_rejects_whitespace() {
+        let err =
+            validate_rpc_auth_token("abc def".to_string()).expect_err("whitespace token must fail");
+        assert!(err.contains("whitespace"));
+    }
+
+    #[test]
+    fn validate_rpc_bind_exposure_rejects_public_bind_without_auth() {
+        let err = validate_rpc_bind_exposure("0.0.0.0:9545", None, false)
+            .expect_err("public bind without auth should fail");
+        assert!(err.contains("refusing non-loopback"));
+    }
+
+    #[test]
+    fn validate_rpc_bind_exposure_allows_public_bind_with_auth() {
+        validate_rpc_bind_exposure("0.0.0.0:9545", Some("token"), false)
+            .expect("auth token should allow public bind");
+    }
+
+    #[test]
+    fn validate_rpc_bind_exposure_allows_loopback_without_auth() {
+        validate_rpc_bind_exposure("127.0.0.1:9545", None, false)
+            .expect("loopback bind should be allowed");
+    }
+
+    #[test]
     fn unhealthy_exit_reason_is_none_when_exit_disabled() {
         let mut progress = base_progress();
         progress.current_block = 1;
@@ -875,6 +1028,7 @@ mod tests {
         let state = RpcAppState {
             storage,
             chain_id: "SN_MAIN".to_string(),
+            rpc_auth_token: None,
             sync_progress: Arc::new(Mutex::new(base_progress())),
             health_policy: HealthPolicy {
                 max_consecutive_failures: 3,
@@ -890,6 +1044,7 @@ mod tests {
             .expect("should reserve the only slot");
         let response = handle_rpc(
             State(state),
+            HeaderMap::new(),
             r#"{"jsonrpc":"2.0","id":1,"method":"starknet_blockNumber","params":[]}"#.to_string(),
         )
         .await
@@ -903,6 +1058,7 @@ mod tests {
         let state = RpcAppState {
             storage,
             chain_id: "SN_MAIN".to_string(),
+            rpc_auth_token: None,
             sync_progress: Arc::new(Mutex::new(base_progress())),
             health_policy: HealthPolicy {
                 max_consecutive_failures: 3,
@@ -913,6 +1069,7 @@ mod tests {
 
         let response = handle_rpc(
             State(state),
+            HeaderMap::new(),
             r#"{"jsonrpc":"2.0","id":7,"method":"starknet_blockNumber","params":[]}"#.to_string(),
         )
         .await
@@ -924,5 +1081,60 @@ mod tests {
         let payload: Value =
             serde_json::from_slice(&bytes).expect("response body should be valid JSON");
         assert_eq!(payload["result"], serde_json::json!(0));
+    }
+
+    #[tokio::test]
+    async fn handle_rpc_rejects_missing_bearer_token_when_required() {
+        let storage = ThreadSafeStorage::new(InMemoryStorage::new(InMemoryState::default()));
+        let state = RpcAppState {
+            storage,
+            chain_id: "SN_MAIN".to_string(),
+            rpc_auth_token: Some("supersecret".to_string()),
+            sync_progress: Arc::new(Mutex::new(base_progress())),
+            health_policy: HealthPolicy {
+                max_consecutive_failures: 3,
+                max_sync_lag: 64,
+            },
+            rpc_slots: Arc::new(Semaphore::new(1)),
+        };
+
+        let response = handle_rpc(
+            State(state),
+            HeaderMap::new(),
+            r#"{"jsonrpc":"2.0","id":99,"method":"starknet_blockNumber","params":[]}"#.to_string(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn handle_rpc_accepts_valid_bearer_token_when_required() {
+        let storage = ThreadSafeStorage::new(InMemoryStorage::new(InMemoryState::default()));
+        let state = RpcAppState {
+            storage,
+            chain_id: "SN_MAIN".to_string(),
+            rpc_auth_token: Some("supersecret".to_string()),
+            sync_progress: Arc::new(Mutex::new(base_progress())),
+            health_policy: HealthPolicy {
+                max_consecutive_failures: 3,
+                max_sync_lag: 64,
+            },
+            rpc_slots: Arc::new(Semaphore::new(1)),
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer supersecret"),
+        );
+        let response = handle_rpc(
+            State(state),
+            headers,
+            r#"{"jsonrpc":"2.0","id":100,"method":"starknet_blockNumber","params":[]}"#.to_string(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
