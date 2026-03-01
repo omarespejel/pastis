@@ -1175,9 +1175,11 @@ mod tests {
             },
             ..Default::default()
         };
-        let tx =
-            StarknetTransaction::try_with_executable("0xabc", ExecutableTx::L1Handler(executable))
-                .expect("matching hashes");
+        let tx = StarknetTransaction::try_with_executable(
+            parsed_tx_hash("0xabc"),
+            ExecutableTx::L1Handler(executable),
+        )
+        .expect("matching hashes");
         assert_eq!(tx.hash, parsed_tx_hash("0xabc"));
     }
 
@@ -1194,9 +1196,11 @@ mod tests {
             },
             ..Default::default()
         };
-        let err =
-            StarknetTransaction::try_with_executable("0xdef", ExecutableTx::L1Handler(executable))
-                .expect_err("must reject mismatched hash");
+        let err = StarknetTransaction::try_with_executable(
+            parsed_tx_hash("0xdef"),
+            ExecutableTx::L1Handler(executable),
+        )
+        .expect_err("must reject mismatched hash");
         assert!(matches!(
             err,
             TransactionValidationError::HashMismatch { .. }
