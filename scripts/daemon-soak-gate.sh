@@ -9,12 +9,14 @@ Runs a long-lived real-data daemon soak with pass/fail gates.
 
 Options:
   --rpc-url <url>                  Upstream Starknet RPC URL (or STARKNET_RPC_URL)
+  --chain-id <id>                  Override daemon chain id (e.g. SN_MAIN, SN_SEPOLIA, SN_FOO)
   --duration-minutes <n>           Soak duration in minutes (default: 60)
   --poll-seconds <n>               Poll interval for health/status checks (default: 15)
   --startup-timeout-seconds <n>    Max wait for daemon endpoint startup (default: 900)
   --daemon-bind <host:port>        Daemon bind address (default: 127.0.0.1:9545)
   --auth-token <token>             Daemon bearer token (auto-generated on loopback binds)
   --state-dir <path>               State directory (default: .pastis/soak-daemon)
+  --allow-http-upstream            Allow plain HTTP upstream RPC URL (disabled by default)
   --allow-private-rpc-url          Allow private/localhost upstream RPC hosts
   --allow-synthetic-fallback       Explicitly allow synthetic fallback (default: disabled)
   --clean-start                    Remove prior state/checkpoints before run (default: enabled)
@@ -23,12 +25,14 @@ Options:
 
 Environment overrides:
   STARKNET_RPC_URL
+  PASTIS_SOAK_CHAIN_ID
   PASTIS_SOAK_DURATION_MINUTES
   PASTIS_SOAK_POLL_SECONDS
   PASTIS_SOAK_STARTUP_TIMEOUT_SECONDS
   PASTIS_SOAK_DAEMON_BIND
   PASTIS_SOAK_AUTH_TOKEN
   PASTIS_SOAK_STATE_DIR
+  PASTIS_SOAK_ALLOW_HTTP_UPSTREAM (true/false)
   PASTIS_SOAK_ALLOW_PRIVATE_RPC_URL (true/false)
   PASTIS_SOAK_ALLOW_UNSAFE_STATE_DIR (true/false)
   PASTIS_SOAK_ALLOW_SYNTHETIC_FALLBACK (true/false)
@@ -87,7 +91,21 @@ iso8601_utc_from_epoch() {
   printf '<invalid-timestamp>'
 }
 
-normalize_state_dir() {
+resolve_existing_path() {
+  local raw="$1"
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "$raw"
+    return 0
+  fi
+  if command -v readlink >/dev/null 2>&1; then
+    readlink -f "$raw"
+    return 0
+  fi
+  echo "error: either realpath or readlink is required for secure path resolution" >&2
+  exit 1
+}
+
+canonicalize_candidate_path() {
   local raw="$1"
   local normalized="$raw"
   if [[ "$normalized" == "~/"* ]]; then
@@ -96,14 +114,84 @@ normalize_state_dir() {
   if [[ "$normalized" != /* ]]; then
     normalized="${ROOT_DIR}/${normalized}"
   fi
-  printf '%s' "$normalized"
+  local parent
+  parent="$(dirname "$normalized")"
+  local parent_resolved
+  parent_resolved="$(resolve_existing_path "$parent")"
+  printf '%s/%s' "$parent_resolved" "$(basename "$normalized")"
+}
+
+enforce_state_dir_policy() {
+  local state_dir="$1"
+  local root_dir="$2"
+  local tmp_dir="$3"
+  local allow_unsafe="$4"
+  if [[ "$allow_unsafe" == "1" ]]; then
+    return 0
+  fi
+  case "$state_dir" in
+    "$root_dir"/*|"$tmp_dir"/*) ;;
+    *)
+      echo "error: state-dir '$state_dir' is blocked by default; use a path under '$root_dir' or '$tmp_dir', or set PASTIS_SOAK_ALLOW_UNSAFE_STATE_DIR=true to override" >&2
+      exit 1
+      ;;
+  esac
+}
+
+extract_bind_host() {
+  local bind="$1"
+  local host="$bind"
+  if [[ "$host" =~ ^\[([^]]+)\](:[0-9]+)?$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ "$host" =~ ^([^:]+):[0-9]+$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  printf '%s' "$host"
+}
+
+extract_url_host() {
+  local raw="$1"
+  local lowered
+  lowered="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+  local rest="${lowered#*://}"
+  rest="${rest%%/*}"
+  rest="${rest##*@}"
+  if [[ "$rest" =~ ^\[([^]]+)\](:[0-9]+)?$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  printf '%s' "${rest%%:*}"
+}
+
+validate_chain_id_literal() {
+  local raw="$1"
+  if [[ ! "$raw" =~ ^SN_[A-Z0-9_]+$ ]]; then
+    echo "error: invalid chain id '$raw'; expected format SN_[A-Z0-9_]+" >&2
+    exit 1
+  fi
+}
+
+validate_bearer_token() {
+  local token="$1"
+  if [[ -z "$token" ]]; then
+    echo "error: bearer token must not be empty" >&2
+    exit 1
+  fi
+  if [[ "$token" =~ [[:space:][:cntrl:]] ]]; then
+    echo "error: bearer token must not contain whitespace/control characters" >&2
+    exit 1
+  fi
 }
 
 is_loopback_bind() {
   local bind="$1"
-  local host="${bind%%:*}"
+  local host
+  host="$(extract_bind_host "$bind")"
   case "$host" in
-    127.0.0.1|localhost|[::1]) return 0 ;;
+    127.0.0.1|localhost|::1) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -119,19 +207,28 @@ generate_token() {
 validate_upstream_rpc_url() {
   local raw="$1"
   local allow_private="$2"
+  local allow_http="$3"
   local lowered
   lowered="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
-  if [[ ! "$lowered" =~ ^https?:// ]]; then
-    echo "error: upstream RPC URL must use http/https: $raw" >&2
+  if [[ "$lowered" =~ ^https:// ]]; then
+    :
+  elif [[ "$lowered" =~ ^http:// ]]; then
+    if [[ "$allow_http" != "1" ]]; then
+      echo "error: upstream RPC URL must use https:// by default; pass --allow-http-upstream or set PASTIS_SOAK_ALLOW_HTTP_UPSTREAM=true to allow http:// for non-production testing" >&2
+      exit 1
+    fi
+  else
+    echo "error: upstream RPC URL must use http/https: $(redact_url "$raw")" >&2
     exit 1
   fi
-  if [[ ! "$lowered" =~ ^https?://([^/:?#]+) ]]; then
-    echo "error: upstream RPC URL host is invalid: $raw" >&2
+  local host
+  host="$(extract_url_host "$raw")"
+  if [[ -z "$host" ]]; then
+    echo "error: upstream RPC URL host is invalid: $(redact_url "$raw")" >&2
     exit 1
   fi
-  local host="${BASH_REMATCH[1]}"
   case "$host" in
-    localhost|127.*|0.0.0.0|[::1]|::1|169.254.169.254)
+    localhost|127.*|0.0.0.0|::1|169.254.169.254)
       if [[ "$allow_private" != "1" ]]; then
         echo "error: upstream RPC URL host '$host' is blocked by default; pass --allow-private-rpc-url to override" >&2
         exit 1
@@ -165,7 +262,7 @@ discover_chain_id() {
   if [[ -z "$result" ]]; then
     local err
     err="$(printf '%s' "$response" | jq -c '.error // "unknown error"')"
-    echo "error: failed to query upstream chain id from $upstream: $err" >&2
+    echo "error: failed to query upstream chain id from $(redact_url "$upstream"): $err" >&2
     exit 1
   fi
   printf '%s' "$result"
@@ -173,14 +270,21 @@ discover_chain_id() {
 
 normalize_chain_id() {
   local raw="$1"
+  local override="${2:-}"
   local upper
   upper="$(printf '%s' "$raw" | tr '[:lower:]' '[:upper:]')"
   case "$upper" in
     SN_MAIN|0X534E5F4D41494E) printf 'SN_MAIN' ;;
     SN_SEPOLIA|0X534E5F5345504F4C4941) printf 'SN_SEPOLIA' ;;
+    SN_[A-Z0-9_]*) printf '%s' "$upper" ;;
     *)
-      echo "error: unsupported upstream chain id '$raw'; set PASTIS_SOAK_CHAIN_ID explicitly if needed" >&2
-      exit 1
+      if [[ -n "$override" ]]; then
+        validate_chain_id_literal "$override"
+        printf '%s' "$override"
+      else
+        echo "error: unsupported upstream chain id '$raw'; pass --chain-id or set PASTIS_SOAK_CHAIN_ID explicitly" >&2
+        exit 1
+      fi
       ;;
   esac
 }
@@ -201,12 +305,14 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 UPSTREAM_RPC_URL="${STARKNET_RPC_URL:-}"
+CHAIN_ID_OVERRIDE="${PASTIS_SOAK_CHAIN_ID:-}"
 DURATION_MINUTES="${PASTIS_SOAK_DURATION_MINUTES:-60}"
 POLL_SECONDS="${PASTIS_SOAK_POLL_SECONDS:-15}"
 STARTUP_TIMEOUT_SECONDS="${PASTIS_SOAK_STARTUP_TIMEOUT_SECONDS:-900}"
 DAEMON_BIND="${PASTIS_SOAK_DAEMON_BIND:-127.0.0.1:9545}"
 DAEMON_TOKEN="${PASTIS_SOAK_AUTH_TOKEN:-}"
 STATE_DIR="${PASTIS_SOAK_STATE_DIR:-${ROOT_DIR}/.pastis/soak-daemon}"
+ALLOW_HTTP_UPSTREAM="$(parse_bool "${PASTIS_SOAK_ALLOW_HTTP_UPSTREAM:-false}")"
 ALLOW_PRIVATE_RPC_URL="$(parse_bool "${PASTIS_SOAK_ALLOW_PRIVATE_RPC_URL:-false}")"
 ALLOW_UNSAFE_STATE_DIR="$(parse_bool "${PASTIS_SOAK_ALLOW_UNSAFE_STATE_DIR:-false}")"
 ALLOW_SYNTHETIC_FALLBACK="$(parse_bool "${PASTIS_SOAK_ALLOW_SYNTHETIC_FALLBACK:-false}")"
@@ -217,6 +323,11 @@ while [[ $# -gt 0 ]]; do
     --rpc-url)
       [[ $# -ge 2 ]] || { echo "--rpc-url requires a value" >&2; exit 1; }
       UPSTREAM_RPC_URL="$2"
+      shift 2
+      ;;
+    --chain-id)
+      [[ $# -ge 2 ]] || { echo "--chain-id requires a value" >&2; exit 1; }
+      CHAIN_ID_OVERRIDE="$2"
       shift 2
       ;;
     --duration-minutes)
@@ -248,6 +359,10 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { echo "--state-dir requires a value" >&2; exit 1; }
       STATE_DIR="$2"
       shift 2
+      ;;
+    --allow-http-upstream)
+      ALLOW_HTTP_UPSTREAM=1
+      shift
       ;;
     --allow-private-rpc-url)
       ALLOW_PRIVATE_RPC_URL=1
@@ -281,7 +396,10 @@ if [[ -z "$UPSTREAM_RPC_URL" ]]; then
   echo "error: missing upstream RPC URL; pass --rpc-url or set STARKNET_RPC_URL" >&2
   exit 1
 fi
-validate_upstream_rpc_url "$UPSTREAM_RPC_URL" "$ALLOW_PRIVATE_RPC_URL"
+if [[ -n "$CHAIN_ID_OVERRIDE" ]]; then
+  validate_chain_id_literal "$CHAIN_ID_OVERRIDE"
+fi
+validate_upstream_rpc_url "$UPSTREAM_RPC_URL" "$ALLOW_PRIVATE_RPC_URL" "$ALLOW_HTTP_UPSTREAM"
 if [[ ! "$DURATION_MINUTES" =~ ^[0-9]+$ ]] || [[ "$DURATION_MINUTES" -eq 0 ]]; then
   echo "error: --duration-minutes must be a positive integer" >&2
   exit 1
@@ -295,16 +413,10 @@ if [[ ! "$STARTUP_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || [[ "$STARTUP_TIMEOUT_SECOND
   exit 1
 fi
 
-STATE_DIR="$(normalize_state_dir "$STATE_DIR")"
-if [[ "$ALLOW_UNSAFE_STATE_DIR" != "1" ]]; then
-  case "$STATE_DIR" in
-    "$ROOT_DIR"/*|/tmp/*) ;;
-    *)
-      echo "error: state-dir '$STATE_DIR' is blocked by default; use a path under '$ROOT_DIR' or '/tmp', or set PASTIS_SOAK_ALLOW_UNSAFE_STATE_DIR=true to override" >&2
-      exit 1
-      ;;
-  esac
-fi
+CANONICAL_ROOT_DIR="$(resolve_existing_path "$ROOT_DIR")"
+CANONICAL_TMP_DIR="$(resolve_existing_path "/tmp")"
+STATE_DIR="$(canonicalize_candidate_path "$STATE_DIR")"
+enforce_state_dir_policy "$STATE_DIR" "$CANONICAL_ROOT_DIR" "$CANONICAL_TMP_DIR" "$ALLOW_UNSAFE_STATE_DIR"
 if [[ -z "$DAEMON_TOKEN" ]]; then
   if is_loopback_bind "$DAEMON_BIND"; then
     DAEMON_TOKEN="$(generate_token)"
@@ -313,8 +425,11 @@ if [[ -z "$DAEMON_TOKEN" ]]; then
     exit 1
   fi
 fi
+validate_bearer_token "$DAEMON_TOKEN"
 
 mkdir -p "$STATE_DIR"
+STATE_DIR="$(resolve_existing_path "$STATE_DIR")"
+enforce_state_dir_policy "$STATE_DIR" "$CANONICAL_ROOT_DIR" "$CANONICAL_TMP_DIR" "$ALLOW_UNSAFE_STATE_DIR"
 CHECKPOINT_PATH="$STATE_DIR/replay-checkpoint.json"
 JOURNAL_PATH="$STATE_DIR/local-journal.jsonl"
 SNAPSHOT_PATH="$STATE_DIR/storage.snapshot"
@@ -328,7 +443,7 @@ if [[ "$CLEAN_START" == "1" ]]; then
 fi
 
 CHAIN_ID_RAW="$(discover_chain_id "$UPSTREAM_RPC_URL")"
-CHAIN_ID="$(normalize_chain_id "$CHAIN_ID_RAW")"
+CHAIN_ID="$(normalize_chain_id "$CHAIN_ID_RAW" "$CHAIN_ID_OVERRIDE")"
 
 echo "starting daemon soak gate"
 echo "upstream_rpc_url: $(redact_url "$UPSTREAM_RPC_URL")"
@@ -369,7 +484,8 @@ cleanup() {
 trap cleanup EXIT
 
 # Wait for endpoint reachability.
-for _ in $(seq 1 "$STARTUP_TIMEOUT_SECONDS"); do
+startup_attempt=0
+while (( startup_attempt < STARTUP_TIMEOUT_SECONDS )); do
   if [[ "$(http_code "http://$DAEMON_BIND/healthz")" != "000" ]]; then
     break
   fi
@@ -378,6 +494,7 @@ for _ in $(seq 1 "$STARTUP_TIMEOUT_SECONDS"); do
     tail -n 120 "$LOG_PATH" >&2 || true
     exit 1
   fi
+  startup_attempt=$((startup_attempt + 1))
   sleep 1
 done
 
@@ -491,6 +608,10 @@ fi
 if [[ "$health_failures" -gt 0 ]]; then
   pass=0
   reasons+=("healthz_non_200_observed")
+fi
+if [[ "$ready_failures" -gt 0 ]]; then
+  pass=0
+  reasons+=("readyz_non_200_observed")
 fi
 if [[ "$status_failures" -gt 0 ]]; then
   pass=0

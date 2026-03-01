@@ -61,6 +61,6 @@ For production validation, do **not** enable this override.
 ## 6. Suggested Cloud Procedure
 
 1. Run a short smoke soak (15-30 min) to validate host/network.
-2. Run 6h soak and review `soak-report.json`.
-3. Run 24h soak as funding-grade evidence.
+2. Execute a 6h soak and review `soak-report.json`.
+3. Conduct a 24h soak as funding-grade evidence.
 4. Attach report + timeline + daemon log to decision docs.
