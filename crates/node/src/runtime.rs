@@ -49,6 +49,7 @@ const MAX_RECENT_ERRORS: usize = 128;
 const MAX_RPC_ERROR_CONTEXT_CHARS: usize = 1_024;
 const MAX_RUNTIME_ERROR_CHARS: usize = 2_048;
 const UPSTREAM_REQUEST_ID: u64 = 1;
+const UPSTREAM_BATCH_REQUEST_ID_BASE: u64 = 10_000;
 const RUNTIME_STORAGE_SNAPSHOT_VERSION: u32 = 1;
 pub const DEFAULT_STORAGE_SNAPSHOT_INTERVAL_BLOCKS: u64 = 128;
 static RUNTIME_STORAGE_SNAPSHOT_TMP_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -1328,6 +1329,18 @@ struct UpstreamRpcClient {
     rpc_url: String,
 }
 
+#[derive(Debug, Clone)]
+struct UpstreamBatchCall {
+    method: &'static str,
+    params: Value,
+}
+
+#[derive(Debug)]
+enum UpstreamBatchCallError {
+    Unsupported(String),
+    Failed(String),
+}
+
 impl UpstreamRpcClient {
     fn new(rpc_url: String, timeout: Duration) -> Result<Self, String> {
         let http = reqwest::Client::builder()
@@ -1356,13 +1369,7 @@ impl UpstreamRpcClient {
         let block_selector = json!([{ "block_number": block_number }]);
 
         let (block_with_txs, tx_count_raw, block_with_hashes, block_with_receipts, state_update) =
-            tokio::try_join!(
-                self.call("starknet_getBlockWithTxs", block_selector.clone()),
-                self.call("starknet_getBlockTransactionCount", block_selector.clone()),
-                self.call("starknet_getBlockWithTxHashes", block_selector.clone()),
-                self.call("starknet_getBlockWithReceipts", block_selector.clone()),
-                self.call("starknet_getStateUpdate", block_selector),
-            )?;
+            self.fetch_block_payloads(block_selector).await?;
 
         let mut warnings = Vec::new();
         let replay = parse_block_with_txs(&block_with_txs, &mut warnings)?;
@@ -1432,6 +1439,150 @@ impl UpstreamRpcClient {
             state_root,
             receipts: receipts_view.receipts,
         })
+    }
+
+    async fn fetch_block_payloads(
+        &self,
+        block_selector: Value,
+    ) -> Result<(Value, Value, Value, Value, Value), String> {
+        let calls = vec![
+            UpstreamBatchCall {
+                method: "starknet_getBlockWithTxs",
+                params: block_selector.clone(),
+            },
+            UpstreamBatchCall {
+                method: "starknet_getBlockTransactionCount",
+                params: block_selector.clone(),
+            },
+            UpstreamBatchCall {
+                method: "starknet_getBlockWithTxHashes",
+                params: block_selector.clone(),
+            },
+            UpstreamBatchCall {
+                method: "starknet_getBlockWithReceipts",
+                params: block_selector.clone(),
+            },
+            UpstreamBatchCall {
+                method: "starknet_getStateUpdate",
+                params: block_selector.clone(),
+            },
+        ];
+
+        let payloads = match self.call_batch(&calls).await {
+            Ok(payloads) => payloads,
+            Err(UpstreamBatchCallError::Unsupported(reason)) => {
+                tokio::try_join!(
+                    self.call("starknet_getBlockWithTxs", block_selector.clone()),
+                    self.call("starknet_getBlockTransactionCount", block_selector.clone()),
+                    self.call("starknet_getBlockWithTxHashes", block_selector.clone()),
+                    self.call("starknet_getBlockWithReceipts", block_selector.clone()),
+                    self.call("starknet_getStateUpdate", block_selector),
+                )
+                .map(|(
+                    block_with_txs,
+                    tx_count_raw,
+                    block_with_hashes,
+                    block_with_receipts,
+                    state_update,
+                )| {
+                    vec![
+                        block_with_txs,
+                        tx_count_raw,
+                        block_with_hashes,
+                        block_with_receipts,
+                        state_update,
+                    ]
+                })
+                .map_err(|error| {
+                    format!(
+                        "RPC batch fallback failed after incompatible batch response ({reason}): {error}"
+                    )
+                })?
+            }
+            Err(UpstreamBatchCallError::Failed(error)) => return Err(error),
+        };
+
+        let mut payload_iter = payloads.into_iter();
+        let block_with_txs = payload_iter
+            .next()
+            .ok_or_else(|| "RPC block fetch missing getBlockWithTxs payload".to_string())?;
+        let tx_count_raw = payload_iter.next().ok_or_else(|| {
+            "RPC block fetch missing getBlockTransactionCount payload".to_string()
+        })?;
+        let block_with_hashes = payload_iter
+            .next()
+            .ok_or_else(|| "RPC block fetch missing getBlockWithTxHashes payload".to_string())?;
+        let block_with_receipts = payload_iter
+            .next()
+            .ok_or_else(|| "RPC block fetch missing getBlockWithReceipts payload".to_string())?;
+        let state_update = payload_iter
+            .next()
+            .ok_or_else(|| "RPC block fetch missing getStateUpdate payload".to_string())?;
+        if payload_iter.next().is_some() {
+            return Err("RPC block fetch returned unexpected extra payloads".to_string());
+        }
+        Ok((
+            block_with_txs,
+            tx_count_raw,
+            block_with_hashes,
+            block_with_receipts,
+            state_update,
+        ))
+    }
+
+    async fn call_batch(
+        &self,
+        calls: &[UpstreamBatchCall],
+    ) -> Result<Vec<Value>, UpstreamBatchCallError> {
+        if calls.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut request = Vec::with_capacity(calls.len());
+        let mut expected = Vec::with_capacity(calls.len());
+        for (index, call) in calls.iter().enumerate() {
+            let id = UPSTREAM_BATCH_REQUEST_ID_BASE + index as u64;
+            request.push(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": call.method,
+                "params": call.params.clone(),
+            }));
+            expected.push((id, call.method));
+        }
+
+        let mut response = self
+            .http
+            .post(&self.rpc_url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|error| {
+                let error = redact_upstream_url(error.to_string(), &self.rpc_url);
+                UpstreamBatchCallError::Failed(format!(
+                    "RPC batch request failed: {}",
+                    sanitize_error_message(&error, MAX_RPC_ERROR_CONTEXT_CHARS)
+                ))
+            })?;
+        let http_status = response.status();
+        let content_length = response.content_length();
+        let body = read_json_body_with_limit(
+            &mut response,
+            content_length,
+            MAX_UPSTREAM_RPC_RESPONSE_BYTES,
+            "batch",
+        )
+        .await
+        .map_err(UpstreamBatchCallError::Failed)?;
+
+        if !http_status.is_success() {
+            let body_summary = summarize_json_for_error(&body);
+            return Err(UpstreamBatchCallError::Failed(format!(
+                "RPC batch request returned HTTP {} with body {}",
+                http_status, body_summary
+            )));
+        }
+        parse_rpc_batch_results(body, &expected)
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -1561,6 +1712,97 @@ fn parse_rpc_result(body: Value, method: &str, expected_id: u64) -> Result<Value
     result_payload
         .cloned()
         .ok_or_else(|| format!("RPC {method} response missing `result`: {body_summary}"))
+}
+
+fn parse_rpc_batch_results(
+    body: Value,
+    expected: &[(u64, &'static str)],
+) -> Result<Vec<Value>, UpstreamBatchCallError> {
+    if looks_like_batch_unsupported_payload(&body) {
+        return Err(UpstreamBatchCallError::Unsupported(format!(
+            "upstream rejected batch request: {}",
+            summarize_json_for_error(&body)
+        )));
+    }
+
+    let responses = body.as_array().ok_or_else(|| {
+        UpstreamBatchCallError::Failed(format!(
+            "RPC batch response must be an array: {}",
+            summarize_json_for_error(&body)
+        ))
+    })?;
+    if responses.len() != expected.len() {
+        return Err(UpstreamBatchCallError::Failed(format!(
+            "RPC batch response expected {} items, got {}: {}",
+            expected.len(),
+            responses.len(),
+            summarize_json_for_error(&body)
+        )));
+    }
+
+    let expected_by_id: BTreeMap<u64, (usize, &'static str)> = expected
+        .iter()
+        .enumerate()
+        .map(|(index, (id, method))| (*id, (index, *method)))
+        .collect();
+    let mut ordered_results: Vec<Option<Value>> = vec![None; expected.len()];
+
+    for response in responses {
+        let id = response.get("id").and_then(Value::as_u64).ok_or_else(|| {
+            UpstreamBatchCallError::Failed(format!(
+                "RPC batch response item has invalid/missing id: {}",
+                summarize_json_for_error(response)
+            ))
+        })?;
+        let (index, method) = expected_by_id.get(&id).copied().ok_or_else(|| {
+            UpstreamBatchCallError::Failed(format!(
+                "RPC batch response has unexpected id {id}: {}",
+                summarize_json_for_error(response)
+            ))
+        })?;
+        if ordered_results[index].is_some() {
+            return Err(UpstreamBatchCallError::Failed(format!(
+                "RPC batch response contains duplicate id {id}: {}",
+                summarize_json_for_error(response)
+            )));
+        }
+        let result = parse_rpc_result(response.clone(), method, id)
+            .map_err(UpstreamBatchCallError::Failed)?;
+        ordered_results[index] = Some(result);
+    }
+
+    let mut out = Vec::with_capacity(expected.len());
+    for (index, maybe_result) in ordered_results.into_iter().enumerate() {
+        let result = maybe_result.ok_or_else(|| {
+            UpstreamBatchCallError::Failed(format!(
+                "RPC batch response missing payload for id {} ({})",
+                expected[index].0, expected[index].1
+            ))
+        })?;
+        out.push(result);
+    }
+    Ok(out)
+}
+
+fn looks_like_batch_unsupported_payload(body: &Value) -> bool {
+    let Some(object) = body.as_object() else {
+        return false;
+    };
+    let id_is_null_or_missing = match object.get("id") {
+        None => true,
+        Some(id) => id.is_null(),
+    };
+    if !id_is_null_or_missing {
+        return false;
+    }
+    let Some(code) = object
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_i64)
+    else {
+        return false;
+    };
+    matches!(code, -32700 | -32600)
 }
 
 fn summarize_json_for_error(body: &Value) -> String {
@@ -3614,6 +3856,76 @@ mod tests {
         assert!(error.contains("missing `jsonrpc`"));
         assert!(error.contains("<truncated>"));
         assert!(error.len() < MAX_RPC_ERROR_CONTEXT_CHARS + 256);
+    }
+
+    #[test]
+    fn parse_rpc_batch_results_preserves_request_order() {
+        let results = parse_rpc_batch_results(
+            json!([
+                {
+                    "jsonrpc": "2.0",
+                    "id": UPSTREAM_BATCH_REQUEST_ID_BASE + 1,
+                    "result": {"kind": "second"}
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": UPSTREAM_BATCH_REQUEST_ID_BASE,
+                    "result": {"kind": "first"}
+                }
+            ]),
+            &[
+                (UPSTREAM_BATCH_REQUEST_ID_BASE, "starknet_first"),
+                (UPSTREAM_BATCH_REQUEST_ID_BASE + 1, "starknet_second"),
+            ],
+        )
+        .expect("out-of-order batch response should still map by id");
+        assert_eq!(results[0], json!({"kind": "first"}));
+        assert_eq!(results[1], json!({"kind": "second"}));
+    }
+
+    #[test]
+    fn parse_rpc_batch_results_rejects_partial_response_sets() {
+        let error = parse_rpc_batch_results(
+            json!([{
+                "jsonrpc": "2.0",
+                "id": UPSTREAM_BATCH_REQUEST_ID_BASE,
+                "result": {"kind": "first"}
+            }]),
+            &[
+                (UPSTREAM_BATCH_REQUEST_ID_BASE, "starknet_first"),
+                (UPSTREAM_BATCH_REQUEST_ID_BASE + 1, "starknet_second"),
+            ],
+        )
+        .expect_err("partial batch responses must fail closed");
+        match error {
+            UpstreamBatchCallError::Failed(message) => {
+                assert!(message.contains("expected 2 items"));
+            }
+            UpstreamBatchCallError::Unsupported(message) => {
+                panic!("unexpected unsupported error variant: {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_rpc_batch_results_classifies_invalid_request_as_unsupported_batch() {
+        let error = parse_rpc_batch_results(
+            json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {"code": -32600, "message": "invalid request"}
+            }),
+            &[(UPSTREAM_BATCH_REQUEST_ID_BASE, "starknet_first")],
+        )
+        .expect_err("single invalid-request envelope should be treated as unsupported batch");
+        match error {
+            UpstreamBatchCallError::Unsupported(message) => {
+                assert!(message.contains("rejected batch request"));
+            }
+            UpstreamBatchCallError::Failed(message) => {
+                panic!("unexpected hard-failure error variant: {message}");
+            }
+        }
     }
 
     #[test]
