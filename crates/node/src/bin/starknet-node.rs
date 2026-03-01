@@ -49,6 +49,8 @@ const DEFAULT_HEALTH_MAX_SYNC_LAG_BLOCKS: u64 = 64;
 const DAEMON_GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
 const MAX_RPC_AUTH_TOKEN_BYTES: usize = 4 * 1024;
 const MAX_TRACKED_RPC_CLIENTS: usize = 10_000;
+const DEFAULT_PEER_HEALTH_HISTORY_CAPACITY: usize = 512;
+const DEFAULT_PEER_HEALTH_FLAP_WINDOW_SECS: u64 = 300;
 
 #[derive(Debug, Clone)]
 struct DaemonConfig {
@@ -75,6 +77,8 @@ struct DaemonConfig {
     bootnodes: Vec<String>,
     min_peers: u64,
     p2p_heartbeat_ms: u64,
+    peer_health_history_capacity: usize,
+    peer_health_flap_window_secs: u64,
     health_max_consecutive_failures: u64,
     health_max_sync_lag_blocks: u64,
     exit_on_unhealthy: bool,
@@ -88,6 +92,7 @@ struct RpcAppState {
     sync_progress: Arc<Mutex<SyncProgress>>,
     health_policy: HealthPolicy,
     min_peer_count: u64,
+    peer_health_tracker: Arc<Mutex<PeerHealthTracker>>,
     rpc_slots: Arc<Semaphore>,
     rpc_rate_limiter: Arc<Mutex<RpcRateLimiter>>,
     rpc_metrics: Arc<Mutex<RpcRuntimeMetrics>>,
@@ -104,6 +109,7 @@ struct StatusPayload {
     reorg_events: u64,
     consecutive_failures: u64,
     last_error: Option<String>,
+    peer_health: PeerHealthStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +117,40 @@ struct HealthPolicy {
     max_consecutive_failures: u64,
     max_sync_lag: u64,
     require_peers: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PeerHealthStatus {
+    healthy: bool,
+    last_peer_count: Option<u64>,
+    history_size: usize,
+    observations_total: u64,
+    healthy_observations_total: u64,
+    unhealthy_observations_total: u64,
+    flap_transitions_total: u64,
+    flap_transitions_recent: u64,
+    last_observed_at_unix_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct PeerHealthSample {
+    observed_at_unix_seconds: u64,
+    peer_count: u64,
+    healthy: bool,
+}
+
+#[derive(Debug)]
+struct PeerHealthTracker {
+    min_peer_count: u64,
+    history_capacity: usize,
+    flap_window_secs: u64,
+    samples: VecDeque<PeerHealthSample>,
+    observations_total: u64,
+    healthy_observations_total: u64,
+    unhealthy_observations_total: u64,
+    flap_transitions_total: u64,
+    flap_transition_timestamps: VecDeque<u64>,
+    last_health: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -226,6 +266,100 @@ impl BootnodeObservation {
     }
 }
 
+impl PeerHealthTracker {
+    fn new(min_peer_count: u64, history_capacity: usize, flap_window_secs: u64) -> Self {
+        Self {
+            min_peer_count,
+            history_capacity,
+            flap_window_secs,
+            samples: VecDeque::with_capacity(history_capacity),
+            observations_total: 0,
+            healthy_observations_total: 0,
+            unhealthy_observations_total: 0,
+            flap_transitions_total: 0,
+            flap_transition_timestamps: VecDeque::new(),
+            last_health: None,
+        }
+    }
+
+    fn record(&mut self, peer_count: u64, observed_at_unix_seconds: u64) {
+        let healthy = peer_meets_minimum(peer_count, self.min_peer_count);
+        self.observations_total = self.observations_total.saturating_add(1);
+        if healthy {
+            self.healthy_observations_total = self.healthy_observations_total.saturating_add(1);
+        } else {
+            self.unhealthy_observations_total = self.unhealthy_observations_total.saturating_add(1);
+        }
+
+        if let Some(last_health) = self.last_health
+            && last_health != healthy
+        {
+            self.flap_transitions_total = self.flap_transitions_total.saturating_add(1);
+            self.flap_transition_timestamps
+                .push_back(observed_at_unix_seconds);
+        }
+        self.last_health = Some(healthy);
+
+        self.samples.push_back(PeerHealthSample {
+            observed_at_unix_seconds,
+            peer_count,
+            healthy,
+        });
+        while self.samples.len() > self.history_capacity {
+            self.samples.pop_front();
+        }
+        self.prune_flap_transitions(observed_at_unix_seconds);
+    }
+
+    fn snapshot(&self, now_unix_seconds: u64) -> PeerHealthStatus {
+        let flap_transitions_recent = self
+            .flap_transition_timestamps
+            .iter()
+            .filter(|ts| now_unix_seconds.saturating_sub(**ts) <= self.flap_window_secs)
+            .count() as u64;
+        let (healthy, last_observed_at_unix_seconds, last_peer_count) = self
+            .samples
+            .back()
+            .map(|sample| {
+                (
+                    sample.healthy,
+                    Some(sample.observed_at_unix_seconds),
+                    Some(sample.peer_count),
+                )
+            })
+            .unwrap_or((peer_meets_minimum(0, self.min_peer_count), None, None));
+
+        PeerHealthStatus {
+            healthy,
+            last_peer_count,
+            history_size: self.samples.len(),
+            observations_total: self.observations_total,
+            healthy_observations_total: self.healthy_observations_total,
+            unhealthy_observations_total: self.unhealthy_observations_total,
+            flap_transitions_total: self.flap_transitions_total,
+            flap_transitions_recent,
+            last_observed_at_unix_seconds,
+        }
+    }
+
+    fn prune_flap_transitions(&mut self, now_unix_seconds: u64) {
+        while let Some(ts) = self.flap_transition_timestamps.front() {
+            if now_unix_seconds.saturating_sub(*ts) <= self.flap_window_secs {
+                break;
+            }
+            self.flap_transition_timestamps.pop_front();
+        }
+    }
+}
+
+fn peer_meets_minimum(peer_count: u64, min_peer_count: u64) -> bool {
+    if min_peer_count == 0 {
+        true
+    } else {
+        peer_count >= min_peer_count
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let config = parse_daemon_config()?;
@@ -267,6 +401,14 @@ async fn main() -> Result<(), String> {
         initial_peers as u64,
         initial_observed_at,
     ));
+    let peer_health_tracker = Arc::new(Mutex::new(PeerHealthTracker::new(
+        config.min_peers,
+        config.peer_health_history_capacity,
+        config.peer_health_flap_window_secs,
+    )));
+    if let Ok(mut tracker) = peer_health_tracker.lock() {
+        tracker.record(initial_peers as u64, initial_observed_at);
+    }
 
     let mut runtime = NodeRuntime::new(runtime_config)?;
     runtime.report_peer_observation(initial_peers, initial_observed_at);
@@ -285,6 +427,7 @@ async fn main() -> Result<(), String> {
             require_peers: config.min_peers > 0,
         },
         min_peer_count: config.min_peers,
+        peer_health_tracker: Arc::clone(&peer_health_tracker),
         rpc_slots: Arc::new(Semaphore::new(config.rpc_max_concurrency)),
         rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(
             config.rpc_rate_limit_per_minute,
@@ -304,6 +447,7 @@ async fn main() -> Result<(), String> {
         let heartbeat_ms = config.p2p_heartbeat_ms.max(1_000);
         let observation = Arc::clone(&bootnode_observation);
         let sync_progress = app_state.sync_progress.clone();
+        let peer_health_tracker = Arc::clone(&peer_health_tracker);
         let heartbeat_shutdown_rx = shutdown_rx.clone();
         Some(tokio::spawn(async move {
             run_bootnode_heartbeat(
@@ -312,6 +456,7 @@ async fn main() -> Result<(), String> {
                 heartbeat_ms,
                 observation,
                 sync_progress,
+                peer_health_tracker,
                 heartbeat_shutdown_rx,
             )
             .await;
@@ -359,6 +504,14 @@ async fn main() -> Result<(), String> {
     println!("allow_public_rpc_bind: {}", config.allow_public_rpc_bind);
     println!("exit_on_unhealthy: {}", config.exit_on_unhealthy);
     println!("min_peers: {}", config.min_peers);
+    println!(
+        "peer_health_history_capacity: {}",
+        config.peer_health_history_capacity
+    );
+    println!(
+        "peer_health_flap_window_secs: {}",
+        config.peer_health_flap_window_secs
+    );
     if let Some(path) = &config.local_journal_path {
         println!("local_journal_path: {path}");
     }
@@ -688,6 +841,7 @@ async fn run_bootnode_heartbeat(
     heartbeat_ms: u64,
     observation: Arc<BootnodeObservation>,
     sync_progress: Arc<Mutex<SyncProgress>>,
+    peer_health_tracker: Arc<Mutex<PeerHealthTracker>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut ticker = new_daemon_interval(Duration::from_millis(heartbeat_ms));
@@ -701,9 +855,13 @@ async fn run_bootnode_heartbeat(
             }
             _ = ticker.tick() => {
                 let reachable = probe_bootnodes(&endpoints, Duration::from_millis(1_500)).await;
-                observation.update(reachable as u64, unix_now_seconds());
+                let observed_at = unix_now_seconds();
+                observation.update(reachable as u64, observed_at);
                 if let Ok(mut progress) = sync_progress.lock() {
                     progress.peer_count = reachable as u64;
+                }
+                if let Ok(mut tracker) = peer_health_tracker.lock() {
+                    tracker.record(reachable as u64, observed_at);
                 }
                 eprintln!("p2p heartbeat: {reachable}/{bootnode_count} bootnodes reachable");
             }
@@ -853,6 +1011,16 @@ async fn status(
             )
         })?
         .clone();
+    let peer_health = state
+        .peer_health_tracker
+        .lock()
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "peer health tracker lock poisoned".to_string(),
+            )
+        })?
+        .snapshot(unix_now_seconds());
 
     Ok(Json(StatusPayload {
         chain_id: state.chain_id,
@@ -864,6 +1032,7 @@ async fn status(
         reorg_events: progress.reorg_events,
         consecutive_failures: progress.consecutive_failures,
         last_error: progress.last_error,
+        peer_health,
     }))
 }
 
@@ -893,6 +1062,16 @@ async fn metrics(State(state): State<RpcAppState>, headers: HeaderMap) -> impl I
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "sync progress lock poisoned".to_string(),
+            )
+                .into_response();
+        }
+    };
+    let peer_health = match state.peer_health_tracker.lock() {
+        Ok(tracker) => tracker.snapshot(unix_now_seconds()),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "peer health tracker lock poisoned".to_string(),
             )
                 .into_response();
         }
@@ -990,6 +1169,85 @@ async fn metrics(State(state): State<RpcAppState>, headers: HeaderMap) -> impl I
     );
     let _ = writeln!(body, "# TYPE pastis_sync_min_peer_count gauge");
     let _ = writeln!(body, "pastis_sync_min_peer_count {}", state.min_peer_count);
+    let _ = writeln!(
+        body,
+        "# HELP pastis_peer_health_status Current peer health state (1=healthy, 0=unhealthy)."
+    );
+    let _ = writeln!(body, "# TYPE pastis_peer_health_status gauge");
+    let _ = writeln!(
+        body,
+        "pastis_peer_health_status {}",
+        if peer_health.healthy { 1 } else { 0 }
+    );
+    let _ = writeln!(
+        body,
+        "# HELP pastis_peer_health_observations_total Total peer-health observations recorded by the daemon."
+    );
+    let _ = writeln!(body, "# TYPE pastis_peer_health_observations_total counter");
+    let _ = writeln!(
+        body,
+        "pastis_peer_health_observations_total {}",
+        peer_health.observations_total
+    );
+    let _ = writeln!(
+        body,
+        "# HELP pastis_peer_health_flap_transitions_total Total health-state flap transitions recorded."
+    );
+    let _ = writeln!(
+        body,
+        "# TYPE pastis_peer_health_flap_transitions_total counter"
+    );
+    let _ = writeln!(
+        body,
+        "pastis_peer_health_flap_transitions_total {}",
+        peer_health.flap_transitions_total
+    );
+    let _ = writeln!(
+        body,
+        "# HELP pastis_peer_health_flap_transitions_recent Flap transitions within the configured flap window."
+    );
+    let _ = writeln!(
+        body,
+        "# TYPE pastis_peer_health_flap_transitions_recent gauge"
+    );
+    let _ = writeln!(
+        body,
+        "pastis_peer_health_flap_transitions_recent {}",
+        peer_health.flap_transitions_recent
+    );
+    let _ = writeln!(
+        body,
+        "# HELP pastis_peer_health_history_size Current bounded peer-health history size."
+    );
+    let _ = writeln!(body, "# TYPE pastis_peer_health_history_size gauge");
+    let _ = writeln!(
+        body,
+        "pastis_peer_health_history_size {}",
+        peer_health.history_size
+    );
+    let _ = writeln!(
+        body,
+        "# HELP pastis_peer_health_last_observed_at_unix_seconds Last peer-health observation timestamp (unix seconds, 0 when unavailable)."
+    );
+    let _ = writeln!(
+        body,
+        "# TYPE pastis_peer_health_last_observed_at_unix_seconds gauge"
+    );
+    let _ = writeln!(
+        body,
+        "pastis_peer_health_last_observed_at_unix_seconds {}",
+        peer_health.last_observed_at_unix_seconds.unwrap_or(0)
+    );
+    let _ = writeln!(
+        body,
+        "# HELP pastis_peer_health_last_peer_count Peer count from the last peer-health observation (0 when unavailable)."
+    );
+    let _ = writeln!(body, "# TYPE pastis_peer_health_last_peer_count gauge");
+    let _ = writeln!(
+        body,
+        "pastis_peer_health_last_peer_count {}",
+        peer_health.last_peer_count.unwrap_or(0)
+    );
     let _ = writeln!(
         body,
         "# HELP pastis_sync_consecutive_failures Current consecutive sync poll failures."
@@ -1294,6 +1552,10 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         Some(value) => value,
         None => parse_env_u64("PASTIS_P2P_HEARTBEAT_MS")?.unwrap_or(DEFAULT_P2P_HEARTBEAT_MS),
     };
+    let peer_health_history_capacity = parse_env_usize("PASTIS_PEER_HEALTH_HISTORY_CAPACITY")?
+        .unwrap_or(DEFAULT_PEER_HEALTH_HISTORY_CAPACITY);
+    let peer_health_flap_window_secs = parse_env_u64("PASTIS_PEER_HEALTH_FLAP_WINDOW_SECS")?
+        .unwrap_or(DEFAULT_PEER_HEALTH_FLAP_WINDOW_SECS);
     let storage_snapshot_interval_blocks = match cli_storage_snapshot_interval_blocks {
         Some(value) => value,
         None => parse_env_u64("PASTIS_STORAGE_SNAPSHOT_INTERVAL_BLOCKS")?
@@ -1363,6 +1625,8 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         bootnodes,
         min_peers,
         p2p_heartbeat_ms,
+        peer_health_history_capacity,
+        peer_health_flap_window_secs,
         health_max_consecutive_failures,
         health_max_sync_lag_blocks,
         exit_on_unhealthy,
@@ -1866,6 +2130,8 @@ environment:\n\
   PASTIS_MIN_PEERS                   Minimum healthy peer count (0 disables)\n\
   PASTIS_EXIT_ON_UNHEALTHY           Exit daemon when health checks fail (true/false)\n\
   PASTIS_P2P_HEARTBEAT_MS            P2P heartbeat interval\n\
+  PASTIS_PEER_HEALTH_HISTORY_CAPACITY  Bounded peer-health history capacity (default: {DEFAULT_PEER_HEALTH_HISTORY_CAPACITY})\n\
+  PASTIS_PEER_HEALTH_FLAP_WINDOW_SECS  Flap detection lookback window in seconds (default: {DEFAULT_PEER_HEALTH_FLAP_WINDOW_SECS})\n\
   PASTIS_HEALTH_MAX_CONSECUTIVE_FAILURES   Health failure threshold for consecutive poll failures\n\
   PASTIS_HEALTH_MAX_SYNC_LAG_BLOCKS         Health failure threshold for sync lag in blocks"
     )
@@ -2017,6 +2283,42 @@ mod tests {
         let error = evaluate_health(&progress, &policy, 2)
             .expect_err("peer count below min threshold must fail health check");
         assert!(error.contains("required minimum=2"));
+    }
+
+    #[test]
+    fn peer_health_tracker_counts_observations_and_flaps() {
+        let mut tracker = PeerHealthTracker::new(1, 16, 300);
+        tracker.record(1, 10);
+        tracker.record(0, 20);
+        tracker.record(3, 30);
+        tracker.record(0, 40);
+
+        let status = tracker.snapshot(40);
+        assert!(!status.healthy);
+        assert_eq!(status.history_size, 4);
+        assert_eq!(status.observations_total, 4);
+        assert_eq!(status.healthy_observations_total, 2);
+        assert_eq!(status.unhealthy_observations_total, 2);
+        assert_eq!(status.flap_transitions_total, 3);
+        assert_eq!(status.flap_transitions_recent, 3);
+        assert_eq!(status.last_observed_at_unix_seconds, Some(40));
+        assert_eq!(status.last_peer_count, Some(0));
+    }
+
+    #[test]
+    fn peer_health_tracker_prunes_history_and_recent_flap_window() {
+        let mut tracker = PeerHealthTracker::new(1, 2, 30);
+        tracker.record(1, 0);
+        tracker.record(0, 10); // flap 1
+        tracker.record(2, 20); // flap 2
+        tracker.record(0, 70); // flap 3
+
+        let status = tracker.snapshot(70);
+        assert_eq!(status.history_size, 2);
+        assert_eq!(status.flap_transitions_total, 3);
+        assert_eq!(status.flap_transitions_recent, 1);
+        assert!(!status.healthy);
+        assert_eq!(status.last_peer_count, Some(0));
     }
 
     #[test]
@@ -2365,12 +2667,18 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let observation = Arc::new(BootnodeObservation::new(0, unix_now_seconds()));
         let sync_progress = Arc::new(Mutex::new(base_progress()));
+        let peer_health_tracker = Arc::new(Mutex::new(PeerHealthTracker::new(
+            0,
+            DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
+            DEFAULT_PEER_HEALTH_FLAP_WINDOW_SECS,
+        )));
         let heartbeat = tokio::spawn(run_bootnode_heartbeat(
             Vec::new(),
             0,
             1_000,
             observation,
             sync_progress,
+            peer_health_tracker,
             shutdown_rx,
         ));
 
@@ -2393,12 +2701,18 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let observation = Arc::new(BootnodeObservation::new(0, unix_now_seconds()));
         let sync_progress = Arc::new(Mutex::new(base_progress()));
+        let peer_health_tracker = Arc::new(Mutex::new(PeerHealthTracker::new(
+            1,
+            DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
+            DEFAULT_PEER_HEALTH_FLAP_WINDOW_SECS,
+        )));
         let heartbeat = tokio::spawn(run_bootnode_heartbeat(
             endpoints,
             1,
             250,
             observation.clone(),
             sync_progress.clone(),
+            Arc::clone(&peer_health_tracker),
             shutdown_rx,
         ));
 
@@ -2425,6 +2739,12 @@ mod tests {
             .expect("sync progress lock should not be poisoned")
             .clone();
         assert_eq!(progress.peer_count, 1);
+        let peer_health = peer_health_tracker
+            .lock()
+            .expect("peer health tracker lock should not be poisoned")
+            .snapshot(unix_now_seconds());
+        assert!(peer_health.observations_total >= 1);
+        assert!(peer_health.healthy);
 
         shutdown_tx
             .send(true)
@@ -2623,6 +2943,11 @@ mod tests {
                 require_peers: false,
             },
             min_peer_count: 0,
+            peer_health_tracker: Arc::new(Mutex::new(PeerHealthTracker::new(
+                0,
+                DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
+                DEFAULT_PEER_HEALTH_FLAP_WINDOW_SECS,
+            ))),
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
             rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
@@ -2658,6 +2983,11 @@ mod tests {
                 require_peers: false,
             },
             min_peer_count: 0,
+            peer_health_tracker: Arc::new(Mutex::new(PeerHealthTracker::new(
+                0,
+                DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
+                DEFAULT_PEER_HEALTH_FLAP_WINDOW_SECS,
+            ))),
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
             rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
@@ -2695,6 +3025,11 @@ mod tests {
                 require_peers: false,
             },
             min_peer_count: 0,
+            peer_health_tracker: Arc::new(Mutex::new(PeerHealthTracker::new(
+                0,
+                DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
+                DEFAULT_PEER_HEALTH_FLAP_WINDOW_SECS,
+            ))),
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
             rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
@@ -2725,6 +3060,11 @@ mod tests {
                 require_peers: false,
             },
             min_peer_count: 0,
+            peer_health_tracker: Arc::new(Mutex::new(PeerHealthTracker::new(
+                0,
+                DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
+                DEFAULT_PEER_HEALTH_FLAP_WINDOW_SECS,
+            ))),
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
             rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
@@ -2760,6 +3100,11 @@ mod tests {
                 require_peers: false,
             },
             min_peer_count: 0,
+            peer_health_tracker: Arc::new(Mutex::new(PeerHealthTracker::new(
+                0,
+                DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
+                DEFAULT_PEER_HEALTH_FLAP_WINDOW_SECS,
+            ))),
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(1))),
             rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
@@ -2800,6 +3145,11 @@ mod tests {
                 require_peers: false,
             },
             min_peer_count: 0,
+            peer_health_tracker: Arc::new(Mutex::new(PeerHealthTracker::new(
+                0,
+                DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
+                DEFAULT_PEER_HEALTH_FLAP_WINDOW_SECS,
+            ))),
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
             rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
@@ -2829,6 +3179,10 @@ mod tests {
         assert!(text.contains("pastis_rpc_responses_no_content_total 0"));
         assert!(text.contains("pastis_sync_current_block 10"));
         assert!(text.contains("pastis_sync_min_peer_count 0"));
+        assert!(text.contains("pastis_peer_health_status 1"));
+        assert!(text.contains("pastis_peer_health_observations_total 0"));
+        assert!(text.contains("pastis_peer_health_flap_transitions_total 0"));
+        assert!(text.contains("pastis_peer_health_last_peer_count 0"));
     }
 
     #[tokio::test]
@@ -2845,6 +3199,11 @@ mod tests {
                 require_peers: false,
             },
             min_peer_count: 0,
+            peer_health_tracker: Arc::new(Mutex::new(PeerHealthTracker::new(
+                0,
+                DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
+                DEFAULT_PEER_HEALTH_FLAP_WINDOW_SECS,
+            ))),
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
             rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
@@ -2872,6 +3231,7 @@ mod tests {
         assert!(text.contains("pastis_rpc_requests_total 1"));
         assert!(text.contains("pastis_rpc_responses_ok_total 0"));
         assert!(text.contains("pastis_rpc_responses_no_content_total 1"));
+        assert!(text.contains("pastis_peer_health_history_size 0"));
     }
 
     #[tokio::test]
@@ -2888,6 +3248,11 @@ mod tests {
                 require_peers: false,
             },
             min_peer_count: 0,
+            peer_health_tracker: Arc::new(Mutex::new(PeerHealthTracker::new(
+                0,
+                DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
+                DEFAULT_PEER_HEALTH_FLAP_WINDOW_SECS,
+            ))),
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
             rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
@@ -2913,6 +3278,11 @@ mod tests {
                 require_peers: false,
             },
             min_peer_count: 0,
+            peer_health_tracker: Arc::new(Mutex::new(PeerHealthTracker::new(
+                0,
+                DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
+                DEFAULT_PEER_HEALTH_FLAP_WINDOW_SECS,
+            ))),
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
             rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
@@ -2941,6 +3311,11 @@ mod tests {
                 require_peers: false,
             },
             min_peer_count: 0,
+            peer_health_tracker: Arc::new(Mutex::new(PeerHealthTracker::new(
+                0,
+                DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
+                DEFAULT_PEER_HEALTH_FLAP_WINDOW_SECS,
+            ))),
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
             rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
@@ -2966,6 +3341,11 @@ mod tests {
                 require_peers: false,
             },
             min_peer_count: 0,
+            peer_health_tracker: Arc::new(Mutex::new(PeerHealthTracker::new(
+                0,
+                DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
+                DEFAULT_PEER_HEALTH_FLAP_WINDOW_SECS,
+            ))),
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
             rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
@@ -2982,5 +3362,9 @@ mod tests {
         assert_eq!(payload.0.chain_id, "SN_MAIN");
         assert_eq!(payload.0.current_block, 10);
         assert_eq!(payload.0.min_peers, 0);
+        assert!(payload.0.peer_health.healthy);
+        assert_eq!(payload.0.peer_health.last_peer_count, None);
+        assert_eq!(payload.0.peer_health.history_size, 0);
+        assert_eq!(payload.0.peer_health.observations_total, 0);
     }
 }

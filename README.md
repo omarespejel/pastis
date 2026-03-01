@@ -40,6 +40,7 @@ This repository currently ships core, tested building blocks:
 - Daemon runtime defaults to production backends (strict consensus guardrails + dynamic peer-health checks)
 - Daemon strict canonical toggle to fail closed when executable payload coverage is incomplete: enabled by default in `production-adapters` builds, disable with `--no-strict-canonical-execution` (or `--strict-canonical-execution=false`) / `PASTIS_STRICT_CANONICAL_EXECUTION=false`; precedence is `CLI > env > build default`
 - Daemon peer quorum controls (`--min-peers` / `PASTIS_MIN_PEERS`) to enforce a minimum healthy peer-count threshold
+- Daemon peer-health history + flap detection exposed in `/status` and `/metrics` for operational alerting
 
 Source entry points:
 
