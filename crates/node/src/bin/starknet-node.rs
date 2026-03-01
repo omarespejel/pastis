@@ -134,6 +134,7 @@ async fn main() -> Result<(), String> {
     let app = Router::new()
         .route("/", post(handle_rpc))
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/status", get(status))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .with_state(app_state);
@@ -277,6 +278,24 @@ async fn healthz(State(state): State<RpcAppState>) -> impl IntoResponse {
     };
 
     match evaluate_health(&progress, &state.health_policy) {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(message) => (StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
+    }
+}
+
+async fn readyz(State(state): State<RpcAppState>) -> impl IntoResponse {
+    let progress = match state.sync_progress.lock() {
+        Ok(progress) => progress.clone(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sync progress lock poisoned".to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    match evaluate_readiness(&progress, &state.health_policy) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(message) => (StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
     }
@@ -653,6 +672,17 @@ fn evaluate_health(progress: &SyncProgress, policy: &HealthPolicy) -> Result<(),
     Ok(())
 }
 
+fn evaluate_readiness(progress: &SyncProgress, policy: &HealthPolicy) -> Result<(), String> {
+    evaluate_health(progress, policy)?;
+    if progress.current_block < progress.highest_block {
+        return Err(format!(
+            "not ready: sync in progress (current={}, highest={})",
+            progress.current_block, progress.highest_block
+        ));
+    }
+    Ok(())
+}
+
 fn classify_rpc_task_completion(
     outcome: Result<Result<(), String>, tokio::task::JoinError>,
 ) -> Result<(), String> {
@@ -748,6 +778,29 @@ mod tests {
             max_sync_lag: 64,
         };
         assert!(evaluate_health(&progress, &policy).is_ok());
+    }
+
+    #[test]
+    fn evaluate_readiness_is_ready_when_synced_and_healthy() {
+        let progress = base_progress();
+        let policy = HealthPolicy {
+            max_consecutive_failures: 3,
+            max_sync_lag: 64,
+        };
+        assert!(evaluate_readiness(&progress, &policy).is_ok());
+    }
+
+    #[test]
+    fn evaluate_readiness_fails_when_node_is_still_catching_up() {
+        let mut progress = base_progress();
+        progress.current_block = 10;
+        progress.highest_block = 20;
+        let policy = HealthPolicy {
+            max_consecutive_failures: 3,
+            max_sync_lag: 64,
+        };
+        let error = evaluate_readiness(&progress, &policy).expect_err("should not be ready");
+        assert!(error.contains("not ready"));
     }
 
     #[test]
