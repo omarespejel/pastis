@@ -167,6 +167,18 @@ Full step-by-step runbook:
 
 - [docs/BOSS_DEMO_RUNBOOK.md](./docs/BOSS_DEMO_RUNBOOK.md)
 
+### Production Soak Gate (Real Daemon)
+
+Run a real-data soak gate with pass/fail criteria and machine-readable report:
+
+```bash
+./scripts/daemon-soak-gate.sh --rpc-url "https://rpc.starknet.lava.build" --duration-minutes 360
+```
+
+Runbook:
+
+- [docs/PRODUCTION_SOAK_RUNBOOK.md](./docs/PRODUCTION_SOAK_RUNBOOK.md)
+
 ### Validate Everything
 
 ```bash
