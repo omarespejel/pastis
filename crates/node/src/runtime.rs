@@ -3685,6 +3685,50 @@ mod tests {
         assert!(error.contains("payload/hash count mismatch"));
     }
 
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn replay_transaction_from_payload_uses_embedded_executable_payload() {
+        use starknet_api::executable_transaction::{
+            L1HandlerTransaction as ExecutableL1Handler, Transaction as ExecutableTransaction,
+        };
+        use starknet_api::hash::StarkHash as StarknetApiFelt;
+        use starknet_api::transaction::TransactionHash;
+
+        let mut executable = ExecutableL1Handler::default();
+        executable.tx.calldata = vec![Default::default()].into();
+        executable.tx_hash = TransactionHash(StarknetApiFelt::from(0x111_u64));
+        let executable_json =
+            serde_json::to_value(ExecutableTransaction::L1Handler(executable.clone()))
+                .expect("serialize executable tx");
+        let payload = json!({ "executable": executable_json });
+
+        let tx = replay_transaction_from_payload(1, "0x111", &payload)
+            .expect("embedded executable payload should be accepted");
+        assert_eq!(tx.hash.as_ref(), "0x111");
+        assert!(tx.executable.is_some());
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn replay_transaction_from_payload_rejects_mismatched_embedded_executable_hash() {
+        use starknet_api::executable_transaction::{
+            L1HandlerTransaction as ExecutableL1Handler, Transaction as ExecutableTransaction,
+        };
+        use starknet_api::hash::StarkHash as StarknetApiFelt;
+        use starknet_api::transaction::TransactionHash;
+
+        let mut executable = ExecutableL1Handler::default();
+        executable.tx.calldata = vec![Default::default()].into();
+        executable.tx_hash = TransactionHash(StarknetApiFelt::from(0x123_u64));
+        let executable_json = serde_json::to_value(ExecutableTransaction::L1Handler(executable))
+            .expect("serialize executable tx");
+        let payload = json!({ "__pastis_executable": executable_json });
+
+        let error = replay_transaction_from_payload(1, "0x111", &payload)
+            .expect_err("mismatched executable hash must fail closed");
+        assert!(error.contains("hash mismatch"));
+    }
+
     #[test]
     fn parses_block_with_txs_hashes_from_objects() {
         let block = json!({
