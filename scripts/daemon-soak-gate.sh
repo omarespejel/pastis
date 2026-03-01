@@ -13,8 +13,9 @@ Options:
   --poll-seconds <n>               Poll interval for health/status checks (default: 15)
   --startup-timeout-seconds <n>    Max wait for daemon endpoint startup (default: 900)
   --daemon-bind <host:port>        Daemon bind address (default: 127.0.0.1:9545)
-  --auth-token <token>             Daemon bearer token (default: pastis-soak-token)
+  --auth-token <token>             Daemon bearer token (auto-generated on loopback binds)
   --state-dir <path>               State directory (default: .pastis/soak-daemon)
+  --allow-private-rpc-url          Allow private/localhost upstream RPC hosts
   --allow-synthetic-fallback       Explicitly allow synthetic fallback (default: disabled)
   --clean-start                    Remove prior state/checkpoints before run (default: enabled)
   --no-clean-start                 Keep prior state/checkpoints
@@ -28,6 +29,8 @@ Environment overrides:
   PASTIS_SOAK_DAEMON_BIND
   PASTIS_SOAK_AUTH_TOKEN
   PASTIS_SOAK_STATE_DIR
+  PASTIS_SOAK_ALLOW_PRIVATE_RPC_URL (true/false)
+  PASTIS_SOAK_ALLOW_UNSAFE_STATE_DIR (true/false)
   PASTIS_SOAK_ALLOW_SYNTHETIC_FALLBACK (true/false)
   PASTIS_SOAK_CLEAN_START (true/false)
 USAGE
@@ -82,6 +85,65 @@ iso8601_utc_from_epoch() {
     return 0
   fi
   printf '<invalid-timestamp>'
+}
+
+normalize_state_dir() {
+  local raw="$1"
+  local normalized="$raw"
+  if [[ "$normalized" == "~/"* ]]; then
+    normalized="${HOME}/${normalized#~/}"
+  fi
+  if [[ "$normalized" != /* ]]; then
+    normalized="${ROOT_DIR}/${normalized}"
+  fi
+  printf '%s' "$normalized"
+}
+
+is_loopback_bind() {
+  local bind="$1"
+  local host="${bind%%:*}"
+  case "$host" in
+    127.0.0.1|localhost|[::1]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+generate_token() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 24
+  else
+    printf 'soak-%s-%s-%s' "$(date +%s)" "$$" "$RANDOM"
+  fi
+}
+
+validate_upstream_rpc_url() {
+  local raw="$1"
+  local allow_private="$2"
+  local lowered
+  lowered="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+  if [[ ! "$lowered" =~ ^https?:// ]]; then
+    echo "error: upstream RPC URL must use http/https: $raw" >&2
+    exit 1
+  fi
+  if [[ ! "$lowered" =~ ^https?://([^/:?#]+) ]]; then
+    echo "error: upstream RPC URL host is invalid: $raw" >&2
+    exit 1
+  fi
+  local host="${BASH_REMATCH[1]}"
+  case "$host" in
+    localhost|127.*|0.0.0.0|[::1]|::1|169.254.169.254)
+      if [[ "$allow_private" != "1" ]]; then
+        echo "error: upstream RPC URL host '$host' is blocked by default; pass --allow-private-rpc-url to override" >&2
+        exit 1
+      fi
+      ;;
+  esac
+  if [[ "$host" =~ ^10\. ]] || [[ "$host" =~ ^192\.168\. ]] || [[ "$host" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]]; then
+    if [[ "$allow_private" != "1" ]]; then
+      echo "error: private upstream RPC host '$host' is blocked by default; pass --allow-private-rpc-url to override" >&2
+      exit 1
+    fi
+  fi
 }
 
 json_rpc_call() {
@@ -143,8 +205,10 @@ DURATION_MINUTES="${PASTIS_SOAK_DURATION_MINUTES:-60}"
 POLL_SECONDS="${PASTIS_SOAK_POLL_SECONDS:-15}"
 STARTUP_TIMEOUT_SECONDS="${PASTIS_SOAK_STARTUP_TIMEOUT_SECONDS:-900}"
 DAEMON_BIND="${PASTIS_SOAK_DAEMON_BIND:-127.0.0.1:9545}"
-DAEMON_TOKEN="${PASTIS_SOAK_AUTH_TOKEN:-pastis-soak-token}"
+DAEMON_TOKEN="${PASTIS_SOAK_AUTH_TOKEN:-}"
 STATE_DIR="${PASTIS_SOAK_STATE_DIR:-${ROOT_DIR}/.pastis/soak-daemon}"
+ALLOW_PRIVATE_RPC_URL="$(parse_bool "${PASTIS_SOAK_ALLOW_PRIVATE_RPC_URL:-false}")"
+ALLOW_UNSAFE_STATE_DIR="$(parse_bool "${PASTIS_SOAK_ALLOW_UNSAFE_STATE_DIR:-false}")"
 ALLOW_SYNTHETIC_FALLBACK="$(parse_bool "${PASTIS_SOAK_ALLOW_SYNTHETIC_FALLBACK:-false}")"
 CLEAN_START="$(parse_bool "${PASTIS_SOAK_CLEAN_START:-true}")"
 
@@ -185,6 +249,10 @@ while [[ $# -gt 0 ]]; do
       STATE_DIR="$2"
       shift 2
       ;;
+    --allow-private-rpc-url)
+      ALLOW_PRIVATE_RPC_URL=1
+      shift
+      ;;
     --allow-synthetic-fallback)
       ALLOW_SYNTHETIC_FALLBACK=1
       shift
@@ -213,10 +281,7 @@ if [[ -z "$UPSTREAM_RPC_URL" ]]; then
   echo "error: missing upstream RPC URL; pass --rpc-url or set STARKNET_RPC_URL" >&2
   exit 1
 fi
-if [[ ! "$UPSTREAM_RPC_URL" =~ ^https?:// ]]; then
-  echo "error: upstream RPC URL must use http/https: $UPSTREAM_RPC_URL" >&2
-  exit 1
-fi
+validate_upstream_rpc_url "$UPSTREAM_RPC_URL" "$ALLOW_PRIVATE_RPC_URL"
 if [[ ! "$DURATION_MINUTES" =~ ^[0-9]+$ ]] || [[ "$DURATION_MINUTES" -eq 0 ]]; then
   echo "error: --duration-minutes must be a positive integer" >&2
   exit 1
@@ -228,6 +293,25 @@ fi
 if [[ ! "$STARTUP_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || [[ "$STARTUP_TIMEOUT_SECONDS" -eq 0 ]]; then
   echo "error: --startup-timeout-seconds must be a positive integer" >&2
   exit 1
+fi
+
+STATE_DIR="$(normalize_state_dir "$STATE_DIR")"
+if [[ "$ALLOW_UNSAFE_STATE_DIR" != "1" ]]; then
+  case "$STATE_DIR" in
+    "$ROOT_DIR"/*|/tmp/*) ;;
+    *)
+      echo "error: state-dir '$STATE_DIR' is blocked by default; use a path under '$ROOT_DIR' or '/tmp', or set PASTIS_SOAK_ALLOW_UNSAFE_STATE_DIR=true to override" >&2
+      exit 1
+      ;;
+  esac
+fi
+if [[ -z "$DAEMON_TOKEN" ]]; then
+  if is_loopback_bind "$DAEMON_BIND"; then
+    DAEMON_TOKEN="$(generate_token)"
+  else
+    echo "error: --auth-token is required when daemon bind is not loopback" >&2
+    exit 1
+  fi
 fi
 
 mkdir -p "$STATE_DIR"
@@ -261,7 +345,6 @@ DAEMON_ARGS=(
   --upstream-rpc-url "$UPSTREAM_RPC_URL"
   --chain-id "$CHAIN_ID"
   --rpc-bind "$DAEMON_BIND"
-  --rpc-auth-token "$DAEMON_TOKEN"
   --poll-ms 1500
   --replay-checkpoint "$CHECKPOINT_PATH"
   --local-journal "$JOURNAL_PATH"
@@ -274,7 +357,7 @@ else
   DAEMON_ARGS+=(--no-allow-synthetic-execution-fallback)
 fi
 
-cargo run --locked --release -p starknet-node --bin starknet-node --features production-adapters -- "${DAEMON_ARGS[@]}" >"$LOG_PATH" 2>&1 &
+PASTIS_RPC_AUTH_TOKEN="$DAEMON_TOKEN" cargo run --locked --release -p starknet-node --bin starknet-node --features production-adapters -- "${DAEMON_ARGS[@]}" >"$LOG_PATH" 2>&1 &
 DAEMON_PID=$!
 
 cleanup() {
@@ -317,9 +400,6 @@ max_sync_lag=0
 max_flaps_recent=0
 block_advance_events=0
 last_current_block=""
-last_highest_block=""
-last_health_code=""
-last_ready_code=""
 last_status_json='{}'
 
 while [[ "$(date +%s)" -lt "$end_epoch" ]]; do
@@ -341,8 +421,6 @@ while [[ "$(date +%s)" -lt "$end_epoch" ]]; do
   )"
 
   samples=$((samples + 1))
-  last_health_code="$health_code"
-  last_ready_code="$ready_code"
 
   if [[ "$health_code" != "200" ]]; then
     health_failures=$((health_failures + 1))
@@ -368,7 +446,6 @@ while [[ "$(date +%s)" -lt "$end_epoch" ]]; do
       block_advance_events=$((block_advance_events + 1))
     fi
     last_current_block="$current_block"
-    last_highest_block="$highest_block"
 
     sync_lag=$((highest_block - current_block))
     if [[ "$sync_lag" -gt "$max_sync_lag" ]]; then
@@ -459,7 +536,7 @@ jq -cn \
 
 echo
 echo "soak report: $REPORT_PATH"
-cat "$REPORT_PATH" | jq .
+jq . "$REPORT_PATH"
 echo
 if [[ "$pass" -eq 1 ]]; then
   echo "daemon soak gate: PASS"
