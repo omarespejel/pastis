@@ -151,6 +151,18 @@ What this demo proves on-screen:
 - BTCFi/strkBTC anomaly detector behavior
 - MCP tool round-trip via `GetAnomalies`
 
+### Boss Demo Daemon (Real Data)
+
+Use the dedicated daemon + smoke runbook for a real (non-simulated) boss demo:
+
+```bash
+./scripts/boss-demo-smoke.sh
+```
+
+Full step-by-step runbook:
+
+- [docs/BOSS_DEMO_RUNBOOK.md](./docs/BOSS_DEMO_RUNBOOK.md)
+
 ### Validate Everything
 
 ```bash

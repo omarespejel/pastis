@@ -2494,58 +2494,27 @@ fn parse_block_with_receipts(
         })?;
     let state_root = parse_optional_block_state_root(block_with_receipts, "getBlockWithReceipts")?;
 
-    let transactions = block_with_receipts
-        .get("transactions")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            format!("getBlockWithReceipts missing transactions array: {block_with_receipts}")
-        })?;
-    let mut transaction_hashes = Vec::with_capacity(transactions.len());
-    let mut seen_hashes = HashSet::with_capacity(transactions.len());
-    for (idx, tx) in transactions.iter().enumerate() {
-        let tx_hash_raw = if let Some(raw) = tx.as_str() {
-            raw
-        } else {
-            tx.get("transaction_hash")
-                .or_else(|| tx.get("hash"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    format!(
-                        "transaction {idx} in getBlockWithReceipts missing transaction_hash: {tx}"
-                    )
-                })?
-        };
-        let tx_hash_normalized = normalize_hex_prefix(tx_hash_raw);
-        let tx_hash = StarknetFelt::from_str(&tx_hash_normalized)
-            .map(|felt| format!("{:#x}", felt))
-            .map_err(|error| {
-                format!(
-                    "invalid getBlockWithReceipts tx hash `{tx_hash_raw}` at index {idx}: {error}"
-                )
-            })?;
-        if !seen_hashes.insert(tx_hash.clone()) {
-            return Err(format!(
-                "duplicate transaction hash `{tx_hash}` at index {idx} in getBlockWithReceipts"
-            ));
-        }
-        transaction_hashes.push(tx_hash);
-    }
-
     let receipts = block_with_receipts
         .get("receipts")
         .and_then(Value::as_array)
         .ok_or_else(|| {
             format!("getBlockWithReceipts missing receipts array: {block_with_receipts}")
         })?;
-    if receipts.len() != transaction_hashes.len() {
+    let transactions = block_with_receipts
+        .get("transactions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            format!("getBlockWithReceipts missing transactions array: {block_with_receipts}")
+        })?;
+    if receipts.len() != transactions.len() {
         return Err(format!(
             "getBlockWithReceipts tx/receipt length mismatch: transactions={}, receipts={}",
-            transaction_hashes.len(),
+            transactions.len(),
             receipts.len()
         ));
     }
 
-    let mut parsed_receipts = Vec::with_capacity(receipts.len());
+    let mut receipt_hashes = Vec::with_capacity(receipts.len());
     for (idx, receipt_raw) in receipts.iter().enumerate() {
         let tx_hash_raw = receipt_raw
             .get("transaction_hash")
@@ -2563,12 +2532,54 @@ fn parse_block_with_receipts(
                     "invalid getBlockWithReceipts receipt transaction_hash `{tx_hash_raw}` at index {idx}: {error}"
                 )
             })?;
-        if tx_hash != transaction_hashes[idx] {
+        receipt_hashes.push(tx_hash);
+    }
+
+    let mut transaction_hashes = Vec::with_capacity(transactions.len());
+    let mut seen_hashes = HashSet::with_capacity(transactions.len());
+    for (idx, tx) in transactions.iter().enumerate() {
+        let tx_hash = if let Some(raw) = tx.as_str() {
+            let normalized = normalize_hex_prefix(raw);
+            StarknetFelt::from_str(&normalized)
+                .map(|felt| format!("{:#x}", felt))
+                .map_err(|error| {
+                    format!("invalid getBlockWithReceipts tx hash `{raw}` at index {idx}: {error}")
+                })?
+        } else if let Some(raw) = tx
+            .get("transaction_hash")
+            .or_else(|| tx.get("hash"))
+            .and_then(Value::as_str)
+        {
+            let normalized = normalize_hex_prefix(raw);
+            StarknetFelt::from_str(&normalized)
+                .map(|felt| format!("{:#x}", felt))
+                .map_err(|error| {
+                    format!("invalid getBlockWithReceipts tx hash `{raw}` at index {idx}: {error}")
+                })?
+        } else {
+            warnings.push(format!(
+                "transaction {idx} in getBlockWithReceipts missing transaction_hash/hash; falling back to receipt.transaction_hash"
+            ));
+            receipt_hashes[idx].clone()
+        };
+
+        if !seen_hashes.insert(tx_hash.clone()) {
             return Err(format!(
-                "receipt hash/order mismatch at index {idx} in getBlockWithReceipts: txs={}, receipts={}",
-                transaction_hashes[idx], tx_hash
+                "duplicate transaction hash `{tx_hash}` at index {idx} in getBlockWithReceipts"
             ));
         }
+        if tx_hash != receipt_hashes[idx] {
+            return Err(format!(
+                "receipt hash/order mismatch at index {idx} in getBlockWithReceipts: txs={}, receipts={}",
+                tx_hash, receipt_hashes[idx]
+            ));
+        }
+        transaction_hashes.push(tx_hash);
+    }
+
+    let mut parsed_receipts = Vec::with_capacity(receipts.len());
+    for (idx, receipt_raw) in receipts.iter().enumerate() {
+        let tx_hash = receipt_hashes[idx].clone();
 
         let execution_status = match receipt_raw.get("execution_status").and_then(Value::as_str) {
             Some(status) if status.eq_ignore_ascii_case("SUCCEEDED") => true,
@@ -3750,6 +3761,35 @@ mod tests {
         assert_eq!(parsed.receipts[1].events, 3);
         assert_eq!(parsed.receipts[1].gas_consumed, 9);
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn parse_block_with_receipts_falls_back_to_receipt_hash_when_tx_hash_missing() {
+        let block = json!({
+            "block_number": 42,
+            "block_hash": "0xabc",
+            "parent_hash": "0x123",
+            "transactions": [
+                {"type": "INVOKE", "version": "0x3"},
+                {"type": "INVOKE", "version": "0x3"}
+            ],
+            "receipts": [
+                {"transaction_hash": "0x111", "execution_status": "SUCCEEDED"},
+                {"transaction_hash": "0x222", "execution_status": "SUCCEEDED"}
+            ]
+        });
+
+        let mut warnings = Vec::new();
+        let parsed = parse_block_with_receipts(&block, &mut warnings)
+            .expect("missing tx hashes should fall back to receipt hashes");
+        assert_eq!(parsed.transaction_hashes, vec!["0x111", "0x222"]);
+        assert_eq!(parsed.receipts.len(), 2);
+        assert_eq!(warnings.len(), 2);
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.contains("falling back to receipt.transaction_hash"))
+        );
     }
 
     #[test]
