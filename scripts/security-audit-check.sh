@@ -17,6 +17,10 @@ done
 
 (
   cd "${ROOT_DIR}"
+  if ! cargo audit --version >/dev/null 2>&1; then
+    echo "cargo-audit not found, installing..."
+    cargo install --locked cargo-audit
+  fi
   cargo audit --deny unsound "${IGNORE_ARGS[@]}"
 )
 
