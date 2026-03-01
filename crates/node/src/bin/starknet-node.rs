@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::env;
 use std::future::Future;
 use std::net::IpAddr;
@@ -106,7 +106,7 @@ struct HealthPolicy {
     require_peers: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum BootnodeEndpoint {
     Socket(SocketAddr),
     HostPort { host: String, port: u16 },
@@ -1356,6 +1356,7 @@ fn validate_rpc_rate_limit_per_minute(value: u32) -> Result<u32, String> {
 }
 
 fn parse_bootnode_endpoints(bootnodes: &[String]) -> Result<Vec<BootnodeEndpoint>, String> {
+    let mut seen = HashSet::with_capacity(bootnodes.len());
     let mut parsed = Vec::with_capacity(bootnodes.len());
     for raw in bootnodes {
         let Some(endpoint) = parse_bootnode_endpoint(raw) else {
@@ -1363,7 +1364,9 @@ fn parse_bootnode_endpoints(bootnodes: &[String]) -> Result<Vec<BootnodeEndpoint
                 "invalid bootnode `{raw}`: expected socket address, host:port, or /ip4|ip6|dns*/.../tcp/<port> multiaddr"
             ));
         };
-        parsed.push(endpoint);
+        if seen.insert(endpoint.clone()) {
+            parsed.push(endpoint);
+        }
     }
     Ok(parsed)
 }
@@ -1374,6 +1377,9 @@ fn parse_bootnode_endpoint(raw: &str) -> Option<BootnodeEndpoint> {
         return None;
     }
     if let Ok(addr) = trimmed.parse::<SocketAddr>() {
+        if addr.port() == 0 {
+            return None;
+        }
         return Some(BootnodeEndpoint::Socket(addr));
     }
     if trimmed.starts_with('/') {
@@ -1383,6 +1389,9 @@ fn parse_bootnode_endpoint(raw: &str) -> Option<BootnodeEndpoint> {
             .collect();
         if segments.len() >= 4 && segments[2] == "tcp" {
             let port = segments[3].parse::<u16>().ok()?;
+            if port == 0 {
+                return None;
+            }
             match segments[0] {
                 "ip4" | "ip6" => {
                     let host = segments[1];
@@ -1405,8 +1414,14 @@ fn parse_bootnode_endpoint(raw: &str) -> Option<BootnodeEndpoint> {
     }
     if let Some((host, port)) = trimmed.rsplit_once(':') {
         let parsed_port = port.parse::<u16>().ok()?;
+        if parsed_port == 0 {
+            return None;
+        }
         let normalized_host = host.trim().trim_start_matches('[').trim_end_matches(']');
         if normalized_host.is_empty() {
+            return None;
+        }
+        if normalized_host.chars().any(char::is_whitespace) {
             return None;
         }
         if let Ok(ip) = normalized_host.parse::<IpAddr>() {
@@ -1790,6 +1805,35 @@ mod tests {
         let err = parse_bootnode_endpoints(&["bad-bootnode".to_string()])
             .expect_err("invalid bootnode should fail parsing");
         assert!(err.contains("invalid bootnode"));
+    }
+
+    #[test]
+    fn parse_bootnode_endpoints_deduplicates_equivalent_entries() {
+        let parsed = parse_bootnode_endpoints(&[
+            "127.0.0.1:9090".to_string(),
+            "/ip4/127.0.0.1/tcp/9090/p2p/12D3KooWabc".to_string(),
+            "127.0.0.1:9090".to_string(),
+            "bootstrap.starknet.io:30303".to_string(),
+            "/dns4/bootstrap.starknet.io/tcp/30303/p2p/12D3KooWdef".to_string(),
+        ])
+        .expect("equivalent entries should parse");
+        assert_eq!(
+            parsed,
+            vec![
+                BootnodeEndpoint::Socket(SocketAddr::from(([127, 0, 0, 1], 9090))),
+                BootnodeEndpoint::HostPort {
+                    host: "bootstrap.starknet.io".to_string(),
+                    port: 30_303
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_bootnode_endpoint_rejects_zero_port_and_whitespace_host() {
+        assert_eq!(parse_bootnode_endpoint("127.0.0.1:0"), None);
+        assert_eq!(parse_bootnode_endpoint("/ip4/127.0.0.1/tcp/0"), None);
+        assert_eq!(parse_bootnode_endpoint("bad host:30303"), None);
     }
 
     #[tokio::test]
