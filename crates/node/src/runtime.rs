@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{BufRead, BufReader, Write};
@@ -1339,7 +1339,7 @@ fn parse_block_with_txs(
         .ok_or_else(|| format!("getBlockWithTxs missing transactions array: {block_with_txs}"))?;
 
     let mut transaction_hashes = Vec::with_capacity(transactions.len());
-    let mut seen_hashes = BTreeSet::new();
+    let mut seen_hashes = HashSet::with_capacity(transactions.len());
     for (idx, tx) in transactions.iter().enumerate() {
         let tx_hash_raw = if let Some(raw) = tx.as_str() {
             raw
@@ -1437,7 +1437,7 @@ fn parse_block_with_tx_hashes(
         })?;
 
     let mut transaction_hashes = Vec::with_capacity(transactions.len());
-    let mut seen_hashes = BTreeSet::new();
+    let mut seen_hashes = HashSet::with_capacity(transactions.len());
     for (idx, tx) in transactions.iter().enumerate() {
         let Some(tx_hash_raw) = tx.as_str() else {
             return Err(format!(

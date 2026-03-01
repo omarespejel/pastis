@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::ops::Deref;
 use std::str::FromStr;
@@ -488,7 +488,7 @@ impl StarknetBlock {
             },
         )?;
 
-        let mut seen_hashes = BTreeSet::new();
+        let mut seen_hashes = HashSet::with_capacity(self.transactions.len());
         for tx in &self.transactions {
             tx.validate_hash()
                 .map_err(|source| BlockValidationError::InvalidIdentifier {
