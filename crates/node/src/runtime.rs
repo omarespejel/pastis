@@ -928,7 +928,8 @@ impl ConsensusBackend for ProductionConsensusBackend {
                 return Ok(ConsensusVerdict::Reject);
             }
             if input.external_block_number == previous.block_number {
-                if input.block_hash == previous.block_hash && input.timestamp == previous.timestamp {
+                if input.block_hash == previous.block_hash && input.timestamp == previous.timestamp
+                {
                     return Ok(ConsensusVerdict::Accept);
                 }
                 return Ok(ConsensusVerdict::Reject);
@@ -5237,7 +5238,9 @@ mod tests {
             tx_count: 1,
         };
         assert_eq!(
-            backend.validate_block(&base).expect("base block should validate"),
+            backend
+                .validate_block(&base)
+                .expect("base block should validate"),
             ConsensusVerdict::Accept
         );
 
@@ -5275,10 +5278,9 @@ mod tests {
         let backend = ProductionNetworkBackend::from_config(1, true, 1);
         assert!(backend.is_healthy());
 
-        backend.last_observation_unix_seconds.store(
-            unix_now_seconds().saturating_sub(5),
-            Ordering::Relaxed,
-        );
+        backend
+            .last_observation_unix_seconds
+            .store(unix_now_seconds().saturating_sub(5), Ordering::Relaxed);
         assert!(!backend.is_healthy());
 
         backend.report_peer_count(2);
