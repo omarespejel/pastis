@@ -9,6 +9,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio::time::interval;
 
 use starknet_node::ChainId;
@@ -24,6 +25,7 @@ const DEFAULT_RPC_BIND: &str = "127.0.0.1:9545";
 const DEFAULT_REPLAY_CHECKPOINT_PATH: &str = ".pastis/node-replay-checkpoint.json";
 const DEFAULT_LOCAL_JOURNAL_PATH: &str = ".pastis/node-local-journal.jsonl";
 const DEFAULT_P2P_HEARTBEAT_MS: u64 = 30_000;
+const DEFAULT_RPC_MAX_CONCURRENCY: usize = 256;
 const DEFAULT_HEALTH_MAX_CONSECUTIVE_FAILURES: u64 = 3;
 const DEFAULT_HEALTH_MAX_SYNC_LAG_BLOCKS: u64 = 64;
 
@@ -40,6 +42,7 @@ struct DaemonConfig {
     rpc_timeout_secs: u64,
     rpc_max_retries: u32,
     rpc_retry_backoff_ms: u64,
+    rpc_max_concurrency: usize,
     bootnodes: Vec<String>,
     require_peers: bool,
     p2p_heartbeat_ms: u64,
@@ -53,6 +56,7 @@ struct RpcAppState {
     chain_id: String,
     sync_progress: Arc<Mutex<SyncProgress>>,
     health_policy: HealthPolicy,
+    rpc_slots: Arc<Semaphore>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -122,6 +126,7 @@ async fn main() -> Result<(), String> {
             max_consecutive_failures: config.health_max_consecutive_failures,
             max_sync_lag: config.health_max_sync_lag_blocks,
         },
+        rpc_slots: Arc::new(Semaphore::new(config.rpc_max_concurrency)),
     };
     let app = Router::new()
         .route("/", post(handle_rpc))
@@ -142,6 +147,7 @@ async fn main() -> Result<(), String> {
     );
     println!("rpc_bind: {}", config.rpc_bind);
     println!("poll_ms: {}", config.poll_ms);
+    println!("rpc_max_concurrency: {}", config.rpc_max_concurrency);
     if let Some(path) = &config.local_journal_path {
         println!("local_journal_path: {path}");
     }
@@ -186,6 +192,17 @@ async fn main() -> Result<(), String> {
 }
 
 async fn handle_rpc(State(state): State<RpcAppState>, raw: String) -> impl IntoResponse {
+    let _rpc_slot = match state.rpc_slots.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "rpc concurrency limit reached".to_string(),
+            )
+                .into_response();
+        }
+    };
+
     let sync_status = match state.sync_progress.lock() {
         Ok(progress) => SyncStatus {
             starting_block_num: progress.starting_block,
@@ -273,6 +290,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
     let mut cli_rpc_timeout_secs: Option<u64> = None;
     let mut cli_rpc_max_retries: Option<u32> = None;
     let mut cli_rpc_retry_backoff_ms: Option<u64> = None;
+    let mut cli_rpc_max_concurrency: Option<usize> = None;
     let mut cli_bootnodes: Vec<String> = Vec::new();
     let mut cli_require_peers = false;
     let mut cli_p2p_heartbeat_ms: Option<u64> = None;
@@ -348,6 +366,12 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
                     .ok_or_else(|| "--rpc-retry-backoff-ms requires a value".to_string())?;
                 cli_rpc_retry_backoff_ms =
                     Some(parse_positive_u64(&raw, "--rpc-retry-backoff-ms")?);
+            }
+            "--rpc-max-concurrency" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--rpc-max-concurrency requires a value".to_string())?;
+                cli_rpc_max_concurrency = Some(parse_positive_usize(&raw, "--rpc-max-concurrency")?);
             }
             "--bootnode" => {
                 cli_bootnodes.push(
@@ -425,6 +449,12 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
             parse_env_u64("PASTIS_RPC_RETRY_BACKOFF_MS")?.unwrap_or(DEFAULT_RPC_RETRY_BACKOFF_MS)
         }
     };
+    let rpc_max_concurrency = match cli_rpc_max_concurrency {
+        Some(value) => value,
+        None => {
+            parse_env_usize("PASTIS_RPC_MAX_CONCURRENCY")?.unwrap_or(DEFAULT_RPC_MAX_CONCURRENCY)
+        }
+    };
     let p2p_heartbeat_ms = match cli_p2p_heartbeat_ms {
         Some(value) => value,
         None => parse_env_u64("PASTIS_P2P_HEARTBEAT_MS")?.unwrap_or(DEFAULT_P2P_HEARTBEAT_MS),
@@ -457,6 +487,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         rpc_timeout_secs,
         rpc_max_retries,
         rpc_retry_backoff_ms,
+        rpc_max_concurrency,
         bootnodes,
         require_peers,
         p2p_heartbeat_ms,
@@ -475,6 +506,13 @@ fn parse_env_u64(name: &str) -> Result<Option<u64>, String> {
 fn parse_env_u32(name: &str) -> Result<Option<u32>, String> {
     match env::var(name) {
         Ok(raw) => Ok(Some(parse_non_negative_u32(&raw, name)?)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn parse_env_usize(name: &str) -> Result<Option<usize>, String> {
+    match env::var(name) {
+        Ok(raw) => Ok(Some(parse_positive_usize(&raw, name)?)),
         Err(_) => Ok(None),
     }
 }
@@ -508,6 +546,16 @@ fn parse_positive_u64(raw: &str, field: &str) -> Result<u64, String> {
 fn parse_non_negative_u32(raw: &str, field: &str) -> Result<u32, String> {
     raw.parse::<u32>()
         .map_err(|error| format!("invalid {field} value `{raw}`: {error}"))
+}
+
+fn parse_positive_usize(raw: &str, field: &str) -> Result<usize, String> {
+    let parsed = raw
+        .parse::<usize>()
+        .map_err(|error| format!("invalid {field} value `{raw}`: {error}"))?;
+    if parsed == 0 {
+        return Err(format!("invalid {field} value `{raw}`: must be > 0"));
+    }
+    Ok(parsed)
 }
 
 fn redact_rpc_url(raw: &str) -> String {
@@ -564,6 +612,7 @@ options:\n\
   --rpc-timeout-secs <secs>          Upstream RPC timeout\n\
   --rpc-max-retries <n>              Upstream RPC max retries\n\
   --rpc-retry-backoff-ms <ms>        Retry backoff base\n\
+  --rpc-max-concurrency <n>          Max concurrent local RPC requests (default: {DEFAULT_RPC_MAX_CONCURRENCY})\n\
   --bootnode <multiaddr>             Configure bootnode (repeatable)\n\
   --require-peers                    Fail closed when no peers are configured/available\n\
   --p2p-heartbeat-ms <ms>            P2P heartbeat logging interval\n\
@@ -579,6 +628,7 @@ environment:\n\
   PASTIS_RPC_TIMEOUT_SECS            Upstream RPC timeout seconds\n\
   PASTIS_RPC_MAX_RETRIES             Upstream RPC max retries\n\
   PASTIS_RPC_RETRY_BACKOFF_MS        Upstream RPC retry backoff ms\n\
+  PASTIS_RPC_MAX_CONCURRENCY         Max concurrent local RPC requests\n\
   PASTIS_BOOTNODES                   Comma-separated bootnodes\n\
   PASTIS_REQUIRE_PEERS               Require peers for sync loop health (true/false)\n\
   PASTIS_P2P_HEARTBEAT_MS            P2P heartbeat interval\n\
@@ -589,6 +639,13 @@ environment:\n\
 
 #[cfg(test)]
 mod tests {
+    use axum::body::to_bytes;
+    use serde_json::Value;
+    use tokio::sync::Semaphore;
+
+    use starknet_node_storage::{InMemoryStorage, ThreadSafeStorage};
+    use starknet_node_types::InMemoryState;
+
     use super::*;
 
     fn base_progress() -> SyncProgress {
@@ -637,5 +694,64 @@ mod tests {
         };
         let error = evaluate_health(&progress, &policy).expect_err("should fail health check");
         assert!(error.contains("sync_lag"));
+    }
+
+    #[tokio::test]
+    async fn handle_rpc_rejects_when_concurrency_limit_reached() {
+        let storage = ThreadSafeStorage::new(InMemoryStorage::new(InMemoryState::default()));
+        let state = RpcAppState {
+            storage,
+            chain_id: "SN_MAIN".to_string(),
+            sync_progress: Arc::new(Mutex::new(base_progress())),
+            health_policy: HealthPolicy {
+                max_consecutive_failures: 3,
+                max_sync_lag: 64,
+            },
+            rpc_slots: Arc::new(Semaphore::new(1)),
+        };
+
+        let _permit = state
+            .rpc_slots
+            .clone()
+            .try_acquire_owned()
+            .expect("should reserve the only slot");
+        let response = handle_rpc(
+            State(state),
+            r#"{"jsonrpc":"2.0","id":1,"method":"starknet_blockNumber","params":[]}"#
+                .to_string(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn handle_rpc_processes_request_when_slot_is_available() {
+        let storage = ThreadSafeStorage::new(InMemoryStorage::new(InMemoryState::default()));
+        let state = RpcAppState {
+            storage,
+            chain_id: "SN_MAIN".to_string(),
+            sync_progress: Arc::new(Mutex::new(base_progress())),
+            health_policy: HealthPolicy {
+                max_consecutive_failures: 3,
+                max_sync_lag: 64,
+            },
+            rpc_slots: Arc::new(Semaphore::new(1)),
+        };
+
+        let response = handle_rpc(
+            State(state),
+            r#"{"jsonrpc":"2.0","id":7,"method":"starknet_blockNumber","params":[]}"#
+                .to_string(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let payload: Value =
+            serde_json::from_slice(&bytes).expect("response body should be valid JSON");
+        assert_eq!(payload["result"], serde_json::json!(0));
     }
 }
