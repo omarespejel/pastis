@@ -34,9 +34,13 @@ const DEFAULT_REPLAY_CHECKPOINT_PATH: &str = ".pastis/node-replay-checkpoint.jso
 const DEFAULT_LOCAL_JOURNAL_PATH: &str = ".pastis/node-local-journal.jsonl";
 const DEFAULT_STORAGE_SNAPSHOT_PATH: &str = ".pastis/node-storage.snapshot";
 const DEFAULT_P2P_HEARTBEAT_MS: u64 = 30_000;
+const MIN_NETWORK_STALE_AFTER_MS: u64 = 30_000;
+const MAX_NETWORK_STALE_AFTER_MS: u64 = 600_000;
 const DEFAULT_RPC_MAX_CONCURRENCY: usize = 256;
 const DEFAULT_RPC_RATE_LIMIT_PER_MINUTE: u32 = 1_200;
 const MAX_RPC_RATE_LIMIT_PER_MINUTE: u32 = 100_000;
+const MAX_UPSTREAM_RPC_ENDPOINTS: usize = 16;
+const MAX_UPSTREAM_RPC_URL_BYTES: usize = 4 * 1024;
 const MAX_BOOTNODE_PROBE_CONCURRENCY: usize = 32;
 const MAX_BOOTNODES: usize = 1_024;
 const MAX_BOOTNODE_ENTRY_BYTES: usize = 1_024;
@@ -191,6 +195,34 @@ struct RpcRuntimeMetrics {
     internal_error_total: u64,
 }
 
+#[derive(Debug)]
+struct BootnodeObservation {
+    peer_count: AtomicU64,
+    observed_at_unix_seconds: AtomicU64,
+}
+
+impl BootnodeObservation {
+    fn new(peer_count: u64, observed_at_unix_seconds: u64) -> Self {
+        Self {
+            peer_count: AtomicU64::new(peer_count),
+            observed_at_unix_seconds: AtomicU64::new(observed_at_unix_seconds),
+        }
+    }
+
+    fn update(&self, peer_count: u64, observed_at_unix_seconds: u64) {
+        self.peer_count.store(peer_count, Ordering::Relaxed);
+        self.observed_at_unix_seconds
+            .store(observed_at_unix_seconds, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.peer_count.load(Ordering::Relaxed),
+            self.observed_at_unix_seconds.load(Ordering::Relaxed),
+        )
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let config = parse_daemon_config()?;
@@ -201,6 +233,11 @@ async fn main() -> Result<(), String> {
                 .to_string(),
         );
     }
+    let initial_peers = if bootnode_endpoints.is_empty() {
+        0
+    } else {
+        probe_bootnodes(&bootnode_endpoints, Duration::from_millis(1_500)).await
+    };
 
     let runtime_config = RuntimeConfig {
         chain_id: config.chain_id.clone(),
@@ -220,13 +257,20 @@ async fn main() -> Result<(), String> {
             base_backoff: Duration::from_millis(config.rpc_retry_backoff_ms),
         },
         disable_batch_requests: config.disable_batch_requests,
-        // Runtime-level network backend is static today; daemon owns live bootnode probing.
-        peer_count_hint: 0,
-        require_peers: false,
+        network_stale_after: derive_network_stale_after(config.p2p_heartbeat_ms),
+        peer_count_hint: initial_peers,
+        require_peers: config.require_peers,
         storage: None,
     };
 
+    let initial_observed_at = unix_now_seconds();
+    let bootnode_observation = Arc::new(BootnodeObservation::new(
+        initial_peers as u64,
+        initial_observed_at,
+    ));
+
     let mut runtime = NodeRuntime::new(runtime_config)?;
+    runtime.report_peer_observation(initial_peers, initial_observed_at);
     let storage = runtime.storage();
     let sync_progress = runtime.sync_progress_handle();
     let chain_id = runtime.chain_id().to_string();
@@ -248,14 +292,8 @@ async fn main() -> Result<(), String> {
         rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
     };
 
-    let bootnode_peer_count = Arc::new(AtomicU64::new(0));
-    if !bootnode_endpoints.is_empty() {
-        let initial_peers =
-            probe_bootnodes(&bootnode_endpoints, Duration::from_millis(1_500)).await;
-        bootnode_peer_count.store(initial_peers as u64, Ordering::Relaxed);
-        if let Ok(mut progress) = app_state.sync_progress.lock() {
-            progress.peer_count = initial_peers as u64;
-        }
+    if let Ok(mut progress) = app_state.sync_progress.lock() {
+        progress.peer_count = initial_peers as u64;
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -264,7 +302,7 @@ async fn main() -> Result<(), String> {
         let endpoints = bootnode_endpoints.clone();
         let bootnode_count = endpoints.len();
         let heartbeat_ms = config.p2p_heartbeat_ms.max(1_000);
-        let peer_counter = bootnode_peer_count.clone();
+        let observation = Arc::clone(&bootnode_observation);
         let sync_progress = app_state.sync_progress.clone();
         let heartbeat_shutdown_rx = shutdown_rx.clone();
         Some(tokio::spawn(async move {
@@ -272,7 +310,7 @@ async fn main() -> Result<(), String> {
                 endpoints,
                 bootnode_count,
                 heartbeat_ms,
-                peer_counter,
+                observation,
                 sync_progress,
                 heartbeat_shutdown_rx,
             )
@@ -298,8 +336,8 @@ async fn main() -> Result<(), String> {
     println!("starknet-node daemon starting");
     println!("chain_id: {chain_id}");
     println!(
-        "upstream_rpc_url: {}",
-        redact_rpc_url(&config.upstream_rpc_url)
+        "upstream_rpc_urls: {}",
+        redact_rpc_urls(&config.upstream_rpc_url)
     );
     println!("rpc_bind: {}", config.rpc_bind);
     println!("poll_ms: {}", config.poll_ms);
@@ -364,6 +402,8 @@ async fn main() -> Result<(), String> {
                 break;
             }
             _ = ticker.tick() => {
+                let (observed_peers, observed_at) = bootnode_observation.snapshot();
+                runtime.report_peer_observation(observed_peers as usize, observed_at);
                 if let Err(error) = runtime.poll_once().await {
                     eprintln!("warning: sync poll failed: {error}");
                 }
@@ -372,7 +412,7 @@ async fn main() -> Result<(), String> {
                     let mut progress = progress_handle
                         .lock()
                         .map_err(|_| "sync progress lock poisoned".to_string())?;
-                    progress.peer_count = bootnode_peer_count.load(Ordering::Relaxed);
+                    progress.peer_count = observed_peers;
                     progress.clone()
                 };
                 if let Some(reason) = unhealthy_exit_reason(
@@ -617,6 +657,14 @@ fn new_daemon_interval(period: Duration) -> tokio::time::Interval {
     ticker
 }
 
+fn derive_network_stale_after(heartbeat_ms: u64) -> Duration {
+    let heartbeat_ms = heartbeat_ms.max(1_000);
+    let stale_ms = heartbeat_ms
+        .saturating_mul(4)
+        .clamp(MIN_NETWORK_STALE_AFTER_MS, MAX_NETWORK_STALE_AFTER_MS);
+    Duration::from_millis(stale_ms)
+}
+
 async fn wait_for_shutdown_signal(shutdown_rx: &mut watch::Receiver<bool>) {
     loop {
         if *shutdown_rx.borrow() {
@@ -632,7 +680,7 @@ async fn run_bootnode_heartbeat(
     endpoints: Vec<BootnodeEndpoint>,
     bootnode_count: usize,
     heartbeat_ms: u64,
-    peer_counter: Arc<AtomicU64>,
+    observation: Arc<BootnodeObservation>,
     sync_progress: Arc<Mutex<SyncProgress>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
@@ -647,7 +695,7 @@ async fn run_bootnode_heartbeat(
             }
             _ = ticker.tick() => {
                 let reachable = probe_bootnodes(&endpoints, Duration::from_millis(1_500)).await;
-                peer_counter.store(reachable as u64, Ordering::Relaxed);
+                observation.update(reachable as u64, unix_now_seconds());
                 if let Ok(mut progress) = sync_progress.lock() {
                     progress.peer_count = reachable as u64;
                 }
@@ -1128,18 +1176,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         .ok_or_else(|| {
             "missing upstream RPC URL; pass --upstream-rpc-url or set STARKNET_RPC_URL".to_string()
         })?;
-    let parsed_url = reqwest::Url::parse(&upstream_rpc_url)
-        .map_err(|error| format!("invalid upstream RPC URL `{upstream_rpc_url}`: {error}"))?;
-    if !matches!(parsed_url.scheme(), "http" | "https") {
-        return Err(format!(
-            "invalid upstream RPC URL `{upstream_rpc_url}`: scheme must be http or https"
-        ));
-    }
-    if parsed_url.host_str().is_none() {
-        return Err(format!(
-            "invalid upstream RPC URL `{upstream_rpc_url}`: host is required"
-        ));
-    }
+    let _validated_upstreams = parse_upstream_rpc_urls(&upstream_rpc_url)?;
 
     let chain_id = match cli_chain_id {
         Some(id) => id,
@@ -1346,6 +1383,55 @@ fn parse_positive_usize(raw: &str, field: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
+fn parse_upstream_rpc_urls(raw: &str) -> Result<Vec<String>, String> {
+    if raw.trim().is_empty() {
+        return Err("invalid upstream RPC URL list: empty input".to_string());
+    }
+
+    let mut urls = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in raw.split(',') {
+        let candidate = entry.trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        if candidate.len() > MAX_UPSTREAM_RPC_URL_BYTES {
+            return Err(format!(
+                "invalid upstream RPC URL entry: exceeds max {} bytes",
+                MAX_UPSTREAM_RPC_URL_BYTES
+            ));
+        }
+        if candidate.chars().any(char::is_control) {
+            return Err(
+                "invalid upstream RPC URL entry: must not contain control characters".to_string(),
+            );
+        }
+        let parsed = reqwest::Url::parse(candidate)
+            .map_err(|error| format!("invalid upstream RPC URL entry: {error}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err("invalid upstream RPC URL entry: scheme must be http or https".to_string());
+        }
+        if parsed.host_str().is_none() {
+            return Err("invalid upstream RPC URL entry: host is required".to_string());
+        }
+        if seen.insert(candidate.to_string()) {
+            if urls.len().saturating_add(1) > MAX_UPSTREAM_RPC_ENDPOINTS {
+                return Err(format!(
+                    "invalid upstream RPC URL list: {} endpoints configured; max supported is {}",
+                    urls.len().saturating_add(1),
+                    MAX_UPSTREAM_RPC_ENDPOINTS
+                ));
+            }
+            urls.push(candidate.to_string());
+        }
+    }
+
+    if urls.is_empty() {
+        return Err("invalid upstream RPC URL list: no valid URLs provided".to_string());
+    }
+    Ok(urls)
+}
+
 fn validate_rpc_rate_limit_per_minute(value: u32) -> Result<u32, String> {
     if value > MAX_RPC_RATE_LIMIT_PER_MINUTE {
         return Err(format!(
@@ -1532,6 +1618,17 @@ fn redact_rpc_url(raw: &str) -> String {
     }
 }
 
+fn redact_rpc_urls(raw: &str) -> String {
+    parse_upstream_rpc_urls(raw)
+        .map(|urls| {
+            urls.iter()
+                .map(|url| redact_rpc_url(url))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_else(|_| redact_rpc_url(raw))
+}
+
 fn evaluate_health(progress: &SyncProgress, policy: &HealthPolicy) -> Result<(), String> {
     if policy.require_peers && progress.peer_count == 0 {
         return Err("unhealthy: peer_count=0 while peers are required".to_string());
@@ -1603,7 +1700,7 @@ fn unhealthy_exit_reason(
 
 fn help_text() -> String {
     format!(
-        "usage: starknet-node --upstream-rpc-url <url> [options]\n\
+        "usage: starknet-node --upstream-rpc-url <url[,url...]> [options]\n\
 options:\n\
   --rpc-bind <addr>                  JSON-RPC bind address (default: {DEFAULT_RPC_BIND})\n\
   --rpc-auth-token <token>           Require bearer token for POST / JSON-RPC\n\
@@ -1629,7 +1726,7 @@ options:\n\
   --exit-on-unhealthy                Exit daemon when health checks fail\n\
   --p2p-heartbeat-ms <ms>            P2P heartbeat logging interval\n\
 environment:\n\
-  STARKNET_RPC_URL                   Upstream Starknet RPC URL\n\
+  STARKNET_RPC_URL                   Upstream Starknet RPC URL (single URL or comma-separated failover list)\n\
   PASTIS_NODE_RPC_BIND               Local JSON-RPC bind\n\
   PASTIS_RPC_AUTH_TOKEN              Bearer token required for POST / JSON-RPC\n\
   PASTIS_ALLOW_PUBLIC_RPC_BIND       Allow non-loopback RPC bind without token (true/false)\n\
@@ -1705,6 +1802,22 @@ mod tests {
         assert_eq!(
             ticker.missed_tick_behavior(),
             tokio::time::MissedTickBehavior::Delay
+        );
+    }
+
+    #[test]
+    fn derive_network_stale_after_scales_with_heartbeat_and_respects_bounds() {
+        assert_eq!(
+            derive_network_stale_after(250),
+            Duration::from_millis(MIN_NETWORK_STALE_AFTER_MS)
+        );
+        assert_eq!(
+            derive_network_stale_after(30_000),
+            Duration::from_millis(120_000)
+        );
+        assert_eq!(
+            derive_network_stale_after(500_000),
+            Duration::from_millis(MAX_NETWORK_STALE_AFTER_MS)
         );
     }
 
@@ -1834,6 +1947,58 @@ mod tests {
         assert_eq!(parse_bootnode_endpoint("127.0.0.1:0"), None);
         assert_eq!(parse_bootnode_endpoint("/ip4/127.0.0.1/tcp/0"), None);
         assert_eq!(parse_bootnode_endpoint("bad host:30303"), None);
+    }
+
+    #[test]
+    fn parse_upstream_rpc_urls_accepts_comma_separated_urls_and_deduplicates() {
+        let parsed = parse_upstream_rpc_urls(
+            "https://rpc-1.example, https://rpc-2.example:9545, https://rpc-1.example",
+        )
+        .expect("valid upstream URL list should parse");
+        assert_eq!(
+            parsed,
+            vec![
+                "https://rpc-1.example".to_string(),
+                "https://rpc-2.example:9545".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_upstream_rpc_urls_rejects_excessive_endpoint_count() {
+        let raw = (0..=MAX_UPSTREAM_RPC_ENDPOINTS)
+            .map(|index| format!("https://rpc-{index}.example"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let error = parse_upstream_rpc_urls(&raw)
+            .expect_err("too many upstream endpoints must fail closed");
+        assert!(error.contains("max supported"));
+    }
+
+    #[test]
+    fn parse_upstream_rpc_urls_rejects_oversized_entries() {
+        let oversized = format!(
+            "https://rpc.example/{}",
+            "a".repeat(MAX_UPSTREAM_RPC_URL_BYTES + 1)
+        );
+        let error = parse_upstream_rpc_urls(&oversized)
+            .expect_err("oversized URL entries must fail closed");
+        assert!(error.contains("exceeds max"));
+    }
+
+    #[test]
+    fn parse_upstream_rpc_urls_rejects_control_characters() {
+        let error = parse_upstream_rpc_urls("https://rpc.\nexample")
+            .expect_err("control chars in URL must fail closed");
+        assert!(error.contains("control characters"));
+    }
+
+    #[test]
+    fn parse_upstream_rpc_urls_error_does_not_echo_secrets() {
+        let error = parse_upstream_rpc_urls("https://user:supersecret@")
+            .expect_err("malformed URL must fail");
+        assert!(!error.contains("supersecret"));
+        assert!(error.contains("invalid upstream RPC URL entry"));
     }
 
     #[tokio::test]
@@ -2010,13 +2175,13 @@ mod tests {
     #[tokio::test]
     async fn bootnode_heartbeat_stops_when_shutdown_requested() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let peer_counter = Arc::new(AtomicU64::new(0));
+        let observation = Arc::new(BootnodeObservation::new(0, unix_now_seconds()));
         let sync_progress = Arc::new(Mutex::new(base_progress()));
         let heartbeat = tokio::spawn(run_bootnode_heartbeat(
             Vec::new(),
             0,
             1_000,
-            peer_counter,
+            observation,
             sync_progress,
             shutdown_rx,
         ));
@@ -2038,27 +2203,27 @@ mod tests {
         let addr = listener.local_addr().expect("listener local addr");
         let endpoints = vec![BootnodeEndpoint::Socket(addr)];
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let peer_counter = Arc::new(AtomicU64::new(0));
+        let observation = Arc::new(BootnodeObservation::new(0, unix_now_seconds()));
         let sync_progress = Arc::new(Mutex::new(base_progress()));
         let heartbeat = tokio::spawn(run_bootnode_heartbeat(
             endpoints,
             1,
             250,
-            peer_counter.clone(),
+            observation.clone(),
             sync_progress.clone(),
             shutdown_rx,
         ));
 
         tokio::time::sleep(Duration::from_millis(50)).await;
+        let (initial_peers, _) = observation.snapshot();
         assert_eq!(
-            peer_counter.load(Ordering::Relaxed),
-            0,
+            initial_peers, 0,
             "heartbeat should not probe before one full interval"
         );
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if peer_counter.load(Ordering::Relaxed) >= 1 {
+                if observation.snapshot().0 >= 1 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;

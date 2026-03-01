@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,6 +20,8 @@ use crate::replay::{
     FileReplayCheckpointStore, ReplayPipeline, ReplayPipelineError, ReplayPipelineStep,
 };
 use crate::{ChainId, NodeConfig, StarknetNode, StarknetNodeBuilder};
+#[cfg(feature = "production-adapters")]
+use starknet_node_execution::BlockifierVmBackend;
 use starknet_node_execution::{
     DualExecutionBackend, ExecutionBackend, ExecutionError, ExecutionMode, MismatchPolicy,
 };
@@ -31,8 +33,9 @@ use starknet_node_storage::{
 use starknet_node_types::ExecutableStarknetTransaction;
 use starknet_node_types::{
     BlockContext, BlockGasPrices, BuiltinStats, ClassHash, ContractAddress, ExecutionOutput,
-    GasPricePerToken, InMemoryState, MutableState, SimulationResult, StarknetBlock, StarknetFelt,
-    StarknetReceipt, StarknetStateDiff, StarknetTransaction, StateReader, TxHash,
+    GasPricePerToken, InMemoryState, MAX_TRANSACTIONS_PER_BLOCK, MutableState, SimulationResult,
+    StarknetBlock, StarknetFelt, StarknetReceipt, StarknetStateDiff, StarknetTransaction,
+    StateReader, TxHash,
 };
 
 pub const DEFAULT_SYNC_POLL_MS: u64 = 1_500;
@@ -43,6 +46,7 @@ pub const DEFAULT_RPC_MAX_RETRIES: u32 = 3;
 pub const DEFAULT_RPC_RETRY_BACKOFF_MS: u64 = 250;
 pub const DEFAULT_CHAIN_ID_REVALIDATE_POLLS: u64 = 64;
 const MAX_UPSTREAM_RPC_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_UPSTREAM_RPC_URL_BYTES: usize = 4 * 1024;
 const MAX_LOCAL_JOURNAL_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_LOCAL_JOURNAL_LINE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RUNTIME_STORAGE_SNAPSHOT_FILE_BYTES: u64 = 512 * 1024 * 1024;
@@ -54,10 +58,12 @@ const MAX_RPC_RETRY_BACKOFF_MS: u64 = 5_000;
 const MAX_UPSTREAM_RPC_CONNECT_TIMEOUT_SECS: u64 = 5;
 const UPSTREAM_RPC_POOL_IDLE_TIMEOUT_SECS: u64 = 30;
 const UPSTREAM_RPC_POOL_MAX_IDLE_PER_HOST: usize = 16;
+const MAX_UPSTREAM_RPC_ENDPOINTS: usize = 16;
 const UPSTREAM_REQUEST_ID: u64 = 1;
 const UPSTREAM_BATCH_REQUEST_ID_BASE: u64 = 10_000;
 const RUNTIME_STORAGE_SNAPSHOT_VERSION: u32 = 1;
 pub const DEFAULT_STORAGE_SNAPSHOT_INTERVAL_BLOCKS: u64 = 128;
+const DEFAULT_CONSENSUS_MAX_FUTURE_SKEW_SECS: u64 = 120;
 const BATCH_MODE_AUTO: u8 = 0;
 const BATCH_MODE_SUPPORTED: u8 = 1;
 const BATCH_MODE_UNSUPPORTED: u8 = 2;
@@ -98,25 +104,13 @@ pub struct RuntimeConfig {
     pub storage_snapshot_path: Option<String>,
     pub storage_snapshot_interval_blocks: u64,
     pub disable_batch_requests: bool,
+    pub network_stale_after: Duration,
     pub storage: Option<ThreadSafeStorage<InMemoryStorage>>,
 }
 
 impl RuntimeConfig {
     fn validate(&self) -> Result<(), String> {
-        if self.upstream_rpc_url.trim().is_empty() {
-            return Err("upstream_rpc_url cannot be empty".to_string());
-        }
-        let parsed = reqwest::Url::parse(self.upstream_rpc_url.trim())
-            .map_err(|error| format!("upstream_rpc_url is invalid: {error}"))?;
-        if !matches!(parsed.scheme(), "http" | "https") {
-            return Err(format!(
-                "upstream_rpc_url must use http or https, got `{}`",
-                parsed.scheme()
-            ));
-        }
-        if parsed.host_str().is_none() {
-            return Err("upstream_rpc_url must include a host".to_string());
-        }
+        let _ = parse_upstream_rpc_urls(&self.upstream_rpc_url)?;
         if self.replay_window == 0 {
             return Err("replay_window must be > 0".to_string());
         }
@@ -131,6 +125,9 @@ impl RuntimeConfig {
         }
         if self.rpc_timeout.is_zero() {
             return Err("rpc_timeout must be > 0".to_string());
+        }
+        if self.network_stale_after.is_zero() {
+            return Err("network_stale_after must be > 0".to_string());
         }
         if let Some(path) = self.local_journal_path.as_deref()
             && path.trim().is_empty()
@@ -147,6 +144,61 @@ impl RuntimeConfig {
         }
         Ok(())
     }
+}
+
+fn parse_upstream_rpc_urls(raw: &str) -> Result<Vec<String>, String> {
+    if raw.trim().is_empty() {
+        return Err("upstream_rpc_url cannot be empty".to_string());
+    }
+
+    let mut urls = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in raw.split(',') {
+        let candidate = entry.trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        validate_upstream_rpc_url(candidate)?;
+        if seen.insert(candidate.to_string()) {
+            if urls.len().saturating_add(1) > MAX_UPSTREAM_RPC_ENDPOINTS {
+                return Err(format!(
+                    "upstream_rpc_url config has {} endpoints; max supported is {}",
+                    urls.len().saturating_add(1),
+                    MAX_UPSTREAM_RPC_ENDPOINTS
+                ));
+            }
+            urls.push(candidate.to_string());
+        }
+    }
+
+    if urls.is_empty() {
+        return Err("upstream_rpc_url must include at least one valid URL".to_string());
+    }
+    Ok(urls)
+}
+
+fn validate_upstream_rpc_url(raw: &str) -> Result<(), String> {
+    if raw.len() > MAX_UPSTREAM_RPC_URL_BYTES {
+        return Err(format!(
+            "upstream_rpc_url entry exceeds max {} bytes",
+            MAX_UPSTREAM_RPC_URL_BYTES
+        ));
+    }
+    if raw.chars().any(char::is_control) {
+        return Err("upstream_rpc_url must not contain control characters".to_string());
+    }
+    let parsed = reqwest::Url::parse(raw)
+        .map_err(|error| format!("upstream_rpc_url is invalid: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!(
+            "upstream_rpc_url must use http or https, got `{}`",
+            parsed.scheme()
+        ));
+    }
+    if parsed.host_str().is_none() {
+        return Err("upstream_rpc_url must include a host".to_string());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -651,6 +703,107 @@ trait SyncSource: Send + Sync {
     fn fetch_block(&self, block_number: u64) -> SyncSourceFuture<'_, RuntimeFetch>;
 }
 
+#[derive(Clone)]
+struct NamedSyncSource {
+    name: String,
+    source: Arc<dyn SyncSource>,
+}
+
+#[derive(Clone)]
+struct FailoverSyncSource {
+    sources: Arc<Vec<NamedSyncSource>>,
+    active_index: Arc<AtomicUsize>,
+}
+
+impl FailoverSyncSource {
+    fn new(sources: Vec<NamedSyncSource>) -> Result<Self, String> {
+        if sources.is_empty() {
+            return Err("failover sync source requires at least one endpoint".to_string());
+        }
+        Ok(Self {
+            sources: Arc::new(sources),
+            active_index: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    fn start_index(&self) -> usize {
+        let total = self.sources.len();
+        debug_assert!(
+            total > 0,
+            "FailoverSyncSource::new validates non-empty sources"
+        );
+        self.active_index.load(Ordering::Relaxed) % total
+    }
+
+    fn mark_active(&self, index: usize) {
+        self.active_index.store(index, Ordering::Relaxed);
+    }
+
+    async fn try_with_failover<T, F>(&self, operation: &str, mut call: F) -> Result<T, String>
+    where
+        F: for<'a> FnMut(&'a Arc<dyn SyncSource>) -> SyncSourceFuture<'a, T>,
+    {
+        let total = self.sources.len();
+        let start = self.start_index();
+        let mut errors = Vec::with_capacity(total);
+        for offset in 0..total {
+            let index = (start + offset) % total;
+            let entry = &self.sources[index];
+            match call(&entry.source).await {
+                Ok(result) => {
+                    self.mark_active(index);
+                    return Ok(result);
+                }
+                Err(error) => {
+                    errors.push(format!(
+                        "{}: {}",
+                        entry.name,
+                        sanitize_error_message(&error, MAX_RPC_ERROR_CONTEXT_CHARS)
+                    ));
+                }
+            }
+        }
+        Err(Self::error_for_all_sources(operation, errors))
+    }
+
+    fn error_for_all_sources(operation: &str, errors: Vec<String>) -> String {
+        format!(
+            "all upstream RPC endpoints failed for {operation}: {}",
+            errors.join(" | ")
+        )
+    }
+}
+
+impl SyncSource for FailoverSyncSource {
+    fn fetch_latest_block_number(&self) -> SyncSourceFuture<'_, u64> {
+        let this = self.clone();
+        Box::pin(async move {
+            this.try_with_failover("starknet_blockHashAndNumber", |source| {
+                source.fetch_latest_block_number()
+            })
+            .await
+        })
+    }
+
+    fn fetch_chain_id(&self) -> SyncSourceFuture<'_, String> {
+        let this = self.clone();
+        Box::pin(async move {
+            this.try_with_failover("starknet_chainId", |source| source.fetch_chain_id())
+                .await
+        })
+    }
+
+    fn fetch_block(&self, block_number: u64) -> SyncSourceFuture<'_, RuntimeFetch> {
+        let this = self.clone();
+        Box::pin(async move {
+            this.try_with_failover("starknet_getBlockWithTxs/getStateUpdate", |source| {
+                source.fetch_block(block_number)
+            })
+            .await
+        })
+    }
+}
+
 async fn fetch_block_with_retry_from_source(
     sync_source: Arc<dyn SyncSource>,
     retry: RpcRetryConfig,
@@ -713,10 +866,97 @@ trait ConsensusBackend: Send + Sync {
     fn validate_block(&self, input: &ConsensusInput) -> Result<ConsensusVerdict, String>;
 }
 
-struct AllowAllConsensusBackend;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProductionConsensusPolicy {
+    max_future_skew_secs: u64,
+    reject_timestamp_regression: bool,
+}
 
-impl ConsensusBackend for AllowAllConsensusBackend {
-    fn validate_block(&self, _input: &ConsensusInput) -> Result<ConsensusVerdict, String> {
+impl Default for ProductionConsensusPolicy {
+    fn default() -> Self {
+        Self {
+            max_future_skew_secs: DEFAULT_CONSENSUS_MAX_FUTURE_SKEW_SECS,
+            reject_timestamp_regression: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedConsensusHead {
+    block_number: u64,
+    block_hash: String,
+    timestamp: u64,
+}
+
+struct ProductionConsensusBackend {
+    policy: ProductionConsensusPolicy,
+    last_head: Mutex<Option<ObservedConsensusHead>>,
+}
+
+impl ProductionConsensusBackend {
+    fn new(policy: ProductionConsensusPolicy) -> Self {
+        Self {
+            policy,
+            last_head: Mutex::new(None),
+        }
+    }
+}
+
+impl Default for ProductionConsensusBackend {
+    fn default() -> Self {
+        Self::new(ProductionConsensusPolicy::default())
+    }
+}
+
+impl ConsensusBackend for ProductionConsensusBackend {
+    fn validate_block(&self, input: &ConsensusInput) -> Result<ConsensusVerdict, String> {
+        if input.tx_count > MAX_TRANSACTIONS_PER_BLOCK {
+            return Ok(ConsensusVerdict::Reject);
+        }
+        if StarknetFelt::from_str(&input.block_hash).is_err()
+            || StarknetFelt::from_str(&input.parent_hash).is_err()
+        {
+            return Ok(ConsensusVerdict::Reject);
+        }
+        let now = unix_now_seconds();
+        if input.timestamp > now.saturating_add(self.policy.max_future_skew_secs) {
+            return Ok(ConsensusVerdict::Reject);
+        }
+
+        let mut last_head = self
+            .last_head
+            .lock()
+            .map_err(|_| "consensus state lock poisoned".to_string())?;
+
+        if let Some(previous) = last_head.as_ref() {
+            if input.external_block_number < previous.block_number {
+                return Ok(ConsensusVerdict::Reject);
+            }
+            if input.external_block_number == previous.block_number {
+                if input.block_hash == previous.block_hash && input.timestamp == previous.timestamp
+                {
+                    return Ok(ConsensusVerdict::Accept);
+                }
+                return Ok(ConsensusVerdict::Reject);
+            }
+            if input.external_block_number > previous.block_number.saturating_add(1) {
+                return Ok(ConsensusVerdict::Reject);
+            }
+            if input.external_block_number == previous.block_number.saturating_add(1)
+                && input.parent_hash != previous.block_hash
+            {
+                return Ok(ConsensusVerdict::Reject);
+            }
+            if self.policy.reject_timestamp_regression && input.timestamp < previous.timestamp {
+                return Ok(ConsensusVerdict::Reject);
+            }
+        }
+
+        *last_head = Some(ObservedConsensusHead {
+            block_number: input.external_block_number,
+            block_hash: input.block_hash.clone(),
+            timestamp: input.timestamp,
+        });
         Ok(ConsensusVerdict::Accept)
     }
 }
@@ -724,30 +964,65 @@ impl ConsensusBackend for AllowAllConsensusBackend {
 trait NetworkBackend: Send + Sync {
     fn is_healthy(&self) -> bool;
     fn peer_count(&self) -> usize;
+    fn report_peer_observation(&self, _peer_count: usize, _observed_at_unix_seconds: u64) {}
+    fn report_peer_count(&self, peer_count: usize) {
+        self.report_peer_observation(peer_count, unix_now_seconds());
+    }
 }
 
-struct StaticNetworkBackend {
-    peer_count: usize,
-    healthy: bool,
+struct ProductionNetworkBackend {
+    peer_count: AtomicUsize,
+    require_peers: bool,
+    stale_after_secs: u64,
+    has_observation: AtomicBool,
+    last_observation_unix_seconds: AtomicU64,
 }
 
-impl StaticNetworkBackend {
-    fn from_config(peer_count: usize, require_peers: bool) -> Self {
-        let healthy = !require_peers || peer_count > 0;
+impl ProductionNetworkBackend {
+    fn from_config(peer_count: usize, require_peers: bool, stale_after_secs: u64) -> Self {
+        let now = unix_now_seconds();
+        let has_observation = !require_peers || peer_count > 0;
         Self {
-            peer_count,
-            healthy,
+            peer_count: AtomicUsize::new(peer_count),
+            require_peers,
+            stale_after_secs: stale_after_secs.max(1),
+            has_observation: AtomicBool::new(has_observation),
+            last_observation_unix_seconds: AtomicU64::new(now),
         }
     }
 }
 
-impl NetworkBackend for StaticNetworkBackend {
+impl NetworkBackend for ProductionNetworkBackend {
     fn is_healthy(&self) -> bool {
-        self.healthy
+        if !self.require_peers {
+            return true;
+        }
+        let peer_count = self.peer_count.load(Ordering::Relaxed);
+        if peer_count == 0 {
+            return false;
+        }
+        if !self.has_observation.load(Ordering::Relaxed) {
+            return false;
+        }
+        let last_observed = self.last_observation_unix_seconds.load(Ordering::Relaxed);
+        let now = unix_now_seconds();
+        now.saturating_sub(last_observed) <= self.stale_after_secs
     }
 
     fn peer_count(&self) -> usize {
-        self.peer_count
+        self.peer_count.load(Ordering::Relaxed)
+    }
+
+    fn report_peer_observation(&self, peer_count: usize, observed_at_unix_seconds: u64) {
+        self.peer_count.store(peer_count, Ordering::Relaxed);
+        let observed_at = if observed_at_unix_seconds == 0 {
+            unix_now_seconds()
+        } else {
+            observed_at_unix_seconds
+        };
+        self.last_observation_unix_seconds
+            .store(observed_at, Ordering::Relaxed);
+        self.has_observation.store(true, Ordering::Relaxed);
     }
 }
 
@@ -774,15 +1049,33 @@ pub struct NodeRuntime {
 impl NodeRuntime {
     pub fn new(config: RuntimeConfig) -> Result<Self, String> {
         config.validate()?;
-        let sync_source = Arc::new(UpstreamRpcClient::new(
-            config.upstream_rpc_url.clone(),
-            config.rpc_timeout,
-            config.disable_batch_requests,
-        )?);
-        let consensus = Arc::new(AllowAllConsensusBackend);
-        let network = Arc::new(StaticNetworkBackend::from_config(
+        let upstream_rpc_urls = parse_upstream_rpc_urls(&config.upstream_rpc_url)?;
+        let sync_source: Arc<dyn SyncSource> = if upstream_rpc_urls.len() == 1 {
+            Arc::new(UpstreamRpcClient::new(
+                upstream_rpc_urls[0].clone(),
+                config.rpc_timeout,
+                config.disable_batch_requests,
+            )?)
+        } else {
+            let mut sources = Vec::with_capacity(upstream_rpc_urls.len());
+            for (index, url) in upstream_rpc_urls.iter().enumerate() {
+                let client = Arc::new(UpstreamRpcClient::new(
+                    url.clone(),
+                    config.rpc_timeout,
+                    config.disable_batch_requests,
+                )?);
+                sources.push(NamedSyncSource {
+                    name: format!("endpoint-{}({})", index + 1, redact_upstream_endpoint(url)),
+                    source: client,
+                });
+            }
+            Arc::new(FailoverSyncSource::new(sources)?)
+        };
+        let consensus = Arc::new(ProductionConsensusBackend::default());
+        let network = Arc::new(ProductionNetworkBackend::from_config(
             config.peer_count_hint,
             config.require_peers,
+            config.network_stale_after.as_secs().max(1),
         ));
         Self::new_with_backends(config, sync_source, consensus, network)
     }
@@ -885,6 +1178,7 @@ impl NodeRuntime {
             starting_block: storage_tip,
             current_block: storage_tip,
             highest_block: storage_tip,
+            peer_count: network.peer_count() as u64,
             ..SyncProgress::default()
         };
         progress.reorg_events = replay.reorg_events();
@@ -932,6 +1226,21 @@ impl NodeRuntime {
 
     pub fn diagnostics(&self) -> RuntimeDiagnostics {
         self.diagnostics.clone()
+    }
+
+    pub fn report_peer_count(&self, peer_count: usize) {
+        self.network.report_peer_count(peer_count);
+        let _ = self.update_sync_progress(|progress| {
+            progress.peer_count = peer_count as u64;
+        });
+    }
+
+    pub fn report_peer_observation(&self, peer_count: usize, observed_at_unix_seconds: u64) {
+        self.network
+            .report_peer_observation(peer_count, observed_at_unix_seconds);
+        let _ = self.update_sync_progress(|progress| {
+            progress.peer_count = peer_count as u64;
+        });
     }
 
     pub async fn poll_once(&mut self) -> Result<(), String> {
@@ -1062,21 +1371,40 @@ impl NodeRuntime {
             })?;
             let local_block_for_journal = local_block.clone();
 
-            if let Err(error) = self
+            let base_execution_state = self.execution_state.clone();
+            let mut execution_validation_state = base_execution_state.clone();
+            let execution_output = match self
                 .node
                 .execution
-                .execute_block(&local_block, &mut self.execution_state)
+                .execute_block(&local_block, &mut execution_validation_state)
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    self.diagnostics.execution_failures =
+                        self.diagnostics.execution_failures.saturating_add(1);
+                    let message = format!(
+                        "execution failed for local block {local_block_number} (external {external_block}): {error}"
+                    );
+                    self.record_failure(message.clone());
+                    return Err(message);
+                }
+            };
+
+            if state_diff_has_mutations(&execution_output.state_diff)
+                && execution_output.state_diff != fetch.state_diff
             {
                 self.diagnostics.execution_failures =
                     self.diagnostics.execution_failures.saturating_add(1);
                 let message = format!(
-                    "execution failed for local block {local_block_number} (external {external_block}): {error}"
+                    "execution state diff mismatch for local block {local_block_number} (external {external_block}): expected {} from upstream, got {} from execution backend",
+                    summarize_state_diff(&fetch.state_diff),
+                    summarize_state_diff(&execution_output.state_diff)
                 );
                 self.record_failure(message.clone());
                 return Err(message);
             }
 
-            let mut staged_execution_state = self.execution_state.clone();
+            let mut staged_execution_state = base_execution_state;
             if let Err(error) =
                 apply_state_diff_checked(&mut staged_execution_state, &fetch.state_diff)
             {
@@ -2025,6 +2353,13 @@ fn retry_backoff_with_jitter(base_backoff: Duration, attempt: u32, seed: u64) ->
     Duration::from_millis(spread.saturating_add(1))
 }
 
+fn unix_now_seconds() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(_) => 0,
+    }
+}
+
 fn next_retry_jitter_seed(salt: u64) -> u64 {
     let nonce = RETRY_JITTER_NONCE.fetch_add(1, Ordering::Relaxed);
     let now_ns = match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -2043,8 +2378,8 @@ fn mix_u64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-fn redact_upstream_url(raw: String, rpc_url: &str) -> String {
-    let redacted = match reqwest::Url::parse(rpc_url) {
+fn format_scheme_host_port(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
         Ok(url) => {
             let host = url.host_str().unwrap_or("unknown-host");
             let port = url
@@ -2053,8 +2388,12 @@ fn redact_upstream_url(raw: String, rpc_url: &str) -> String {
                 .unwrap_or_default();
             format!("{}://{}{port}", url.scheme(), host)
         }
-        Err(_) => "<upstream-rpc-url>".to_string(),
-    };
+        Err(_) => "<invalid-rpc-url>".to_string(),
+    }
+}
+
+fn redact_upstream_url(raw: String, rpc_url: &str) -> String {
+    let redacted = format_scheme_host_port(rpc_url);
     raw.replace(rpc_url, &redacted)
 }
 
@@ -2085,11 +2424,9 @@ fn build_runtime_node(
 
 fn build_runtime_execution_backend() -> DualExecutionBackend {
     DualExecutionBackend::new(
-        Some(Box::new(RuntimeExecutionBackend)),
-        Box::new(RuntimeExecutionBackend),
-        ExecutionMode::DualWithVerification {
-            verification_depth: 32,
-        },
+        None,
+        Box::new(RuntimeExecutionBackend::new()),
+        ExecutionMode::CanonicalOnly,
         MismatchPolicy::WarnAndFallback,
     )
 }
@@ -2175,15 +2512,46 @@ fn apply_state_diff_checked(
         .map_err(|error| format!("state diff application failed: {error}"))
 }
 
-struct RuntimeExecutionBackend;
+fn state_diff_has_mutations(diff: &StarknetStateDiff) -> bool {
+    !diff.storage_diffs.is_empty() || !diff.nonces.is_empty() || !diff.declared_classes.is_empty()
+}
 
-impl ExecutionBackend for RuntimeExecutionBackend {
-    fn execute_block(
-        &self,
-        block: &StarknetBlock,
-        _state: &mut dyn MutableState,
-    ) -> Result<ExecutionOutput, ExecutionError> {
-        Ok(ExecutionOutput {
+fn summarize_state_diff(diff: &StarknetStateDiff) -> String {
+    let storage_writes = diff
+        .storage_diffs
+        .values()
+        .map(BTreeMap::len)
+        .sum::<usize>();
+    format!(
+        "writes={storage_writes}, nonces={}, classes={}",
+        diff.nonces.len(),
+        diff.declared_classes.len()
+    )
+}
+
+struct RuntimeExecutionBackend {
+    #[cfg(feature = "production-adapters")]
+    canonical: BlockifierVmBackend,
+    #[cfg(feature = "production-adapters")]
+    warned_canonical_fallback: AtomicBool,
+    #[cfg(feature = "production-adapters")]
+    canonical_enabled: AtomicBool,
+}
+
+impl RuntimeExecutionBackend {
+    fn new() -> Self {
+        Self {
+            #[cfg(feature = "production-adapters")]
+            canonical: BlockifierVmBackend::starknet_mainnet(),
+            #[cfg(feature = "production-adapters")]
+            warned_canonical_fallback: AtomicBool::new(false),
+            #[cfg(feature = "production-adapters")]
+            canonical_enabled: AtomicBool::new(true),
+        }
+    }
+
+    fn synthetic_execute_block(block: &StarknetBlock) -> ExecutionOutput {
+        ExecutionOutput {
             receipts: block
                 .transactions
                 .iter()
@@ -2197,16 +2565,11 @@ impl ExecutionBackend for RuntimeExecutionBackend {
             state_diff: StarknetStateDiff::default(),
             builtin_stats: BuiltinStats::default(),
             execution_time: Duration::from_millis(1),
-        })
+        }
     }
 
-    fn simulate_tx(
-        &self,
-        tx: &StarknetTransaction,
-        _state: &dyn StateReader,
-        _block_context: &BlockContext,
-    ) -> Result<SimulationResult, ExecutionError> {
-        Ok(SimulationResult {
+    fn synthetic_simulation(tx: &StarknetTransaction) -> SimulationResult {
+        SimulationResult {
             receipt: StarknetReceipt {
                 tx_hash: tx.hash.clone(),
                 execution_status: true,
@@ -2214,7 +2577,84 @@ impl ExecutionBackend for RuntimeExecutionBackend {
                 gas_consumed: 1,
             },
             estimated_fee: 1,
-        })
+        }
+    }
+
+    #[cfg(feature = "production-adapters")]
+    fn should_try_canonical_block_execution(block: &StarknetBlock) -> bool {
+        !block.transactions.is_empty()
+            && block
+                .transactions
+                .iter()
+                .all(|tx| tx.executable.as_ref().is_some())
+    }
+
+    #[cfg(feature = "production-adapters")]
+    fn should_try_canonical_simulation(tx: &StarknetTransaction) -> bool {
+        tx.executable.as_ref().is_some()
+    }
+
+    #[cfg(feature = "production-adapters")]
+    fn warn_canonical_fallback(&self, context: &str, error: &ExecutionError) {
+        if self.warned_canonical_fallback.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let sanitized = sanitize_error_message(&error.to_string(), MAX_RUNTIME_ERROR_CHARS);
+        eprintln!(
+            "warning: runtime canonical execution backend disabled after first failure ({context}): {sanitized}"
+        );
+    }
+}
+
+impl ExecutionBackend for RuntimeExecutionBackend {
+    fn execute_block(
+        &self,
+        block: &StarknetBlock,
+        state: &mut dyn MutableState,
+    ) -> Result<ExecutionOutput, ExecutionError> {
+        #[cfg(feature = "production-adapters")]
+        if self.canonical_enabled.load(Ordering::Relaxed)
+            && Self::should_try_canonical_block_execution(block)
+        {
+            match self.canonical.execute_block(block, state) {
+                Ok(output) => return Ok(output),
+                Err(error) => {
+                    self.canonical_enabled.store(false, Ordering::Relaxed);
+                    self.warn_canonical_fallback("execute_block", &error);
+                }
+            }
+        }
+        #[cfg(not(feature = "production-adapters"))]
+        let _ = state;
+
+        Ok(Self::synthetic_execute_block(block))
+    }
+
+    fn simulate_tx(
+        &self,
+        tx: &StarknetTransaction,
+        state: &dyn StateReader,
+        block_context: &BlockContext,
+    ) -> Result<SimulationResult, ExecutionError> {
+        #[cfg(feature = "production-adapters")]
+        if self.canonical_enabled.load(Ordering::Relaxed)
+            && Self::should_try_canonical_simulation(tx)
+        {
+            match self.canonical.simulate_tx(tx, state, block_context) {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    self.canonical_enabled.store(false, Ordering::Relaxed);
+                    self.warn_canonical_fallback("simulate_tx", &error);
+                }
+            }
+        }
+        #[cfg(not(feature = "production-adapters"))]
+        {
+            let _ = state;
+            let _ = block_context;
+        }
+
+        Ok(Self::synthetic_simulation(tx))
     }
 }
 
@@ -3254,10 +3694,15 @@ fn decode_ascii_hex(hex: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+fn redact_upstream_endpoint(raw: &str) -> String {
+    format_scheme_host_port(raw)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashSet};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use std::time::Instant;
 
@@ -3392,6 +3837,47 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct CountingSyncSource {
+        latest_result: Result<u64, String>,
+        chain_id_result: Result<String, String>,
+        block_result: Result<RuntimeFetch, String>,
+        latest_calls: Arc<AtomicUsize>,
+        chain_id_calls: Arc<AtomicUsize>,
+        block_calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingSyncSource {
+        fn new(
+            latest_result: Result<u64, &str>,
+            chain_id_result: Result<&str, &str>,
+            block_result: Result<RuntimeFetch, &str>,
+        ) -> Self {
+            Self {
+                latest_result: latest_result.map_err(std::string::ToString::to_string),
+                chain_id_result: chain_id_result
+                    .map(std::string::ToString::to_string)
+                    .map_err(std::string::ToString::to_string),
+                block_result: block_result.map_err(std::string::ToString::to_string),
+                latest_calls: Arc::new(AtomicUsize::new(0)),
+                chain_id_calls: Arc::new(AtomicUsize::new(0)),
+                block_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn latest_calls(&self) -> usize {
+            self.latest_calls.load(Ordering::Relaxed)
+        }
+
+        fn chain_id_calls(&self) -> usize {
+            self.chain_id_calls.load(Ordering::Relaxed)
+        }
+
+        fn block_calls(&self) -> usize {
+            self.block_calls.load(Ordering::Relaxed)
+        }
+    }
+
     impl SyncSource for SequenceChainIdSyncSource {
         fn fetch_latest_block_number(&self) -> SyncSourceFuture<'_, u64> {
             Box::pin(async move { Ok(0) })
@@ -3420,6 +3906,35 @@ mod tests {
                 Err(format!(
                     "fetch_block({block_number}) should not be called in this test"
                 ))
+            })
+        }
+    }
+
+    impl SyncSource for CountingSyncSource {
+        fn fetch_latest_block_number(&self) -> SyncSourceFuture<'_, u64> {
+            let result = self.latest_result.clone();
+            let calls = Arc::clone(&self.latest_calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                result
+            })
+        }
+
+        fn fetch_chain_id(&self) -> SyncSourceFuture<'_, String> {
+            let result = self.chain_id_result.clone();
+            let calls = Arc::clone(&self.chain_id_calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                result
+            })
+        }
+
+        fn fetch_block(&self, _block_number: u64) -> SyncSourceFuture<'_, RuntimeFetch> {
+            let result = self.block_result.clone();
+            let calls = Arc::clone(&self.block_calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                result
             })
         }
     }
@@ -3605,6 +4120,82 @@ mod tests {
         }
     }
 
+    struct MutatingFailingExecutionBackend;
+
+    impl ExecutionBackend for MutatingFailingExecutionBackend {
+        fn execute_block(
+            &self,
+            _block: &StarknetBlock,
+            state: &mut dyn MutableState,
+        ) -> Result<ExecutionOutput, ExecutionError> {
+            let contract =
+                ContractAddress::parse("0xabc").expect("test contract address should parse");
+            state.set_storage(contract, "0x1".to_string(), StarknetFelt::from(999_u64));
+            Err(ExecutionError::Backend(
+                "intentional mutating failure".to_string(),
+            ))
+        }
+
+        fn simulate_tx(
+            &self,
+            _tx: &StarknetTransaction,
+            _state: &dyn StateReader,
+            _block_context: &BlockContext,
+        ) -> Result<SimulationResult, ExecutionError> {
+            Err(ExecutionError::Backend(
+                "intentional mutating failure".to_string(),
+            ))
+        }
+    }
+
+    struct DivergingStateDiffExecutionBackend;
+
+    impl ExecutionBackend for DivergingStateDiffExecutionBackend {
+        fn execute_block(
+            &self,
+            block: &StarknetBlock,
+            _state: &mut dyn MutableState,
+        ) -> Result<ExecutionOutput, ExecutionError> {
+            let mut diff = StarknetStateDiff::default();
+            diff.storage_diffs
+                .entry(ContractAddress::parse("0x123").expect("test contract should parse"))
+                .or_default()
+                .insert("0x10".to_string(), StarknetFelt::from(42_u64));
+            Ok(ExecutionOutput {
+                receipts: block
+                    .transactions
+                    .iter()
+                    .map(|tx| StarknetReceipt {
+                        tx_hash: tx.hash.clone(),
+                        execution_status: true,
+                        events: 0,
+                        gas_consumed: 1,
+                    })
+                    .collect(),
+                state_diff: diff,
+                builtin_stats: BuiltinStats::default(),
+                execution_time: Duration::from_millis(1),
+            })
+        }
+
+        fn simulate_tx(
+            &self,
+            tx: &StarknetTransaction,
+            _state: &dyn StateReader,
+            _block_context: &BlockContext,
+        ) -> Result<SimulationResult, ExecutionError> {
+            Ok(SimulationResult {
+                receipt: StarknetReceipt {
+                    tx_hash: tx.hash.clone(),
+                    execution_status: true,
+                    events: 0,
+                    gas_consumed: 1,
+                },
+                estimated_fee: 1,
+            })
+        }
+    }
+
     fn runtime_config() -> RuntimeConfig {
         RuntimeConfig {
             chain_id: ChainId::Mainnet,
@@ -3623,8 +4214,26 @@ mod tests {
             storage_snapshot_path: None,
             storage_snapshot_interval_blocks: DEFAULT_STORAGE_SNAPSHOT_INTERVAL_BLOCKS,
             disable_batch_requests: false,
+            network_stale_after: Duration::from_secs(120),
             storage: None,
         }
+    }
+
+    #[test]
+    fn runtime_execution_backend_runs_canonical_path_once_per_block() {
+        let backend = build_runtime_execution_backend();
+        let fetch = sample_fetch(1, "0x0", "0x1");
+        let block = ingest_block_from_fetch(1, &fetch).expect("sample block should ingest");
+        let mut state = InMemoryState::default();
+
+        let output = backend
+            .execute_block(&block, &mut state)
+            .expect("execution should succeed");
+        assert_eq!(output.receipts.len(), block.transactions.len());
+
+        let metrics = backend.metrics().expect("metrics should be readable");
+        assert_eq!(metrics.fast_executions, 0);
+        assert_eq!(metrics.canonical_executions, 1);
     }
 
     fn write_replay_checkpoint(
@@ -3717,6 +4326,150 @@ mod tests {
             gas_consumed: 7,
         }];
         fetch
+    }
+
+    #[test]
+    fn parse_upstream_rpc_urls_accepts_comma_separated_values_and_deduplicates() {
+        let parsed = parse_upstream_rpc_urls(
+            " https://rpc-1.example,https://rpc-2.example:9545 , https://rpc-1.example ",
+        )
+        .expect("comma-separated upstream URLs should parse");
+        assert_eq!(
+            parsed,
+            vec![
+                "https://rpc-1.example".to_string(),
+                "https://rpc-2.example:9545".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_upstream_rpc_urls_rejects_excessive_endpoint_count() {
+        let raw = (0..=MAX_UPSTREAM_RPC_ENDPOINTS)
+            .map(|index| format!("https://rpc-{index}.example"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let error =
+            parse_upstream_rpc_urls(&raw).expect_err("too many endpoints must fail validation");
+        assert!(error.contains("max supported"));
+    }
+
+    #[test]
+    fn parse_upstream_rpc_urls_rejects_invalid_entries() {
+        let error = parse_upstream_rpc_urls("https://rpc-1.example,not-a-url")
+            .expect_err("invalid URL entry must fail validation");
+        assert!(error.contains("upstream_rpc_url is invalid"));
+    }
+
+    #[test]
+    fn parse_upstream_rpc_urls_rejects_oversized_entries() {
+        let oversized = format!(
+            "https://rpc.example/{}",
+            "a".repeat(MAX_UPSTREAM_RPC_URL_BYTES + 1)
+        );
+        let error = parse_upstream_rpc_urls(&oversized)
+            .expect_err("oversized URL entries must fail validation");
+        assert!(error.contains("exceeds max"));
+    }
+
+    #[test]
+    fn parse_upstream_rpc_urls_rejects_control_characters() {
+        let error = parse_upstream_rpc_urls("https://rpc.\nexample")
+            .expect_err("control characters in URL must fail validation");
+        assert!(error.contains("control characters"));
+    }
+
+    #[test]
+    fn runtime_config_validate_rejects_zero_network_stale_after() {
+        let mut config = runtime_config();
+        config.network_stale_after = Duration::ZERO;
+        let error = config
+            .validate()
+            .expect_err("zero network staleness threshold must fail");
+        assert!(error.contains("network_stale_after must be > 0"));
+    }
+
+    #[tokio::test]
+    async fn failover_sync_source_switches_to_healthy_endpoint() {
+        let primary = Arc::new(CountingSyncSource::new(
+            Ok(10),
+            Err("primary chain-id failed"),
+            Err("primary block failed"),
+        ));
+        let secondary = Arc::new(CountingSyncSource::new(
+            Ok(10),
+            Ok("SN_MAIN"),
+            Ok(sample_fetch(1, "0x0", "0x1")),
+        ));
+        let failover = FailoverSyncSource::new(vec![
+            NamedSyncSource {
+                name: "primary".to_string(),
+                source: primary.clone(),
+            },
+            NamedSyncSource {
+                name: "secondary".to_string(),
+                source: secondary.clone(),
+            },
+        ])
+        .expect("failover source should initialize");
+
+        let first_chain_id = failover
+            .fetch_chain_id()
+            .await
+            .expect("secondary endpoint should provide chain id");
+        assert_eq!(first_chain_id, "SN_MAIN");
+        assert_eq!(primary.chain_id_calls(), 1);
+        assert_eq!(secondary.chain_id_calls(), 1);
+
+        let second_chain_id = failover
+            .fetch_chain_id()
+            .await
+            .expect("active endpoint should remain on healthy secondary");
+        assert_eq!(second_chain_id, "SN_MAIN");
+        assert_eq!(primary.chain_id_calls(), 1);
+        assert_eq!(secondary.chain_id_calls(), 2);
+
+        let _ = failover
+            .fetch_block(1)
+            .await
+            .expect("block fetch should use healthy secondary endpoint");
+        assert_eq!(primary.block_calls(), 0);
+        assert_eq!(secondary.block_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn failover_sync_source_reports_all_endpoint_errors() {
+        let primary = Arc::new(CountingSyncSource::new(
+            Err("primary latest failed"),
+            Err("primary chain-id failed"),
+            Err("primary block failed"),
+        ));
+        let secondary = Arc::new(CountingSyncSource::new(
+            Err("secondary latest failed"),
+            Err("secondary chain-id failed"),
+            Err("secondary block failed"),
+        ));
+        let failover = FailoverSyncSource::new(vec![
+            NamedSyncSource {
+                name: "primary".to_string(),
+                source: primary.clone(),
+            },
+            NamedSyncSource {
+                name: "secondary".to_string(),
+                source: secondary.clone(),
+            },
+        ])
+        .expect("failover source should initialize");
+
+        let error = failover
+            .fetch_latest_block_number()
+            .await
+            .expect_err("latest block fetch must fail when all endpoints fail");
+        assert!(error.contains("all upstream RPC endpoints failed"));
+        assert!(error.contains("primary"));
+        assert!(error.contains("secondary"));
+        assert_eq!(primary.latest_calls(), 1);
+        assert_eq!(secondary.latest_calls(), 1);
     }
 
     #[test]
@@ -4685,6 +5438,189 @@ mod tests {
         assert_eq!(normalize_chain_id("0x00534E5F4D41494E"), "SN_MAIN");
     }
 
+    #[test]
+    fn production_consensus_accepts_sequential_blocks() {
+        let backend = ProductionConsensusBackend::new(ProductionConsensusPolicy {
+            max_future_skew_secs: u64::MAX,
+            reject_timestamp_regression: true,
+        });
+        let first = ConsensusInput {
+            external_block_number: 10,
+            block_hash: "0x10".to_string(),
+            parent_hash: "0x0f".to_string(),
+            timestamp: 1_000,
+            tx_count: 0,
+        };
+        let second = ConsensusInput {
+            external_block_number: 11,
+            block_hash: "0x11".to_string(),
+            parent_hash: "0x10".to_string(),
+            timestamp: 1_001,
+            tx_count: 3,
+        };
+        assert_eq!(
+            backend
+                .validate_block(&first)
+                .expect("first block should validate"),
+            ConsensusVerdict::Accept
+        );
+        assert_eq!(
+            backend
+                .validate_block(&second)
+                .expect("second block should validate"),
+            ConsensusVerdict::Accept
+        );
+    }
+
+    #[test]
+    fn production_consensus_rejects_parent_mismatch_and_regression() {
+        let backend = ProductionConsensusBackend::new(ProductionConsensusPolicy {
+            max_future_skew_secs: u64::MAX,
+            reject_timestamp_regression: true,
+        });
+        let base = ConsensusInput {
+            external_block_number: 50,
+            block_hash: "0x50".to_string(),
+            parent_hash: "0x4f".to_string(),
+            timestamp: 10_000,
+            tx_count: 1,
+        };
+        assert_eq!(
+            backend
+                .validate_block(&base)
+                .expect("base block should validate"),
+            ConsensusVerdict::Accept
+        );
+
+        let bad_parent = ConsensusInput {
+            external_block_number: 51,
+            block_hash: "0x51".to_string(),
+            parent_hash: "0xdead".to_string(),
+            timestamp: 10_001,
+            tx_count: 1,
+        };
+        assert_eq!(
+            backend
+                .validate_block(&bad_parent)
+                .expect("bad parent should still return verdict"),
+            ConsensusVerdict::Reject
+        );
+
+        let stale = ConsensusInput {
+            external_block_number: 49,
+            block_hash: "0x49".to_string(),
+            parent_hash: "0x48".to_string(),
+            timestamp: 9_999,
+            tx_count: 1,
+        };
+        assert_eq!(
+            backend
+                .validate_block(&stale)
+                .expect("stale block should still return verdict"),
+            ConsensusVerdict::Reject
+        );
+    }
+
+    #[test]
+    fn production_consensus_rejects_non_contiguous_blocks_and_future_skew() {
+        let backend = ProductionConsensusBackend::new(ProductionConsensusPolicy {
+            max_future_skew_secs: 0,
+            reject_timestamp_regression: true,
+        });
+        let now = unix_now_seconds();
+        let base = ConsensusInput {
+            external_block_number: 100,
+            block_hash: "0x100".to_string(),
+            parent_hash: "0xff".to_string(),
+            timestamp: now,
+            tx_count: 2,
+        };
+        assert_eq!(
+            backend
+                .validate_block(&base)
+                .expect("base block should validate"),
+            ConsensusVerdict::Accept
+        );
+
+        let skipped = ConsensusInput {
+            external_block_number: 102,
+            block_hash: "0x102".to_string(),
+            parent_hash: "0x101".to_string(),
+            timestamp: now,
+            tx_count: 1,
+        };
+        assert_eq!(
+            backend
+                .validate_block(&skipped)
+                .expect("skipped block should return verdict"),
+            ConsensusVerdict::Reject
+        );
+
+        let future = ConsensusInput {
+            external_block_number: 101,
+            block_hash: "0x101".to_string(),
+            parent_hash: "0x100".to_string(),
+            timestamp: now.saturating_add(30),
+            tx_count: 1,
+        };
+        assert_eq!(
+            backend
+                .validate_block(&future)
+                .expect("future-skewed block should return verdict"),
+            ConsensusVerdict::Reject
+        );
+    }
+
+    #[test]
+    fn production_consensus_rejects_excessive_transaction_counts() {
+        let backend = ProductionConsensusBackend::new(ProductionConsensusPolicy {
+            max_future_skew_secs: u64::MAX,
+            reject_timestamp_regression: true,
+        });
+        let input = ConsensusInput {
+            external_block_number: 1,
+            block_hash: "0x1".to_string(),
+            parent_hash: "0x0".to_string(),
+            timestamp: unix_now_seconds(),
+            tx_count: MAX_TRANSACTIONS_PER_BLOCK.saturating_add(1),
+        };
+        assert_eq!(
+            backend
+                .validate_block(&input)
+                .expect("oversized tx count should return verdict"),
+            ConsensusVerdict::Reject
+        );
+    }
+
+    #[test]
+    fn production_network_requires_fresh_peer_observations() {
+        let backend = ProductionNetworkBackend::from_config(1, true, 1);
+        assert!(backend.is_healthy());
+
+        backend
+            .last_observation_unix_seconds
+            .store(unix_now_seconds().saturating_sub(5), Ordering::Relaxed);
+        assert!(!backend.is_healthy());
+
+        backend.report_peer_count(2);
+        assert!(backend.is_healthy());
+
+        backend.report_peer_count(0);
+        assert!(!backend.is_healthy());
+    }
+
+    #[test]
+    fn production_network_uses_observation_timestamp_for_staleness() {
+        let backend = ProductionNetworkBackend::from_config(1, true, 2);
+        let stale_observation = unix_now_seconds().saturating_sub(30);
+        backend.report_peer_observation(2, stale_observation);
+        assert!(!backend.is_healthy());
+
+        let fresh_observation = unix_now_seconds();
+        backend.report_peer_observation(2, fresh_observation);
+        assert!(backend.is_healthy());
+    }
+
     #[tokio::test]
     async fn poll_once_fails_closed_when_network_is_unhealthy() {
         let sync_source = Arc::new(MockSyncSource::with_blocks("SN_MAIN", 0, Vec::new()));
@@ -4702,6 +5638,46 @@ mod tests {
             .poll_once()
             .await
             .expect_err("unhealthy network must fail closed");
+        assert!(error.contains("network backend unhealthy"));
+        assert_eq!(runtime.diagnostics().network_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn poll_once_fails_closed_when_required_peer_observation_drops_to_zero() {
+        let sync_source = Arc::new(MockSyncSource::with_blocks("SN_MAIN", 0, Vec::new()));
+        let consensus = Arc::new(HealthyConsensus);
+        let network = Arc::new(ProductionNetworkBackend::from_config(1, true, 60));
+        let mut config = runtime_config();
+        config.require_peers = true;
+
+        let mut runtime = NodeRuntime::new_with_backends(config, sync_source, consensus, network)
+            .expect("runtime should initialize");
+        runtime.report_peer_count(0);
+
+        let error = runtime
+            .poll_once()
+            .await
+            .expect_err("peer loss must fail closed");
+        assert!(error.contains("network backend unhealthy"));
+        assert_eq!(runtime.diagnostics().network_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn poll_once_fails_closed_when_peer_observation_is_stale() {
+        let sync_source = Arc::new(MockSyncSource::with_blocks("SN_MAIN", 0, Vec::new()));
+        let consensus = Arc::new(HealthyConsensus);
+        let network = Arc::new(ProductionNetworkBackend::from_config(1, true, 1));
+        let mut config = runtime_config();
+        config.require_peers = true;
+
+        let mut runtime = NodeRuntime::new_with_backends(config, sync_source, consensus, network)
+            .expect("runtime should initialize");
+        runtime.report_peer_observation(1, unix_now_seconds().saturating_sub(30));
+
+        let error = runtime
+            .poll_once()
+            .await
+            .expect_err("stale peer observation must fail closed");
         assert!(error.contains("network backend unhealthy"));
         assert_eq!(runtime.diagnostics().network_failures, 1);
     }
@@ -4778,6 +5754,105 @@ mod tests {
                 .nonce_of(&contract)
                 .expect("read nonce"),
             Some(StarknetFelt::from(2_u64))
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_once_does_not_mutate_live_state_when_execution_backend_fails() {
+        let sync_source = Arc::new(MockSyncSource::with_blocks(
+            "SN_MAIN",
+            1,
+            vec![sample_fetch(1, "0x0", "0x1")],
+        ));
+        let consensus = Arc::new(HealthyConsensus);
+        let network = Arc::new(MockNetwork {
+            healthy: true,
+            peers: 3,
+        });
+        let mut runtime =
+            NodeRuntime::new_with_backends(runtime_config(), sync_source, consensus, network)
+                .expect("runtime should initialize");
+        runtime.node.execution = DualExecutionBackend::new(
+            None,
+            Box::new(MutatingFailingExecutionBackend),
+            ExecutionMode::CanonicalOnly,
+            MismatchPolicy::WarnAndFallback,
+        );
+        let contract = ContractAddress::parse("0xabc").expect("test contract should parse");
+        assert_eq!(
+            runtime
+                .execution_state
+                .get_storage(&contract, "0x1")
+                .expect("state lookup should succeed"),
+            None
+        );
+
+        let error = runtime
+            .poll_once()
+            .await
+            .expect_err("execution failure must fail closed");
+        assert!(error.contains("execution failed for local block"));
+        assert_eq!(
+            runtime
+                .execution_state
+                .get_storage(&contract, "0x1")
+                .expect("state lookup should succeed"),
+            None
+        );
+        assert_eq!(
+            runtime
+                .storage()
+                .latest_block_number()
+                .expect("storage lookup should succeed"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_once_fails_closed_when_execution_state_diff_mismatches_upstream() {
+        let contract = ContractAddress::parse("0x123").expect("test contract should parse");
+        let mut upstream_diff = StarknetStateDiff::default();
+        upstream_diff
+            .storage_diffs
+            .entry(contract)
+            .or_default()
+            .insert("0x10".to_string(), StarknetFelt::from(777_u64));
+        let sync_source = Arc::new(MockSyncSource::with_blocks(
+            "SN_MAIN",
+            1,
+            vec![sample_fetch_with_state_diff(
+                1,
+                "0x0",
+                "0x1",
+                upstream_diff.clone(),
+            )],
+        ));
+        let consensus = Arc::new(HealthyConsensus);
+        let network = Arc::new(MockNetwork {
+            healthy: true,
+            peers: 2,
+        });
+        let mut runtime =
+            NodeRuntime::new_with_backends(runtime_config(), sync_source, consensus, network)
+                .expect("runtime should initialize");
+        runtime.node.execution = DualExecutionBackend::new(
+            None,
+            Box::new(DivergingStateDiffExecutionBackend),
+            ExecutionMode::CanonicalOnly,
+            MismatchPolicy::WarnAndFallback,
+        );
+
+        let error = runtime
+            .poll_once()
+            .await
+            .expect_err("state diff mismatch must fail closed");
+        assert!(error.contains("execution state diff mismatch"));
+        assert_eq!(
+            runtime
+                .storage()
+                .latest_block_number()
+                .expect("storage lookup should succeed"),
+            0
         );
     }
 

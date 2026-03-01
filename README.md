@@ -37,6 +37,7 @@ This repository currently ships core, tested building blocks:
 - MCP server request handler with authenticated tool execution, bounded batch support, and BTCFi anomaly query surface
 - JSON-RPC server request handler with strict JSON-RPC 2.0 validation and Starknet core method coverage
 - Type-state node builder that enforces composition order
+- Daemon runtime defaults to production backends (strict consensus guardrails + dynamic peer-health checks)
 
 Source entry points:
 
@@ -213,6 +214,6 @@ Near-term implementation sequence:
 
 Long-term:
 
-- Full production node binary wiring
-- End-to-end sync pipeline integration
+- Full libp2p gossip/sync protocol integration (replace bootnode reachability heartbeat)
+- End-to-end sync pipeline integration with sustained soak/perf validation
 - Production-grade STWO proving backend integration
