@@ -166,6 +166,11 @@ pub struct RuntimeDiagnostics {
     pub failure_count: u64,
     pub consecutive_failures: u64,
     pub replayed_tx_count: u64,
+    pub replay_payloads_total: u64,
+    pub replay_payloads_enriched: u64,
+    pub replay_payloads_with_embedded_executable: u64,
+    pub replay_blocks_with_enriched_payloads: u64,
+    pub replay_blocks_with_full_embedded_executables: u64,
     pub replay_failures: u64,
     pub consensus_rejections: u64,
     pub network_failures: u64,
@@ -1134,6 +1139,34 @@ impl NodeRuntime {
                 .diagnostics
                 .replayed_tx_count
                 .saturating_add(fetch.replay.transaction_hashes.len() as u64);
+            let tx_payload_count = fetch.replay.transactions.len() as u64;
+            let (enriched_payloads, embedded_executables) =
+                summarize_transaction_payloads(&fetch.replay.transactions);
+            self.diagnostics.replay_payloads_total = self
+                .diagnostics
+                .replay_payloads_total
+                .saturating_add(tx_payload_count);
+            self.diagnostics.replay_payloads_enriched = self
+                .diagnostics
+                .replay_payloads_enriched
+                .saturating_add(enriched_payloads);
+            self.diagnostics.replay_payloads_with_embedded_executable = self
+                .diagnostics
+                .replay_payloads_with_embedded_executable
+                .saturating_add(embedded_executables);
+            if enriched_payloads > 0 {
+                self.diagnostics.replay_blocks_with_enriched_payloads = self
+                    .diagnostics
+                    .replay_blocks_with_enriched_payloads
+                    .saturating_add(1);
+            }
+            if tx_payload_count > 0 && embedded_executables == tx_payload_count {
+                self.diagnostics
+                    .replay_blocks_with_full_embedded_executables = self
+                    .diagnostics
+                    .replay_blocks_with_full_embedded_executables
+                    .saturating_add(1);
+            }
             if let Err(error) = self.maybe_persist_storage_snapshot(local_block_number) {
                 self.diagnostics.journal_failures =
                     self.diagnostics.journal_failures.saturating_add(1);
@@ -2823,7 +2856,7 @@ fn merge_transaction_payloads(
 fn transaction_payload_richness(payload: &Value) -> usize {
     match payload {
         Value::Null => 0,
-        Value::String(_) | Value::Number(_) | Value::Bool(_) => 1,
+        Value::String(_) | Value::Number(_) | Value::Bool(_) => 0,
         Value::Array(entries) => entries.len(),
         Value::Object(map) => {
             let mut score = map.len();
@@ -2836,6 +2869,24 @@ fn transaction_payload_richness(payload: &Value) -> usize {
             score
         }
     }
+}
+
+fn summarize_transaction_payloads(payloads: &[Value]) -> (u64, u64) {
+    let mut enriched = 0_u64;
+    let mut embedded_executable = 0_u64;
+    for payload in payloads {
+        if transaction_payload_richness(payload) > 0 {
+            enriched = enriched.saturating_add(1);
+        }
+        if payload
+            .get("__pastis_executable")
+            .or_else(|| payload.get("executable"))
+            .is_some()
+        {
+            embedded_executable = embedded_executable.saturating_add(1);
+        }
+    }
+    (enriched, embedded_executable)
 }
 
 fn state_update_to_diff(state_update: &Value) -> Result<(StarknetStateDiff, Vec<String>), String> {
@@ -4215,6 +4266,19 @@ mod tests {
             replay.transactions[0]["version"],
             Value::String("0x3".to_string())
         );
+    }
+
+    #[test]
+    fn summarize_transaction_payloads_counts_enriched_and_embedded_entries() {
+        let payloads = vec![
+            json!({"transaction_hash": "0x1"}),
+            json!({"transaction_hash": "0x2", "type": "INVOKE", "version": "0x3"}),
+            json!({"hash": "0x3", "executable": {"kind": "placeholder"}}),
+            json!("0x4"),
+        ];
+        let (enriched, embedded) = summarize_transaction_payloads(&payloads);
+        assert_eq!(enriched, 2);
+        assert_eq!(embedded, 1);
     }
 
     #[test]
