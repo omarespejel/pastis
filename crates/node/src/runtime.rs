@@ -43,6 +43,7 @@ pub const DEFAULT_RPC_MAX_RETRIES: u32 = 3;
 pub const DEFAULT_RPC_RETRY_BACKOFF_MS: u64 = 250;
 pub const DEFAULT_CHAIN_ID_REVALIDATE_POLLS: u64 = 64;
 const MAX_UPSTREAM_RPC_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_UPSTREAM_RPC_URL_BYTES: usize = 4 * 1024;
 const MAX_LOCAL_JOURNAL_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_LOCAL_JOURNAL_LINE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RUNTIME_STORAGE_SNAPSHOT_FILE_BYTES: u64 = 512 * 1024 * 1024;
@@ -169,6 +170,15 @@ fn parse_upstream_rpc_urls(raw: &str) -> Result<Vec<String>, String> {
 }
 
 fn validate_upstream_rpc_url(raw: &str) -> Result<(), String> {
+    if raw.len() > MAX_UPSTREAM_RPC_URL_BYTES {
+        return Err(format!(
+            "upstream_rpc_url entry exceeds max {} bytes",
+            MAX_UPSTREAM_RPC_URL_BYTES
+        ));
+    }
+    if raw.chars().any(char::is_control) {
+        return Err("upstream_rpc_url must not contain control characters".to_string());
+    }
     let parsed = reqwest::Url::parse(raw)
         .map_err(|error| format!("upstream_rpc_url is invalid: {error}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -4018,6 +4028,24 @@ mod tests {
         let error = parse_upstream_rpc_urls("https://rpc-1.example,not-a-url")
             .expect_err("invalid URL entry must fail validation");
         assert!(error.contains("upstream_rpc_url is invalid"));
+    }
+
+    #[test]
+    fn parse_upstream_rpc_urls_rejects_oversized_entries() {
+        let oversized = format!(
+            "https://rpc.example/{}",
+            "a".repeat(MAX_UPSTREAM_RPC_URL_BYTES + 1)
+        );
+        let error = parse_upstream_rpc_urls(&oversized)
+            .expect_err("oversized URL entries must fail validation");
+        assert!(error.contains("exceeds max"));
+    }
+
+    #[test]
+    fn parse_upstream_rpc_urls_rejects_control_characters() {
+        let error = parse_upstream_rpc_urls("https://rpc.\nexample")
+            .expect_err("control characters in URL must fail validation");
+        assert!(error.contains("control characters"));
     }
 
     #[tokio::test]

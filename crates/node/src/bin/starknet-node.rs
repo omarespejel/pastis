@@ -37,6 +37,8 @@ const DEFAULT_P2P_HEARTBEAT_MS: u64 = 30_000;
 const DEFAULT_RPC_MAX_CONCURRENCY: usize = 256;
 const DEFAULT_RPC_RATE_LIMIT_PER_MINUTE: u32 = 1_200;
 const MAX_RPC_RATE_LIMIT_PER_MINUTE: u32 = 100_000;
+const MAX_UPSTREAM_RPC_ENDPOINTS: usize = 16;
+const MAX_UPSTREAM_RPC_URL_BYTES: usize = 4 * 1024;
 const MAX_BOOTNODE_PROBE_CONCURRENCY: usize = 32;
 const MAX_BOOTNODES: usize = 1_024;
 const MAX_BOOTNODE_ENTRY_BYTES: usize = 1_024;
@@ -1347,17 +1349,24 @@ fn parse_upstream_rpc_urls(raw: &str) -> Result<Vec<String>, String> {
         if candidate.is_empty() {
             continue;
         }
-        let parsed = reqwest::Url::parse(candidate)
-            .map_err(|error| format!("invalid upstream RPC URL `{candidate}`: {error}"))?;
-        if !matches!(parsed.scheme(), "http" | "https") {
+        if candidate.len() > MAX_UPSTREAM_RPC_URL_BYTES {
             return Err(format!(
-                "invalid upstream RPC URL `{candidate}`: scheme must be http or https"
+                "invalid upstream RPC URL entry: exceeds max {} bytes",
+                MAX_UPSTREAM_RPC_URL_BYTES
             ));
         }
+        if candidate.chars().any(char::is_control) {
+            return Err(
+                "invalid upstream RPC URL entry: must not contain control characters".to_string(),
+            );
+        }
+        let parsed = reqwest::Url::parse(candidate)
+            .map_err(|error| format!("invalid upstream RPC URL entry: {error}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err("invalid upstream RPC URL entry: scheme must be http or https".to_string());
+        }
         if parsed.host_str().is_none() {
-            return Err(format!(
-                "invalid upstream RPC URL `{candidate}`: host is required"
-            ));
+            return Err("invalid upstream RPC URL entry: host is required".to_string());
         }
         if seen.insert(candidate.to_string()) {
             urls.push(candidate.to_string());
@@ -1366,6 +1375,13 @@ fn parse_upstream_rpc_urls(raw: &str) -> Result<Vec<String>, String> {
 
     if urls.is_empty() {
         return Err("invalid upstream RPC URL list: no valid URLs provided".to_string());
+    }
+    if urls.len() > MAX_UPSTREAM_RPC_ENDPOINTS {
+        return Err(format!(
+            "invalid upstream RPC URL list: {} endpoints configured; max supported is {}",
+            urls.len(),
+            MAX_UPSTREAM_RPC_ENDPOINTS
+        ));
     }
     Ok(urls)
 }
@@ -1869,6 +1885,58 @@ mod tests {
         assert_eq!(parse_bootnode_endpoint("127.0.0.1:0"), None);
         assert_eq!(parse_bootnode_endpoint("/ip4/127.0.0.1/tcp/0"), None);
         assert_eq!(parse_bootnode_endpoint("bad host:30303"), None);
+    }
+
+    #[test]
+    fn parse_upstream_rpc_urls_accepts_comma_separated_urls_and_deduplicates() {
+        let parsed = parse_upstream_rpc_urls(
+            "https://rpc-1.example, https://rpc-2.example:9545, https://rpc-1.example",
+        )
+        .expect("valid upstream URL list should parse");
+        assert_eq!(
+            parsed,
+            vec![
+                "https://rpc-1.example".to_string(),
+                "https://rpc-2.example:9545".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_upstream_rpc_urls_rejects_excessive_endpoint_count() {
+        let raw = (0..=MAX_UPSTREAM_RPC_ENDPOINTS)
+            .map(|index| format!("https://rpc-{index}.example"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let error = parse_upstream_rpc_urls(&raw)
+            .expect_err("too many upstream endpoints must fail closed");
+        assert!(error.contains("max supported"));
+    }
+
+    #[test]
+    fn parse_upstream_rpc_urls_rejects_oversized_entries() {
+        let oversized = format!(
+            "https://rpc.example/{}",
+            "a".repeat(MAX_UPSTREAM_RPC_URL_BYTES + 1)
+        );
+        let error = parse_upstream_rpc_urls(&oversized)
+            .expect_err("oversized URL entries must fail closed");
+        assert!(error.contains("exceeds max"));
+    }
+
+    #[test]
+    fn parse_upstream_rpc_urls_rejects_control_characters() {
+        let error = parse_upstream_rpc_urls("https://rpc.\nexample")
+            .expect_err("control chars in URL must fail closed");
+        assert!(error.contains("control characters"));
+    }
+
+    #[test]
+    fn parse_upstream_rpc_urls_error_does_not_echo_secrets() {
+        let error = parse_upstream_rpc_urls("https://user:supersecret@")
+            .expect_err("malformed URL must fail");
+        assert!(!error.contains("supersecret"));
+        assert!(error.contains("invalid upstream RPC URL entry"));
     }
 
     #[tokio::test]
