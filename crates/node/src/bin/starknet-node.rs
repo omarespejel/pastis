@@ -741,7 +741,22 @@ fn validate_rpc_bind_exposure(
         return Ok(());
     }
     let Ok(parsed) = rpc_bind.parse::<SocketAddr>() else {
-        return Ok(());
+        let Some((host, _port)) = rpc_bind.rsplit_once(':') else {
+            return Ok(());
+        };
+        let normalized_host = host.trim().trim_start_matches('[').trim_end_matches(']');
+        if normalized_host.eq_ignore_ascii_case("localhost")
+            || normalized_host == "127.0.0.1"
+            || normalized_host == "::1"
+        {
+            return Ok(());
+        }
+        if rpc_auth_token.is_some() {
+            return Ok(());
+        }
+        return Err(format!(
+            "refusing non-loopback rpc bind `{rpc_bind}` without auth token; set --rpc-auth-token/PASTIS_RPC_AUTH_TOKEN or --allow-public-rpc-bind/PASTIS_ALLOW_PUBLIC_RPC_BIND=true"
+        ));
     };
     if parsed.ip().is_loopback() {
         return Ok(());
@@ -994,6 +1009,19 @@ mod tests {
     fn validate_rpc_bind_exposure_allows_loopback_without_auth() {
         validate_rpc_bind_exposure("127.0.0.1:9545", None, false)
             .expect("loopback bind should be allowed");
+    }
+
+    #[test]
+    fn validate_rpc_bind_exposure_rejects_named_host_without_auth() {
+        let err = validate_rpc_bind_exposure("example.com:9545", None, false)
+            .expect_err("named host without auth should fail closed");
+        assert!(err.contains("refusing non-loopback"));
+    }
+
+    #[test]
+    fn validate_rpc_bind_exposure_allows_named_host_with_auth() {
+        validate_rpc_bind_exposure("example.com:9545", Some("token"), false)
+            .expect("named host should be allowed when auth is configured");
     }
 
     #[test]

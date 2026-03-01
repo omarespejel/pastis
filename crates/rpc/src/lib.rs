@@ -180,7 +180,19 @@ impl<'a> StarknetRpcServer<'a> {
 
     pub fn handle_request(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
         let is_notification = request.id.is_none();
-        let request_id = request.id.unwrap_or(Value::Null);
+        let request_id = match request.id {
+            None => Value::Null,
+            Some(Value::Null) => Value::Null,
+            Some(Value::String(value)) => Value::String(value),
+            Some(Value::Number(value)) => Value::Number(value),
+            Some(_) => {
+                return Some(error_response(
+                    Value::Null,
+                    ERR_INVALID_REQUEST,
+                    "invalid request id type: expected string, number, or null",
+                ));
+            }
+        };
         if request.jsonrpc != JSONRPC_VERSION {
             if is_notification {
                 return None;
@@ -1430,6 +1442,22 @@ mod tests {
     }
 
     #[test]
+    fn invalid_request_id_type_is_rejected() {
+        let server = seeded_server();
+        let raw =
+            r#"{"jsonrpc":"2.0","id":{"nested":1},"method":"starknet_blockNumber","params":[]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["error"]["code"], json!(ERR_INVALID_REQUEST));
+        assert_eq!(value["id"], Value::Null);
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .expect("error message")
+                .contains("invalid request id type")
+        );
+    }
+
+    #[test]
     fn invalid_jsonrpc_version_is_rejected() {
         let server = seeded_server();
         let raw = r#"{"jsonrpc":"1.0","id":5,"method":"starknet_blockNumber","params":[]}"#;
@@ -1460,6 +1488,22 @@ mod tests {
         assert_eq!(arr[0]["result"], json!(2));
         assert_eq!(arr[1]["id"], json!(2));
         assert_eq!(arr[1]["result"], json!("SN_MAIN"));
+    }
+
+    #[test]
+    fn batch_invalid_id_type_is_reported_without_dropping_other_responses() {
+        let server = seeded_server();
+        let raw = r#"[
+          {"jsonrpc":"2.0","id":1,"method":"starknet_blockNumber","params":[]},
+          {"jsonrpc":"2.0","id":{"bad":1},"method":"starknet_chainId","params":[]}
+        ]"#;
+        let values: Value = serde_json::from_str(&server.handle_raw(raw)).expect("batch json");
+        let arr = values.as_array().expect("array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["id"], json!(1));
+        assert_eq!(arr[0]["result"], json!(2));
+        assert_eq!(arr[1]["error"]["code"], json!(ERR_INVALID_REQUEST));
+        assert_eq!(arr[1]["id"], Value::Null);
     }
 
     #[test]
