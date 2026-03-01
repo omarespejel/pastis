@@ -1,9 +1,13 @@
+use std::collections::{BTreeMap, VecDeque};
 use std::env;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -27,9 +31,11 @@ const DEFAULT_REPLAY_CHECKPOINT_PATH: &str = ".pastis/node-replay-checkpoint.jso
 const DEFAULT_LOCAL_JOURNAL_PATH: &str = ".pastis/node-local-journal.jsonl";
 const DEFAULT_P2P_HEARTBEAT_MS: u64 = 30_000;
 const DEFAULT_RPC_MAX_CONCURRENCY: usize = 256;
+const DEFAULT_RPC_RATE_LIMIT_PER_MINUTE: u32 = 1_200;
 const DEFAULT_HEALTH_MAX_CONSECUTIVE_FAILURES: u64 = 3;
 const DEFAULT_HEALTH_MAX_SYNC_LAG_BLOCKS: u64 = 64;
 const MAX_RPC_AUTH_TOKEN_BYTES: usize = 4 * 1024;
+const MAX_TRACKED_RPC_CLIENTS: usize = 10_000;
 
 #[derive(Debug, Clone)]
 struct DaemonConfig {
@@ -48,6 +54,7 @@ struct DaemonConfig {
     rpc_max_retries: u32,
     rpc_retry_backoff_ms: u64,
     rpc_max_concurrency: usize,
+    rpc_rate_limit_per_minute: u32,
     bootnodes: Vec<String>,
     require_peers: bool,
     p2p_heartbeat_ms: u64,
@@ -64,6 +71,7 @@ struct RpcAppState {
     sync_progress: Arc<Mutex<SyncProgress>>,
     health_policy: HealthPolicy,
     rpc_slots: Arc<Semaphore>,
+    rpc_rate_limiter: Arc<Mutex<RpcRateLimiter>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -82,6 +90,74 @@ struct StatusPayload {
 struct HealthPolicy {
     max_consecutive_failures: u64,
     max_sync_lag: u64,
+}
+
+#[derive(Debug, Default)]
+struct RpcRateLimiter {
+    limit_per_minute: u32,
+    requests_by_ip: BTreeMap<IpAddr, VecDeque<u64>>,
+}
+
+impl RpcRateLimiter {
+    fn new(limit_per_minute: u32) -> Self {
+        Self {
+            limit_per_minute,
+            requests_by_ip: BTreeMap::new(),
+        }
+    }
+
+    fn check_and_record(&mut self, ip: IpAddr, now_unix_seconds: u64) -> Result<(), String> {
+        if self.limit_per_minute == 0 {
+            return Ok(());
+        }
+
+        let requests = self.requests_by_ip.entry(ip).or_default();
+        while let Some(ts) = requests.front() {
+            if now_unix_seconds.saturating_sub(*ts) < 60 {
+                break;
+            }
+            requests.pop_front();
+        }
+        if requests.len() as u32 >= self.limit_per_minute {
+            return Err(format!(
+                "rpc rate limit exceeded for {ip}: limit {} requests/minute",
+                self.limit_per_minute
+            ));
+        }
+        requests.push_back(now_unix_seconds);
+        self.enforce_capacity(now_unix_seconds, ip);
+        Ok(())
+    }
+
+    fn enforce_capacity(&mut self, now_unix_seconds: u64, current_ip: IpAddr) {
+        if self.requests_by_ip.len() <= MAX_TRACKED_RPC_CLIENTS {
+            return;
+        }
+
+        for requests in self.requests_by_ip.values_mut() {
+            while let Some(ts) = requests.front() {
+                if now_unix_seconds.saturating_sub(*ts) < 60 {
+                    break;
+                }
+                requests.pop_front();
+            }
+        }
+        self.requests_by_ip
+            .retain(|_, requests| !requests.is_empty());
+
+        while self.requests_by_ip.len() > MAX_TRACKED_RPC_CLIENTS {
+            let evict = self
+                .requests_by_ip
+                .keys()
+                .copied()
+                .find(|ip| *ip != current_ip)
+                .or_else(|| self.requests_by_ip.keys().copied().next());
+            let Some(evict) = evict else {
+                break;
+            };
+            self.requests_by_ip.remove(&evict);
+        }
+    }
 }
 
 #[tokio::main]
@@ -136,6 +212,9 @@ async fn main() -> Result<(), String> {
             max_sync_lag: config.health_max_sync_lag_blocks,
         },
         rpc_slots: Arc::new(Semaphore::new(config.rpc_max_concurrency)),
+        rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(
+            config.rpc_rate_limit_per_minute,
+        ))),
     };
     let app = Router::new()
         .route("/", post(handle_rpc))
@@ -162,6 +241,10 @@ async fn main() -> Result<(), String> {
         config.chain_id_revalidate_polls
     );
     println!("rpc_max_concurrency: {}", config.rpc_max_concurrency);
+    println!(
+        "rpc_rate_limit_per_minute: {}",
+        config.rpc_rate_limit_per_minute
+    );
     println!("rpc_auth_enabled: {}", config.rpc_auth_token.is_some());
     println!("allow_public_rpc_bind: {}", config.allow_public_rpc_bind);
     println!("exit_on_unhealthy: {}", config.exit_on_unhealthy);
@@ -171,9 +254,12 @@ async fn main() -> Result<(), String> {
     println!("require_peers: {}", config.require_peers);
 
     let mut rpc_handle = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .map_err(|error| format!("rpc server failed: {error}"))
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .map_err(|error| format!("rpc server failed: {error}"))
     });
 
     if let Err(error) = runtime.poll_once().await {
@@ -233,6 +319,7 @@ async fn main() -> Result<(), String> {
 async fn handle_rpc(
     State(state): State<RpcAppState>,
     headers: HeaderMap,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     raw: String,
 ) -> impl IntoResponse {
     if !is_rpc_request_authorized(&headers, state.rpc_auth_token.as_deref()) {
@@ -242,6 +329,28 @@ async fn handle_rpc(
             "missing or invalid bearer token".to_string(),
         )
             .into_response();
+    }
+
+    let now_unix_seconds = unix_now_seconds();
+    {
+        let mut limiter = match state.rpc_rate_limiter.lock() {
+            Ok(limiter) => limiter,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "rpc rate limiter lock poisoned".to_string(),
+                )
+                    .into_response();
+            }
+        };
+        if let Err(message) = limiter.check_and_record(peer_addr.ip(), now_unix_seconds) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, "60")],
+                message,
+            )
+                .into_response();
+        }
     }
 
     let _rpc_slot = match state.rpc_slots.clone().try_acquire_owned() {
@@ -317,6 +426,13 @@ fn constant_time_eq_str(left: &str, right: &str) -> bool {
         diff |= usize::from(lhs ^ rhs);
     }
     diff == 0
+}
+
+fn unix_now_seconds() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(_) => 0,
+    }
 }
 
 async fn healthz(State(state): State<RpcAppState>) -> impl IntoResponse {
@@ -405,6 +521,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
     let mut cli_rpc_max_retries: Option<u32> = None;
     let mut cli_rpc_retry_backoff_ms: Option<u64> = None;
     let mut cli_rpc_max_concurrency: Option<usize> = None;
+    let mut cli_rpc_rate_limit_per_minute: Option<u32> = None;
     let mut cli_bootnodes: Vec<String> = Vec::new();
     let mut cli_require_peers = false;
     let mut cli_exit_on_unhealthy = false;
@@ -505,6 +622,13 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
                 cli_rpc_max_concurrency =
                     Some(parse_positive_usize(&raw, "--rpc-max-concurrency")?);
             }
+            "--rpc-rate-limit-per-minute" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--rpc-rate-limit-per-minute requires a value".to_string())?;
+                cli_rpc_rate_limit_per_minute =
+                    Some(parse_non_negative_u32(&raw, "--rpc-rate-limit-per-minute")?);
+            }
             "--bootnode" => {
                 cli_bootnodes.push(
                     args.next()
@@ -601,6 +725,11 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
             parse_env_usize("PASTIS_RPC_MAX_CONCURRENCY")?.unwrap_or(DEFAULT_RPC_MAX_CONCURRENCY)
         }
     };
+    let rpc_rate_limit_per_minute = match cli_rpc_rate_limit_per_minute {
+        Some(value) => value,
+        None => parse_env_u32("PASTIS_RPC_RATE_LIMIT_PER_MINUTE")?
+            .unwrap_or(DEFAULT_RPC_RATE_LIMIT_PER_MINUTE),
+    };
     let p2p_heartbeat_ms = match cli_p2p_heartbeat_ms {
         Some(value) => value,
         None => parse_env_u64("PASTIS_P2P_HEARTBEAT_MS")?.unwrap_or(DEFAULT_P2P_HEARTBEAT_MS),
@@ -651,6 +780,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         rpc_max_retries,
         rpc_retry_backoff_ms,
         rpc_max_concurrency,
+        rpc_rate_limit_per_minute,
         bootnodes,
         require_peers,
         p2p_heartbeat_ms,
@@ -867,6 +997,7 @@ options:\n\
   --rpc-max-retries <n>              Upstream RPC max retries\n\
   --rpc-retry-backoff-ms <ms>        Retry backoff base\n\
   --rpc-max-concurrency <n>          Max concurrent local RPC requests (default: {DEFAULT_RPC_MAX_CONCURRENCY})\n\
+  --rpc-rate-limit-per-minute <n>    Per-IP RPC request rate limit (0 disables; default: {DEFAULT_RPC_RATE_LIMIT_PER_MINUTE})\n\
   --bootnode <multiaddr>             Configure bootnode (repeatable)\n\
   --require-peers                    Fail closed when no peers are configured/available\n\
   --exit-on-unhealthy                Exit daemon when health checks fail\n\
@@ -887,6 +1018,7 @@ environment:\n\
   PASTIS_RPC_MAX_RETRIES             Upstream RPC max retries\n\
   PASTIS_RPC_RETRY_BACKOFF_MS        Upstream RPC retry backoff ms\n\
   PASTIS_RPC_MAX_CONCURRENCY         Max concurrent local RPC requests\n\
+  PASTIS_RPC_RATE_LIMIT_PER_MINUTE   Per-IP RPC request rate limit (0 disables)\n\
   PASTIS_BOOTNODES                   Comma-separated bootnodes\n\
   PASTIS_REQUIRE_PEERS               Require peers for sync loop health (true/false)\n\
   PASTIS_EXIT_ON_UNHEALTHY           Exit daemon when health checks fail (true/false)\n\
@@ -907,6 +1039,10 @@ mod tests {
     use starknet_node_types::InMemoryState;
 
     use super::*;
+
+    fn peer(port: u16) -> ConnectInfo<SocketAddr> {
+        ConnectInfo(SocketAddr::from(([127, 0, 0, 1], port)))
+    }
 
     fn base_progress() -> SyncProgress {
         SyncProgress {
@@ -1020,6 +1156,35 @@ mod tests {
     }
 
     #[test]
+    fn rpc_rate_limiter_enforces_limit_for_single_ip() {
+        let mut limiter = RpcRateLimiter::new(2);
+        let ip = IpAddr::from([127, 0, 0, 1]);
+        limiter
+            .check_and_record(ip, 1_000)
+            .expect("first request should pass");
+        limiter
+            .check_and_record(ip, 1_001)
+            .expect("second request should pass");
+        let err = limiter
+            .check_and_record(ip, 1_002)
+            .expect_err("third request within minute should be rate limited");
+        assert!(err.contains("rate limit exceeded"));
+    }
+
+    #[test]
+    fn rpc_rate_limiter_is_scoped_per_ip() {
+        let mut limiter = RpcRateLimiter::new(1);
+        let ip_a = IpAddr::from([127, 0, 0, 1]);
+        let ip_b = IpAddr::from([127, 0, 0, 2]);
+        limiter
+            .check_and_record(ip_a, 2_000)
+            .expect("first ip should pass");
+        limiter
+            .check_and_record(ip_b, 2_001)
+            .expect("second ip should pass independently");
+    }
+
+    #[test]
     fn validate_rpc_bind_exposure_rejects_named_host_without_auth() {
         let err = validate_rpc_bind_exposure("example.com:9545", None, false)
             .expect_err("named host without auth should fail closed");
@@ -1071,6 +1236,7 @@ mod tests {
                 max_sync_lag: 64,
             },
             rpc_slots: Arc::new(Semaphore::new(1)),
+            rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
         };
 
         let _permit = state
@@ -1081,6 +1247,7 @@ mod tests {
         let response = handle_rpc(
             State(state),
             HeaderMap::new(),
+            peer(30_001),
             r#"{"jsonrpc":"2.0","id":1,"method":"starknet_blockNumber","params":[]}"#.to_string(),
         )
         .await
@@ -1101,11 +1268,13 @@ mod tests {
                 max_sync_lag: 64,
             },
             rpc_slots: Arc::new(Semaphore::new(1)),
+            rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
         };
 
         let response = handle_rpc(
             State(state),
             HeaderMap::new(),
+            peer(30_002),
             r#"{"jsonrpc":"2.0","id":7,"method":"starknet_blockNumber","params":[]}"#.to_string(),
         )
         .await
@@ -1132,11 +1301,13 @@ mod tests {
                 max_sync_lag: 64,
             },
             rpc_slots: Arc::new(Semaphore::new(1)),
+            rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
         };
 
         let response = handle_rpc(
             State(state),
             HeaderMap::new(),
+            peer(30_003),
             r#"{"jsonrpc":"2.0","id":99,"method":"starknet_blockNumber","params":[]}"#.to_string(),
         )
         .await
@@ -1157,6 +1328,7 @@ mod tests {
                 max_sync_lag: 64,
             },
             rpc_slots: Arc::new(Semaphore::new(1)),
+            rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
         };
 
         let mut headers = HeaderMap::new();
@@ -1167,11 +1339,49 @@ mod tests {
         let response = handle_rpc(
             State(state),
             headers,
+            peer(30_004),
             r#"{"jsonrpc":"2.0","id":100,"method":"starknet_blockNumber","params":[]}"#.to_string(),
         )
         .await
         .into_response();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn handle_rpc_enforces_per_ip_rate_limit() {
+        let storage = ThreadSafeStorage::new(InMemoryStorage::new(InMemoryState::default()));
+        let state = RpcAppState {
+            storage,
+            chain_id: "SN_MAIN".to_string(),
+            rpc_auth_token: None,
+            sync_progress: Arc::new(Mutex::new(base_progress())),
+            health_policy: HealthPolicy {
+                max_consecutive_failures: 3,
+                max_sync_lag: 64,
+            },
+            rpc_slots: Arc::new(Semaphore::new(1)),
+            rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(1))),
+        };
+
+        let first = handle_rpc(
+            State(state.clone()),
+            HeaderMap::new(),
+            peer(30_005),
+            r#"{"jsonrpc":"2.0","id":111,"method":"starknet_blockNumber","params":[]}"#.to_string(),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = handle_rpc(
+            State(state),
+            HeaderMap::new(),
+            peer(30_005),
+            r#"{"jsonrpc":"2.0","id":112,"method":"starknet_blockNumber","params":[]}"#.to_string(),
+        )
+        .await
+        .into_response();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]
@@ -1187,6 +1397,7 @@ mod tests {
                 max_sync_lag: 64,
             },
             rpc_slots: Arc::new(Semaphore::new(1)),
+            rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
         };
 
         let response = status(State(state), HeaderMap::new())
@@ -1208,6 +1419,7 @@ mod tests {
                 max_sync_lag: 64,
             },
             rpc_slots: Arc::new(Semaphore::new(1)),
+            rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
         };
 
         let mut headers = HeaderMap::new();
