@@ -5,8 +5,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bincode::Options;
 use semver::Version;
@@ -42,12 +43,14 @@ const MAX_UPSTREAM_RPC_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LOCAL_JOURNAL_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_LOCAL_JOURNAL_LINE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RUNTIME_STORAGE_SNAPSHOT_FILE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_RUNTIME_STORAGE_SNAPSHOT_TMP_ATTEMPTS: u32 = 32;
 const MAX_RECENT_ERRORS: usize = 128;
 const MAX_RPC_ERROR_CONTEXT_CHARS: usize = 1_024;
 const MAX_RUNTIME_ERROR_CHARS: usize = 2_048;
 const UPSTREAM_REQUEST_ID: u64 = 1;
 const RUNTIME_STORAGE_SNAPSHOT_VERSION: u32 = 1;
 pub const DEFAULT_STORAGE_SNAPSHOT_INTERVAL_BLOCKS: u64 = 128;
+static RUNTIME_STORAGE_SNAPSHOT_TMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct RpcRetryConfig {
@@ -439,6 +442,47 @@ impl RuntimeStorageSnapshotStore {
         Ok(Some(snapshot))
     }
 
+    fn unique_tmp_path(&self) -> PathBuf {
+        let nonce = RUNTIME_STORAGE_SNAPSHOT_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let timestamp_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        self.path.with_extension(format!(
+            "tmp-{}-{timestamp_ns:x}-{nonce:x}",
+            std::process::id()
+        ))
+    }
+
+    fn open_unique_tmp_file(&self) -> Result<(PathBuf, File), String> {
+        for _ in 0..MAX_RUNTIME_STORAGE_SNAPSHOT_TMP_ATTEMPTS {
+            let tmp_path = self.unique_tmp_path();
+            match OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp_path)
+            {
+                Ok(file) => return Ok((tmp_path, file)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "failed to open temporary runtime storage snapshot {}: {error}",
+                        tmp_path.display()
+                    ));
+                }
+            }
+        }
+        Err(format!(
+            "failed to allocate unique temporary runtime storage snapshot path near {} after {} attempts",
+            self.path.display(),
+            MAX_RUNTIME_STORAGE_SNAPSHOT_TMP_ATTEMPTS
+        ))
+    }
+
+    fn cleanup_tmp_file(path: &Path) {
+        let _ = fs::remove_file(path);
+    }
+
     fn save(&self, snapshot: &RuntimeStorageSnapshot) -> Result<(), String> {
         self.ensure_not_symlink()?;
         let options = bincode::DefaultOptions::new()
@@ -466,38 +510,29 @@ impl RuntimeStorageSnapshotStore {
                 )
             })?;
         }
-        let tmp_path = self
-            .path
-            .with_extension(format!("tmp-{}", std::process::id()));
-        let mut tmp_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp_path)
-            .map_err(|error| {
-                format!(
-                    "failed to open temporary runtime storage snapshot {}: {error}",
-                    tmp_path.display()
-                )
-            })?;
-        tmp_file.write_all(&encoded).map_err(|error| {
-            format!(
+        let (tmp_path, mut tmp_file) = self.open_unique_tmp_file()?;
+        if let Err(error) = tmp_file.write_all(&encoded) {
+            Self::cleanup_tmp_file(&tmp_path);
+            return Err(format!(
                 "failed to write temporary runtime storage snapshot {}: {error}",
                 tmp_path.display()
-            )
-        })?;
-        tmp_file.sync_data().map_err(|error| {
-            format!(
+            ));
+        }
+        if let Err(error) = tmp_file.sync_data() {
+            Self::cleanup_tmp_file(&tmp_path);
+            return Err(format!(
                 "failed to fsync temporary runtime storage snapshot {}: {error}",
                 tmp_path.display()
-            )
-        })?;
-        fs::rename(&tmp_path, &self.path).map_err(|error| {
-            format!(
+            ));
+        }
+        drop(tmp_file);
+        if let Err(error) = fs::rename(&tmp_path, &self.path) {
+            Self::cleanup_tmp_file(&tmp_path);
+            return Err(format!(
                 "failed to atomically replace runtime storage snapshot {}: {error}",
                 self.path.display()
-            )
-        })?;
+            ));
+        }
         Ok(())
     }
 }
@@ -3641,6 +3676,30 @@ mod tests {
             .expect("restored receipt should exist");
         assert_eq!(receipt.gas_consumed, 7);
         assert!(receipt.execution_status);
+    }
+
+    #[test]
+    fn runtime_storage_snapshot_save_does_not_reuse_legacy_tmp_path() {
+        let dir = tempdir().expect("tempdir");
+        let snapshot_path = dir.path().join("runtime-storage.snapshot");
+        let legacy_tmp_path = snapshot_path.with_extension(format!("tmp-{}", std::process::id()));
+        std::fs::write(&legacy_tmp_path, b"legacy-temp-sentinel").expect("seed legacy tmp file");
+
+        let store = RuntimeStorageSnapshotStore::new(&snapshot_path);
+        let snapshot = RuntimeStorageSnapshot {
+            version: RUNTIME_STORAGE_SNAPSHOT_VERSION,
+            local_tip: 0,
+            storage: InMemoryStorage::new(InMemoryState::default()).export_snapshot(),
+            execution_state: InMemoryStateSnapshot::from(&InMemoryState::default()),
+        };
+        store
+            .save(&snapshot)
+            .expect("snapshot save should succeed without touching legacy tmp path");
+
+        let legacy_bytes =
+            std::fs::read(&legacy_tmp_path).expect("legacy tmp file should remain untouched");
+        assert_eq!(legacy_bytes, b"legacy-temp-sentinel");
+        assert!(snapshot_path.exists());
     }
 
     #[tokio::test]

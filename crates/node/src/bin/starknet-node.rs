@@ -35,6 +35,7 @@ const DEFAULT_STORAGE_SNAPSHOT_PATH: &str = ".pastis/node-storage.snapshot";
 const DEFAULT_P2P_HEARTBEAT_MS: u64 = 30_000;
 const DEFAULT_RPC_MAX_CONCURRENCY: usize = 256;
 const DEFAULT_RPC_RATE_LIMIT_PER_MINUTE: u32 = 1_200;
+const MAX_RPC_RATE_LIMIT_PER_MINUTE: u32 = 100_000;
 const DEFAULT_HEALTH_MAX_CONSECUTIVE_FAILURES: u64 = 3;
 const DEFAULT_HEALTH_MAX_SYNC_LAG_BLOCKS: u64 = 64;
 const MAX_RPC_AUTH_TOKEN_BYTES: usize = 4 * 1024;
@@ -1020,6 +1021,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         None => parse_env_u32("PASTIS_RPC_RATE_LIMIT_PER_MINUTE")?
             .unwrap_or(DEFAULT_RPC_RATE_LIMIT_PER_MINUTE),
     };
+    let rpc_rate_limit_per_minute = validate_rpc_rate_limit_per_minute(rpc_rate_limit_per_minute)?;
     let p2p_heartbeat_ms = match cli_p2p_heartbeat_ms {
         Some(value) => value,
         None => parse_env_u64("PASTIS_P2P_HEARTBEAT_MS")?.unwrap_or(DEFAULT_P2P_HEARTBEAT_MS),
@@ -1149,6 +1151,15 @@ fn parse_positive_usize(raw: &str, field: &str) -> Result<usize, String> {
         return Err(format!("invalid {field} value `{raw}`: must be > 0"));
     }
     Ok(parsed)
+}
+
+fn validate_rpc_rate_limit_per_minute(value: u32) -> Result<u32, String> {
+    if value > MAX_RPC_RATE_LIMIT_PER_MINUTE {
+        return Err(format!(
+            "invalid rpc rate limit value `{value}`: exceeds max {MAX_RPC_RATE_LIMIT_PER_MINUTE} requests/minute"
+        ));
+    }
+    Ok(value)
 }
 
 fn parse_bootnode_endpoints(bootnodes: &[String]) -> Result<Vec<BootnodeEndpoint>, String> {
@@ -1593,6 +1604,31 @@ mod tests {
     fn validate_rpc_bind_exposure_allows_loopback_without_auth() {
         validate_rpc_bind_exposure("127.0.0.1:9545", None, false)
             .expect("loopback bind should be allowed");
+    }
+
+    #[test]
+    fn validate_rpc_rate_limit_per_minute_accepts_disabled_and_reasonable_values() {
+        assert_eq!(
+            validate_rpc_rate_limit_per_minute(0).expect("zero should disable rate limiting"),
+            0
+        );
+        assert_eq!(
+            validate_rpc_rate_limit_per_minute(DEFAULT_RPC_RATE_LIMIT_PER_MINUTE)
+                .expect("default should be accepted"),
+            DEFAULT_RPC_RATE_LIMIT_PER_MINUTE
+        );
+        assert_eq!(
+            validate_rpc_rate_limit_per_minute(MAX_RPC_RATE_LIMIT_PER_MINUTE)
+                .expect("upper bound should be accepted"),
+            MAX_RPC_RATE_LIMIT_PER_MINUTE
+        );
+    }
+
+    #[test]
+    fn validate_rpc_rate_limit_per_minute_rejects_extreme_values() {
+        let err = validate_rpc_rate_limit_per_minute(MAX_RPC_RATE_LIMIT_PER_MINUTE + 1)
+            .expect_err("values above cap should fail closed");
+        assert!(err.contains("exceeds max"));
     }
 
     #[test]
