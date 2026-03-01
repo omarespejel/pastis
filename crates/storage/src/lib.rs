@@ -767,11 +767,6 @@ impl StorageBackend for InMemoryStorage {
         }
 
         let block_number = block.number;
-        for (index, tx) in block.transactions.iter().enumerate() {
-            self.tx_index.insert(tx.hash.clone(), (block_number, index));
-            self.receipt_index
-                .insert(tx.hash.clone(), (block_number, index));
-        }
         if let Some(hash) = normalized_block_hash.as_ref()
             && let Some(existing_block) = self.block_number_by_hash.get(hash)
         {
@@ -780,6 +775,12 @@ impl StorageBackend for InMemoryStorage {
                 existing_block: *existing_block,
                 new_block: block_number,
             });
+        }
+
+        for (index, tx) in block.transactions.iter().enumerate() {
+            self.tx_index.insert(tx.hash.clone(), (block_number, index));
+            self.receipt_index
+                .insert(tx.hash.clone(), (block_number, index));
         }
         self.blocks.insert(block_number, block);
         if let Some(hash) = normalized_block_hash {
@@ -1832,6 +1833,51 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn duplicate_block_hash_rejection_does_not_mutate_tx_indexes() {
+        let mut storage = InMemoryStorage::new(InMemoryState::default());
+        storage
+            .insert_block_with_metadata(
+                block(1),
+                StarknetStateDiff::default(),
+                Vec::new(),
+                Some("0xabc".to_string()),
+            )
+            .expect("insert first block hash");
+        let block_2 = block(2);
+        let failed_tx_hash = block_2.transactions[0].hash.clone();
+        let err = storage
+            .insert_block_with_metadata(
+                block_2,
+                StarknetStateDiff::default(),
+                Vec::new(),
+                Some("0X000AbC".to_string()),
+            )
+            .expect_err("duplicate canonical hash must fail");
+        assert!(matches!(
+            err,
+            StorageError::DuplicateBlockHash {
+                existing_block: 1,
+                new_block: 2,
+                ..
+            }
+        ));
+
+        assert_eq!(storage.latest_block_number().expect("latest"), 1);
+        assert!(
+            storage
+                .get_block(BlockId::Number(2))
+                .expect("block lookup should succeed")
+                .is_none()
+        );
+        assert!(
+            storage
+                .get_transaction_by_hash(&failed_tx_hash)
+                .expect("tx lookup should succeed")
+                .is_none()
+        );
     }
 
     #[test]

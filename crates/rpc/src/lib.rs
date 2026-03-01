@@ -569,17 +569,47 @@ fn parse_block_id_value(block_id_value: &Value) -> Result<BlockId, RpcError> {
     match block_id_value {
         Value::String(s) if s == "latest" || s == "pending" => Ok(BlockId::Latest),
         Value::Object(obj) => {
-            if let Some(number) = obj.get("block_number").and_then(Value::as_u64) {
+            let has_block_number = obj.contains_key("block_number");
+            let has_block_hash = obj.contains_key("block_hash");
+            let has_block_tag = obj.contains_key("block_tag");
+            let selector_count = [has_block_number, has_block_hash, has_block_tag]
+                .into_iter()
+                .filter(|selected| *selected)
+                .count();
+            if selector_count > 1 {
+                return Err(RpcError::InvalidParams(
+                    "block_id object must include exactly one selector: block_number, block_hash, or block_tag"
+                        .to_string(),
+                ));
+            }
+
+            if has_block_number {
+                let Some(number) = obj.get("block_number").and_then(Value::as_u64) else {
+                    return Err(RpcError::InvalidParams(
+                        "block_number must be an unsigned integer".to_string(),
+                    ));
+                };
                 return Ok(BlockId::Number(number));
             }
-            if let Some(hash_value) = obj.get("block_hash") {
+            if has_block_hash {
+                let hash_value = obj.get("block_hash").ok_or_else(|| {
+                    RpcError::InvalidParams("missing required key 'block_hash'".to_string())
+                })?;
                 let hash = parse_felt_hex(hash_value, "block_hash")?;
                 return Ok(BlockId::Hash(hash));
             }
-            if let Some(tag) = obj.get("block_tag").and_then(Value::as_str)
-                && (tag == "latest" || tag == "pending")
-            {
-                return Ok(BlockId::Latest);
+            if has_block_tag {
+                let Some(tag) = obj.get("block_tag").and_then(Value::as_str) else {
+                    return Err(RpcError::InvalidParams(
+                        "block_tag must be 'latest' or 'pending'".to_string(),
+                    ));
+                };
+                if tag == "latest" || tag == "pending" {
+                    return Ok(BlockId::Latest);
+                }
+                return Err(RpcError::InvalidParams(
+                    "block_tag must be 'latest' or 'pending'".to_string(),
+                ));
             }
             Err(RpcError::InvalidParams(
                 "block_id object must include block_number, block_hash, or block_tag='latest'|'pending'"
@@ -1543,6 +1573,34 @@ mod tests {
         let raw = r#"{"jsonrpc":"2.0","id":4,"method":"starknet_getBlockWithTxs","params":[]}"#;
         let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
         assert_eq!(value["error"]["code"], json!(ERR_INVALID_PARAMS));
+    }
+
+    #[test]
+    fn block_id_rejects_conflicting_selectors() {
+        let server = seeded_server();
+        let raw = r#"{"jsonrpc":"2.0","id":84,"method":"starknet_getBlockWithTxs","params":[{"block_number":1,"block_hash":"0x1"}]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["error"]["code"], json!(ERR_INVALID_PARAMS));
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .expect("error message")
+                .contains("exactly one selector")
+        );
+    }
+
+    #[test]
+    fn block_id_rejects_non_numeric_block_number() {
+        let server = seeded_server();
+        let raw = r#"{"jsonrpc":"2.0","id":85,"method":"starknet_getBlockWithTxs","params":[{"block_number":"1"}]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["error"]["code"], json!(ERR_INVALID_PARAMS));
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .expect("error message")
+                .contains("block_number must be an unsigned integer")
+        );
     }
 
     #[test]
