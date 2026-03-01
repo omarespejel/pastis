@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::net::IpAddr;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::SystemTime;
@@ -13,7 +14,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::interval;
 
@@ -91,6 +92,13 @@ struct StatusPayload {
 struct HealthPolicy {
     max_consecutive_failures: u64,
     max_sync_lag: u64,
+    require_peers: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BootnodeEndpoint {
+    Socket(SocketAddr),
+    HostPort { host: String, port: u16 },
 }
 
 #[derive(Debug, Default)]
@@ -175,6 +183,13 @@ struct RpcRuntimeMetrics {
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let config = parse_daemon_config()?;
+    let bootnode_endpoints = parse_bootnode_endpoints(&config.bootnodes)?;
+    if config.require_peers && bootnode_endpoints.is_empty() {
+        return Err(
+            "PASTIS_REQUIRE_PEERS=true requires at least one valid --bootnode/PASTIS_BOOTNODES entry"
+                .to_string(),
+        );
+    }
 
     let runtime_config = RuntimeConfig {
         chain_id: config.chain_id.clone(),
@@ -190,29 +205,15 @@ async fn main() -> Result<(), String> {
             max_retries: config.rpc_max_retries,
             base_backoff: Duration::from_millis(config.rpc_retry_backoff_ms),
         },
-        peer_count_hint: config.bootnodes.len(),
-        require_peers: config.require_peers,
+        // Runtime-level network backend is static today; daemon owns live bootnode probing.
+        peer_count_hint: 0,
+        require_peers: false,
     };
 
     let mut runtime = NodeRuntime::new(runtime_config)?;
     let storage = runtime.storage();
     let sync_progress = runtime.sync_progress_handle();
     let chain_id = runtime.chain_id().to_string();
-
-    if !config.bootnodes.is_empty() {
-        let bootnodes = config.bootnodes.clone();
-        let heartbeat_ms = config.p2p_heartbeat_ms.max(1_000);
-        tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_millis(heartbeat_ms));
-            loop {
-                ticker.tick().await;
-                eprintln!(
-                    "p2p heartbeat: {} configured bootnodes, sync loop active",
-                    bootnodes.len()
-                );
-            }
-        });
-    }
 
     let app_state = RpcAppState {
         storage,
@@ -222,6 +223,7 @@ async fn main() -> Result<(), String> {
         health_policy: HealthPolicy {
             max_consecutive_failures: config.health_max_consecutive_failures,
             max_sync_lag: config.health_max_sync_lag_blocks,
+            require_peers: config.require_peers,
         },
         rpc_slots: Arc::new(Semaphore::new(config.rpc_max_concurrency)),
         rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(
@@ -229,6 +231,37 @@ async fn main() -> Result<(), String> {
         ))),
         rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
     };
+
+    let bootnode_peer_count = Arc::new(AtomicU64::new(0));
+    if !bootnode_endpoints.is_empty() {
+        let initial_peers =
+            probe_bootnodes(&bootnode_endpoints, Duration::from_millis(1_500)).await;
+        bootnode_peer_count.store(initial_peers as u64, Ordering::Relaxed);
+        if let Ok(mut progress) = app_state.sync_progress.lock() {
+            progress.peer_count = initial_peers as u64;
+        }
+    }
+
+    if !bootnode_endpoints.is_empty() {
+        let endpoints = bootnode_endpoints.clone();
+        let bootnode_count = endpoints.len();
+        let heartbeat_ms = config.p2p_heartbeat_ms.max(1_000);
+        let peer_counter = bootnode_peer_count.clone();
+        let sync_progress = app_state.sync_progress.clone();
+        tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_millis(heartbeat_ms));
+            loop {
+                ticker.tick().await;
+                let reachable = probe_bootnodes(&endpoints, Duration::from_millis(1_500)).await;
+                peer_counter.store(reachable as u64, Ordering::Relaxed);
+                if let Ok(mut progress) = sync_progress.lock() {
+                    progress.peer_count = reachable as u64;
+                }
+                eprintln!("p2p heartbeat: {reachable}/{bootnode_count} bootnodes reachable");
+            }
+        });
+    }
+
     let app = Router::new()
         .route("/", post(handle_rpc))
         .route("/healthz", get(healthz))
@@ -296,16 +329,20 @@ async fn main() -> Result<(), String> {
                 if let Err(error) = runtime.poll_once().await {
                     eprintln!("warning: sync poll failed: {error}");
                 }
-                let progress = runtime
-                    .sync_progress_handle()
-                    .lock()
-                    .map_err(|_| "sync progress lock poisoned".to_string())?
-                    .clone();
+                let progress = {
+                    let progress_handle = runtime.sync_progress_handle();
+                    let mut progress = progress_handle
+                        .lock()
+                        .map_err(|_| "sync progress lock poisoned".to_string())?;
+                    progress.peer_count = bootnode_peer_count.load(Ordering::Relaxed);
+                    progress.clone()
+                };
                 if let Some(reason) = unhealthy_exit_reason(
                     &progress,
                     &HealthPolicy {
                         max_consecutive_failures: config.health_max_consecutive_failures,
                         max_sync_lag: config.health_max_sync_lag_blocks,
+                        require_peers: config.require_peers,
                     },
                     config.exit_on_unhealthy,
                 ) {
@@ -479,6 +516,31 @@ fn unix_now_seconds() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_secs(),
         Err(_) => 0,
+    }
+}
+
+async fn probe_bootnodes(endpoints: &[BootnodeEndpoint], timeout: Duration) -> usize {
+    let mut reachable = 0usize;
+    for endpoint in endpoints {
+        if probe_bootnode(endpoint, timeout).await {
+            reachable = reachable.saturating_add(1);
+        }
+    }
+    reachable
+}
+
+async fn probe_bootnode(endpoint: &BootnodeEndpoint, timeout: Duration) -> bool {
+    match endpoint {
+        BootnodeEndpoint::Socket(addr) => {
+            matches!(
+                tokio::time::timeout(timeout, TcpStream::connect(*addr)).await,
+                Ok(Ok(_))
+            )
+        }
+        BootnodeEndpoint::HostPort { host, port } => matches!(
+            tokio::time::timeout(timeout, TcpStream::connect((host.as_str(), *port))).await,
+            Ok(Ok(_))
+        ),
     }
 }
 
@@ -1029,6 +1091,71 @@ fn parse_positive_usize(raw: &str, field: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
+fn parse_bootnode_endpoints(bootnodes: &[String]) -> Result<Vec<BootnodeEndpoint>, String> {
+    let mut parsed = Vec::with_capacity(bootnodes.len());
+    for raw in bootnodes {
+        let Some(endpoint) = parse_bootnode_endpoint(raw) else {
+            return Err(format!(
+                "invalid bootnode `{raw}`: expected socket address, host:port, or /ip4|ip6|dns*/.../tcp/<port> multiaddr"
+            ));
+        };
+        parsed.push(endpoint);
+    }
+    Ok(parsed)
+}
+
+fn parse_bootnode_endpoint(raw: &str) -> Option<BootnodeEndpoint> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(addr) = trimmed.parse::<SocketAddr>() {
+        return Some(BootnodeEndpoint::Socket(addr));
+    }
+    if trimmed.starts_with('/') {
+        let segments: Vec<&str> = trimmed
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        if segments.len() >= 4 && segments[2] == "tcp" {
+            let port = segments[3].parse::<u16>().ok()?;
+            match segments[0] {
+                "ip4" | "ip6" => {
+                    let host = segments[1];
+                    if let Ok(addr) = format!("{host}:{port}").parse::<SocketAddr>() {
+                        return Some(BootnodeEndpoint::Socket(addr));
+                    }
+                    if let Ok(addr) = format!("[{host}]:{port}").parse::<SocketAddr>() {
+                        return Some(BootnodeEndpoint::Socket(addr));
+                    }
+                }
+                "dns" | "dns4" | "dns6" => {
+                    return Some(BootnodeEndpoint::HostPort {
+                        host: segments[1].to_string(),
+                        port,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some((host, port)) = trimmed.rsplit_once(':') {
+        let parsed_port = port.parse::<u16>().ok()?;
+        let normalized_host = host.trim().trim_start_matches('[').trim_end_matches(']');
+        if normalized_host.is_empty() {
+            return None;
+        }
+        if let Ok(ip) = normalized_host.parse::<IpAddr>() {
+            return Some(BootnodeEndpoint::Socket(SocketAddr::new(ip, parsed_port)));
+        }
+        return Some(BootnodeEndpoint::HostPort {
+            host: normalized_host.to_string(),
+            port: parsed_port,
+        });
+    }
+    None
+}
+
 fn validate_rpc_auth_token(raw: String) -> Result<String, String> {
     if raw.is_empty() {
         return Err("invalid RPC auth token: token must not be empty".to_string());
@@ -1099,6 +1226,10 @@ fn redact_rpc_url(raw: &str) -> String {
 }
 
 fn evaluate_health(progress: &SyncProgress, policy: &HealthPolicy) -> Result<(), String> {
+    if policy.require_peers && progress.peer_count == 0 {
+        return Err("unhealthy: peer_count=0 while peers are required".to_string());
+    }
+
     if progress.consecutive_failures > policy.max_consecutive_failures {
         return Err(format!(
             "unhealthy: consecutive_failures={} exceeds threshold={}; last_error={}",
@@ -1239,6 +1370,7 @@ mod tests {
         let policy = HealthPolicy {
             max_consecutive_failures: 3,
             max_sync_lag: 64,
+            require_peers: false,
         };
         assert!(evaluate_health(&progress, &policy).is_ok());
     }
@@ -1249,6 +1381,7 @@ mod tests {
         let policy = HealthPolicy {
             max_consecutive_failures: 3,
             max_sync_lag: 64,
+            require_peers: false,
         };
         assert!(evaluate_readiness(&progress, &policy).is_ok());
     }
@@ -1261,6 +1394,7 @@ mod tests {
         let policy = HealthPolicy {
             max_consecutive_failures: 3,
             max_sync_lag: 64,
+            require_peers: false,
         };
         let error = evaluate_readiness(&progress, &policy).expect_err("should not be ready");
         assert!(error.contains("not ready"));
@@ -1274,6 +1408,7 @@ mod tests {
         let policy = HealthPolicy {
             max_consecutive_failures: 3,
             max_sync_lag: 64,
+            require_peers: false,
         };
         let error = evaluate_health(&progress, &policy).expect_err("should fail health check");
         assert!(error.contains("consecutive_failures"));
@@ -1287,9 +1422,72 @@ mod tests {
         let policy = HealthPolicy {
             max_consecutive_failures: 3,
             max_sync_lag: 64,
+            require_peers: false,
         };
         let error = evaluate_health(&progress, &policy).expect_err("should fail health check");
         assert!(error.contains("sync_lag"));
+    }
+
+    #[test]
+    fn evaluate_health_fails_when_peers_required_and_none_available() {
+        let mut progress = base_progress();
+        progress.peer_count = 0;
+        let policy = HealthPolicy {
+            max_consecutive_failures: 3,
+            max_sync_lag: 64,
+            require_peers: true,
+        };
+        let error =
+            evaluate_health(&progress, &policy).expect_err("missing peers must fail health check");
+        assert!(error.contains("peer_count=0"));
+    }
+
+    #[test]
+    fn parse_bootnode_endpoint_supports_socket_and_multiaddr_formats() {
+        assert_eq!(
+            parse_bootnode_endpoint("127.0.0.1:9090"),
+            Some(BootnodeEndpoint::Socket(SocketAddr::from((
+                [127, 0, 0, 1],
+                9090
+            ))))
+        );
+        assert_eq!(
+            parse_bootnode_endpoint("/ip4/127.0.0.1/tcp/9999/p2p/12D3KooWabc"),
+            Some(BootnodeEndpoint::Socket(SocketAddr::from((
+                [127, 0, 0, 1],
+                9999
+            ))))
+        );
+        assert_eq!(
+            parse_bootnode_endpoint("/dns4/bootstrap.starknet.io/tcp/30303/p2p/12D3KooWabc"),
+            Some(BootnodeEndpoint::HostPort {
+                host: "bootstrap.starknet.io".to_string(),
+                port: 30_303,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_bootnode_endpoints_rejects_invalid_entries() {
+        let err = parse_bootnode_endpoints(&["bad-bootnode".to_string()])
+            .expect_err("invalid bootnode should fail parsing");
+        assert!(err.contains("invalid bootnode"));
+    }
+
+    #[tokio::test]
+    async fn probe_bootnode_detects_reachable_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener bind should succeed");
+        let addr = listener.local_addr().expect("listener local addr");
+        let endpoint = BootnodeEndpoint::Socket(addr);
+
+        let accept_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let reachable = probe_bootnode(&endpoint, Duration::from_millis(250)).await;
+        assert!(reachable);
+        let _ = accept_task.await;
     }
 
     #[test]
@@ -1382,6 +1580,7 @@ mod tests {
         let policy = HealthPolicy {
             max_consecutive_failures: 3,
             max_sync_lag: 64,
+            require_peers: false,
         };
         assert!(unhealthy_exit_reason(&progress, &policy, false).is_none());
     }
@@ -1394,6 +1593,7 @@ mod tests {
         let policy = HealthPolicy {
             max_consecutive_failures: 3,
             max_sync_lag: 64,
+            require_peers: false,
         };
         let reason = unhealthy_exit_reason(&progress, &policy, true)
             .expect("enabled unhealthy exit should surface reason");
@@ -1411,6 +1611,7 @@ mod tests {
             health_policy: HealthPolicy {
                 max_consecutive_failures: 3,
                 max_sync_lag: 64,
+                require_peers: false,
             },
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
@@ -1444,6 +1645,7 @@ mod tests {
             health_policy: HealthPolicy {
                 max_consecutive_failures: 3,
                 max_sync_lag: 64,
+                require_peers: false,
             },
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
@@ -1478,6 +1680,7 @@ mod tests {
             health_policy: HealthPolicy {
                 max_consecutive_failures: 3,
                 max_sync_lag: 64,
+                require_peers: false,
             },
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
@@ -1506,6 +1709,7 @@ mod tests {
             health_policy: HealthPolicy {
                 max_consecutive_failures: 3,
                 max_sync_lag: 64,
+                require_peers: false,
             },
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
@@ -1539,6 +1743,7 @@ mod tests {
             health_policy: HealthPolicy {
                 max_consecutive_failures: 3,
                 max_sync_lag: 64,
+                require_peers: false,
             },
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(1))),
@@ -1577,6 +1782,7 @@ mod tests {
             health_policy: HealthPolicy {
                 max_consecutive_failures: 3,
                 max_sync_lag: 64,
+                require_peers: false,
             },
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
@@ -1617,6 +1823,7 @@ mod tests {
             health_policy: HealthPolicy {
                 max_consecutive_failures: 3,
                 max_sync_lag: 64,
+                require_peers: false,
             },
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
@@ -1656,6 +1863,7 @@ mod tests {
             health_policy: HealthPolicy {
                 max_consecutive_failures: 3,
                 max_sync_lag: 64,
+                require_peers: false,
             },
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
@@ -1679,6 +1887,7 @@ mod tests {
             health_policy: HealthPolicy {
                 max_consecutive_failures: 3,
                 max_sync_lag: 64,
+                require_peers: false,
             },
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
