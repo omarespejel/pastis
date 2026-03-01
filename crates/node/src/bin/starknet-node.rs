@@ -51,6 +51,7 @@ const MAX_RPC_AUTH_TOKEN_BYTES: usize = 4 * 1024;
 const MAX_TRACKED_RPC_CLIENTS: usize = 10_000;
 const DEFAULT_PEER_HEALTH_HISTORY_CAPACITY: usize = 512;
 const DEFAULT_PEER_HEALTH_FLAP_WINDOW_SECS: u64 = 300;
+const DEFAULT_PEER_HEALTH_MAX_RECENT_FLAPS: u64 = 0;
 
 #[derive(Debug, Clone)]
 struct DaemonConfig {
@@ -79,6 +80,7 @@ struct DaemonConfig {
     p2p_heartbeat_ms: u64,
     peer_health_history_capacity: usize,
     peer_health_flap_window_secs: u64,
+    peer_health_max_recent_flaps: u64,
     health_max_consecutive_failures: u64,
     health_max_sync_lag_blocks: u64,
     exit_on_unhealthy: bool,
@@ -92,6 +94,7 @@ struct RpcAppState {
     sync_progress: Arc<Mutex<SyncProgress>>,
     health_policy: HealthPolicy,
     min_peer_count: u64,
+    max_recent_peer_health_flaps: u64,
     peer_health_tracker: Arc<Mutex<PeerHealthTracker>>,
     rpc_slots: Arc<Semaphore>,
     rpc_rate_limiter: Arc<Mutex<RpcRateLimiter>>,
@@ -106,6 +109,7 @@ struct StatusPayload {
     highest_block: u64,
     peer_count: u64,
     min_peers: u64,
+    max_recent_peer_health_flaps: u64,
     reorg_events: u64,
     consecutive_failures: u64,
     last_error: Option<String>,
@@ -427,6 +431,7 @@ async fn main() -> Result<(), String> {
             require_peers: config.min_peers > 0,
         },
         min_peer_count: config.min_peers,
+        max_recent_peer_health_flaps: config.peer_health_max_recent_flaps,
         peer_health_tracker: Arc::clone(&peer_health_tracker),
         rpc_slots: Arc::new(Semaphore::new(config.rpc_max_concurrency)),
         rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(
@@ -512,6 +517,10 @@ async fn main() -> Result<(), String> {
         "peer_health_flap_window_secs: {}",
         config.peer_health_flap_window_secs
     );
+    println!(
+        "peer_health_max_recent_flaps: {}",
+        config.peer_health_max_recent_flaps
+    );
     if let Some(path) = &config.local_journal_path {
         println!("local_journal_path: {path}");
     }
@@ -582,6 +591,11 @@ async fn main() -> Result<(), String> {
                     },
                     config.min_peers,
                     config.exit_on_unhealthy,
+                    peer_health_tracker
+                        .lock()
+                        .map_err(|_| "peer health tracker lock poisoned".to_string())?
+                        .snapshot(unix_now_seconds()),
+                    config.peer_health_max_recent_flaps,
                 ) {
                     exit_error = Some(format!(
                         "fatal health condition while sync loop is active: {reason}"
@@ -966,7 +980,24 @@ async fn healthz(State(state): State<RpcAppState>) -> impl IntoResponse {
         }
     };
 
-    match evaluate_health(&progress, &state.health_policy, state.min_peer_count) {
+    let peer_health = match state.peer_health_tracker.lock() {
+        Ok(tracker) => tracker.snapshot(unix_now_seconds()),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "peer health tracker lock poisoned".to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    match evaluate_health(
+        &progress,
+        &state.health_policy,
+        state.min_peer_count,
+        &peer_health,
+        state.max_recent_peer_health_flaps,
+    ) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(message) => (StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
     }
@@ -984,7 +1015,24 @@ async fn readyz(State(state): State<RpcAppState>) -> impl IntoResponse {
         }
     };
 
-    match evaluate_readiness(&progress, &state.health_policy, state.min_peer_count) {
+    let peer_health = match state.peer_health_tracker.lock() {
+        Ok(tracker) => tracker.snapshot(unix_now_seconds()),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "peer health tracker lock poisoned".to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    match evaluate_readiness(
+        &progress,
+        &state.health_policy,
+        state.min_peer_count,
+        &peer_health,
+        state.max_recent_peer_health_flaps,
+    ) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(message) => (StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
     }
@@ -1029,6 +1077,7 @@ async fn status(
         highest_block: progress.highest_block,
         peer_count: progress.peer_count,
         min_peers: state.min_peer_count,
+        max_recent_peer_health_flaps: state.max_recent_peer_health_flaps,
         reorg_events: progress.reorg_events,
         consecutive_failures: progress.consecutive_failures,
         last_error: progress.last_error,
@@ -1169,6 +1218,16 @@ async fn metrics(State(state): State<RpcAppState>, headers: HeaderMap) -> impl I
     );
     let _ = writeln!(body, "# TYPE pastis_sync_min_peer_count gauge");
     let _ = writeln!(body, "pastis_sync_min_peer_count {}", state.min_peer_count);
+    let _ = writeln!(
+        body,
+        "# HELP pastis_peer_health_max_recent_flaps Max allowed recent peer-health flaps before unhealthy (0 disables)."
+    );
+    let _ = writeln!(body, "# TYPE pastis_peer_health_max_recent_flaps gauge");
+    let _ = writeln!(
+        body,
+        "pastis_peer_health_max_recent_flaps {}",
+        state.max_recent_peer_health_flaps
+    );
     let _ = writeln!(
         body,
         "# HELP pastis_peer_health_status Current peer health state (1=healthy, 0=unhealthy)."
@@ -1556,6 +1615,9 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         .unwrap_or(DEFAULT_PEER_HEALTH_HISTORY_CAPACITY);
     let peer_health_flap_window_secs = parse_env_u64("PASTIS_PEER_HEALTH_FLAP_WINDOW_SECS")?
         .unwrap_or(DEFAULT_PEER_HEALTH_FLAP_WINDOW_SECS);
+    let peer_health_max_recent_flaps =
+        parse_env_non_negative_u64("PASTIS_PEER_HEALTH_MAX_RECENT_FLAPS")?
+            .unwrap_or(DEFAULT_PEER_HEALTH_MAX_RECENT_FLAPS);
     let storage_snapshot_interval_blocks = match cli_storage_snapshot_interval_blocks {
         Some(value) => value,
         None => parse_env_u64("PASTIS_STORAGE_SNAPSHOT_INTERVAL_BLOCKS")?
@@ -1627,6 +1689,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         p2p_heartbeat_ms,
         peer_health_history_capacity,
         peer_health_flap_window_secs,
+        peer_health_max_recent_flaps,
         health_max_consecutive_failures,
         health_max_sync_lag_blocks,
         exit_on_unhealthy,
@@ -1989,6 +2052,8 @@ fn evaluate_health(
     progress: &SyncProgress,
     policy: &HealthPolicy,
     min_peer_count: u64,
+    peer_health: &PeerHealthStatus,
+    max_recent_peer_health_flaps: u64,
 ) -> Result<(), String> {
     let required_peers = if min_peer_count > 0 {
         min_peer_count
@@ -2026,6 +2091,15 @@ fn evaluate_health(
         ));
     }
 
+    if max_recent_peer_health_flaps > 0
+        && peer_health.flap_transitions_recent > max_recent_peer_health_flaps
+    {
+        return Err(format!(
+            "unhealthy: peer_health_flap_transitions_recent={} exceeds threshold={}",
+            peer_health.flap_transitions_recent, max_recent_peer_health_flaps
+        ));
+    }
+
     Ok(())
 }
 
@@ -2033,8 +2107,16 @@ fn evaluate_readiness(
     progress: &SyncProgress,
     policy: &HealthPolicy,
     min_peer_count: u64,
+    peer_health: &PeerHealthStatus,
+    max_recent_peer_health_flaps: u64,
 ) -> Result<(), String> {
-    evaluate_health(progress, policy, min_peer_count)?;
+    evaluate_health(
+        progress,
+        policy,
+        min_peer_count,
+        peer_health,
+        max_recent_peer_health_flaps,
+    )?;
     if progress.current_block < progress.highest_block {
         return Err(format!(
             "not ready: sync in progress (current={}, highest={})",
@@ -2066,11 +2148,20 @@ fn unhealthy_exit_reason(
     policy: &HealthPolicy,
     min_peer_count: u64,
     exit_on_unhealthy: bool,
+    peer_health: PeerHealthStatus,
+    max_recent_peer_health_flaps: u64,
 ) -> Option<String> {
     if !exit_on_unhealthy {
         return None;
     }
-    evaluate_health(progress, policy, min_peer_count).err()
+    evaluate_health(
+        progress,
+        policy,
+        min_peer_count,
+        &peer_health,
+        max_recent_peer_health_flaps,
+    )
+    .err()
 }
 
 fn help_text() -> String {
@@ -2132,6 +2223,7 @@ environment:\n\
   PASTIS_P2P_HEARTBEAT_MS            P2P heartbeat interval\n\
   PASTIS_PEER_HEALTH_HISTORY_CAPACITY  Bounded peer-health history capacity (default: {DEFAULT_PEER_HEALTH_HISTORY_CAPACITY})\n\
   PASTIS_PEER_HEALTH_FLAP_WINDOW_SECS  Flap detection lookback window in seconds (default: {DEFAULT_PEER_HEALTH_FLAP_WINDOW_SECS})\n\
+  PASTIS_PEER_HEALTH_MAX_RECENT_FLAPS  Max allowed recent peer-health flaps before unhealthy (0 disables; default: {DEFAULT_PEER_HEALTH_MAX_RECENT_FLAPS})\n\
   PASTIS_HEALTH_MAX_CONSECUTIVE_FAILURES   Health failure threshold for consecutive poll failures\n\
   PASTIS_HEALTH_MAX_SYNC_LAG_BLOCKS         Health failure threshold for sync lag in blocks"
     )
@@ -2168,15 +2260,30 @@ mod tests {
         }
     }
 
+    fn base_peer_health_status() -> PeerHealthStatus {
+        PeerHealthStatus {
+            healthy: true,
+            last_peer_count: Some(3),
+            history_size: 1,
+            observations_total: 1,
+            healthy_observations_total: 1,
+            unhealthy_observations_total: 0,
+            flap_transitions_total: 0,
+            flap_transitions_recent: 0,
+            last_observed_at_unix_seconds: Some(10),
+        }
+    }
+
     #[test]
     fn evaluate_health_reports_healthy_when_within_thresholds() {
         let progress = base_progress();
+        let peer_health = base_peer_health_status();
         let policy = HealthPolicy {
             max_consecutive_failures: 3,
             max_sync_lag: 64,
             require_peers: false,
         };
-        assert!(evaluate_health(&progress, &policy, 0).is_ok());
+        assert!(evaluate_health(&progress, &policy, 0, &peer_health, 0).is_ok());
     }
 
     #[tokio::test]
@@ -2207,12 +2314,13 @@ mod tests {
     #[test]
     fn evaluate_readiness_is_ready_when_synced_and_healthy() {
         let progress = base_progress();
+        let peer_health = base_peer_health_status();
         let policy = HealthPolicy {
             max_consecutive_failures: 3,
             max_sync_lag: 64,
             require_peers: false,
         };
-        assert!(evaluate_readiness(&progress, &policy, 0).is_ok());
+        assert!(evaluate_readiness(&progress, &policy, 0, &peer_health, 0).is_ok());
     }
 
     #[test]
@@ -2220,12 +2328,14 @@ mod tests {
         let mut progress = base_progress();
         progress.current_block = 10;
         progress.highest_block = 20;
+        let peer_health = base_peer_health_status();
         let policy = HealthPolicy {
             max_consecutive_failures: 3,
             max_sync_lag: 64,
             require_peers: false,
         };
-        let error = evaluate_readiness(&progress, &policy, 0).expect_err("should not be ready");
+        let error = evaluate_readiness(&progress, &policy, 0, &peer_health, 0)
+            .expect_err("should not be ready");
         assert!(error.contains("not ready"));
     }
 
@@ -2234,12 +2344,14 @@ mod tests {
         let mut progress = base_progress();
         progress.consecutive_failures = 4;
         progress.last_error = Some("upstream timeout".to_string());
+        let peer_health = base_peer_health_status();
         let policy = HealthPolicy {
             max_consecutive_failures: 3,
             max_sync_lag: 64,
             require_peers: false,
         };
-        let error = evaluate_health(&progress, &policy, 0).expect_err("should fail health check");
+        let error = evaluate_health(&progress, &policy, 0, &peer_health, 0)
+            .expect_err("should fail health check");
         assert!(error.contains("consecutive_failures"));
     }
 
@@ -2248,12 +2360,14 @@ mod tests {
         let mut progress = base_progress();
         progress.current_block = 100;
         progress.highest_block = 300;
+        let peer_health = base_peer_health_status();
         let policy = HealthPolicy {
             max_consecutive_failures: 3,
             max_sync_lag: 64,
             require_peers: false,
         };
-        let error = evaluate_health(&progress, &policy, 0).expect_err("should fail health check");
+        let error = evaluate_health(&progress, &policy, 0, &peer_health, 0)
+            .expect_err("should fail health check");
         assert!(error.contains("sync_lag"));
     }
 
@@ -2261,12 +2375,13 @@ mod tests {
     fn evaluate_health_fails_when_peers_required_and_none_available() {
         let mut progress = base_progress();
         progress.peer_count = 0;
+        let peer_health = base_peer_health_status();
         let policy = HealthPolicy {
             max_consecutive_failures: 3,
             max_sync_lag: 64,
             require_peers: true,
         };
-        let error = evaluate_health(&progress, &policy, 1)
+        let error = evaluate_health(&progress, &policy, 1, &peer_health, 0)
             .expect_err("missing peers must fail health check");
         assert!(error.contains("peer_count=0"));
     }
@@ -2275,14 +2390,45 @@ mod tests {
     fn evaluate_health_fails_when_peer_count_is_below_minimum_threshold() {
         let mut progress = base_progress();
         progress.peer_count = 1;
+        let peer_health = base_peer_health_status();
         let policy = HealthPolicy {
             max_consecutive_failures: 3,
             max_sync_lag: 64,
             require_peers: false,
         };
-        let error = evaluate_health(&progress, &policy, 2)
+        let error = evaluate_health(&progress, &policy, 2, &peer_health, 0)
             .expect_err("peer count below min threshold must fail health check");
         assert!(error.contains("required minimum=2"));
+    }
+
+    #[test]
+    fn evaluate_health_fails_when_recent_peer_health_flaps_exceed_threshold() {
+        let progress = base_progress();
+        let mut peer_health = base_peer_health_status();
+        peer_health.flap_transitions_recent = 4;
+        let policy = HealthPolicy {
+            max_consecutive_failures: 3,
+            max_sync_lag: 64,
+            require_peers: false,
+        };
+
+        let error = evaluate_health(&progress, &policy, 0, &peer_health, 3)
+            .expect_err("recent flap transitions above threshold must fail health");
+        assert!(error.contains("peer_health_flap_transitions_recent"));
+    }
+
+    #[test]
+    fn evaluate_health_allows_recent_peer_health_flaps_within_threshold() {
+        let progress = base_progress();
+        let mut peer_health = base_peer_health_status();
+        peer_health.flap_transitions_recent = 3;
+        let policy = HealthPolicy {
+            max_consecutive_failures: 3,
+            max_sync_lag: 64,
+            require_peers: false,
+        };
+
+        assert!(evaluate_health(&progress, &policy, 0, &peer_health, 3).is_ok());
     }
 
     #[test]
@@ -2906,12 +3052,13 @@ mod tests {
         let mut progress = base_progress();
         progress.current_block = 1;
         progress.highest_block = 1_000;
+        let peer_health = base_peer_health_status();
         let policy = HealthPolicy {
             max_consecutive_failures: 3,
             max_sync_lag: 64,
             require_peers: false,
         };
-        assert!(unhealthy_exit_reason(&progress, &policy, 0, false).is_none());
+        assert!(unhealthy_exit_reason(&progress, &policy, 0, false, peer_health, 0).is_none());
     }
 
     #[test]
@@ -2919,12 +3066,13 @@ mod tests {
         let mut progress = base_progress();
         progress.consecutive_failures = 10;
         progress.last_error = Some("upstream timeout".to_string());
+        let peer_health = base_peer_health_status();
         let policy = HealthPolicy {
             max_consecutive_failures: 3,
             max_sync_lag: 64,
             require_peers: false,
         };
-        let reason = unhealthy_exit_reason(&progress, &policy, 0, true)
+        let reason = unhealthy_exit_reason(&progress, &policy, 0, true, peer_health, 0)
             .expect("enabled unhealthy exit should surface reason");
         assert!(reason.contains("consecutive_failures"));
     }
@@ -2943,6 +3091,7 @@ mod tests {
                 require_peers: false,
             },
             min_peer_count: 0,
+            max_recent_peer_health_flaps: 0,
             peer_health_tracker: Arc::new(Mutex::new(PeerHealthTracker::new(
                 0,
                 DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
@@ -2983,6 +3132,7 @@ mod tests {
                 require_peers: false,
             },
             min_peer_count: 0,
+            max_recent_peer_health_flaps: 0,
             peer_health_tracker: Arc::new(Mutex::new(PeerHealthTracker::new(
                 0,
                 DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
@@ -3025,6 +3175,7 @@ mod tests {
                 require_peers: false,
             },
             min_peer_count: 0,
+            max_recent_peer_health_flaps: 0,
             peer_health_tracker: Arc::new(Mutex::new(PeerHealthTracker::new(
                 0,
                 DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
@@ -3060,6 +3211,7 @@ mod tests {
                 require_peers: false,
             },
             min_peer_count: 0,
+            max_recent_peer_health_flaps: 0,
             peer_health_tracker: Arc::new(Mutex::new(PeerHealthTracker::new(
                 0,
                 DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
@@ -3100,6 +3252,7 @@ mod tests {
                 require_peers: false,
             },
             min_peer_count: 0,
+            max_recent_peer_health_flaps: 0,
             peer_health_tracker: Arc::new(Mutex::new(PeerHealthTracker::new(
                 0,
                 DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
@@ -3145,6 +3298,7 @@ mod tests {
                 require_peers: false,
             },
             min_peer_count: 0,
+            max_recent_peer_health_flaps: 0,
             peer_health_tracker: Arc::new(Mutex::new(PeerHealthTracker::new(
                 0,
                 DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
@@ -3179,6 +3333,7 @@ mod tests {
         assert!(text.contains("pastis_rpc_responses_no_content_total 0"));
         assert!(text.contains("pastis_sync_current_block 10"));
         assert!(text.contains("pastis_sync_min_peer_count 0"));
+        assert!(text.contains("pastis_peer_health_max_recent_flaps 0"));
         assert!(text.contains("pastis_peer_health_status 1"));
         assert!(text.contains("pastis_peer_health_observations_total 0"));
         assert!(text.contains("pastis_peer_health_flap_transitions_total 0"));
@@ -3199,6 +3354,7 @@ mod tests {
                 require_peers: false,
             },
             min_peer_count: 0,
+            max_recent_peer_health_flaps: 0,
             peer_health_tracker: Arc::new(Mutex::new(PeerHealthTracker::new(
                 0,
                 DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
@@ -3248,6 +3404,7 @@ mod tests {
                 require_peers: false,
             },
             min_peer_count: 0,
+            max_recent_peer_health_flaps: 0,
             peer_health_tracker: Arc::new(Mutex::new(PeerHealthTracker::new(
                 0,
                 DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
@@ -3278,6 +3435,7 @@ mod tests {
                 require_peers: false,
             },
             min_peer_count: 0,
+            max_recent_peer_health_flaps: 0,
             peer_health_tracker: Arc::new(Mutex::new(PeerHealthTracker::new(
                 0,
                 DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
@@ -3311,6 +3469,7 @@ mod tests {
                 require_peers: false,
             },
             min_peer_count: 0,
+            max_recent_peer_health_flaps: 0,
             peer_health_tracker: Arc::new(Mutex::new(PeerHealthTracker::new(
                 0,
                 DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
@@ -3341,6 +3500,7 @@ mod tests {
                 require_peers: false,
             },
             min_peer_count: 0,
+            max_recent_peer_health_flaps: 0,
             peer_health_tracker: Arc::new(Mutex::new(PeerHealthTracker::new(
                 0,
                 DEFAULT_PEER_HEALTH_HISTORY_CAPACITY,
@@ -3362,6 +3522,7 @@ mod tests {
         assert_eq!(payload.0.chain_id, "SN_MAIN");
         assert_eq!(payload.0.current_block, 10);
         assert_eq!(payload.0.min_peers, 0);
+        assert_eq!(payload.0.max_recent_peer_health_flaps, 0);
         assert!(payload.0.peer_health.healthy);
         assert_eq!(payload.0.peer_health.last_peer_count, None);
         assert_eq!(payload.0.peer_health.history_size, 0);
