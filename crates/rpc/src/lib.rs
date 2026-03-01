@@ -18,6 +18,7 @@ const ERR_INTERNAL: i64 = -32603;
 const ERR_BLOCK_NOT_FOUND: i64 = -32001;
 const ERR_TX_NOT_FOUND: i64 = -32003;
 const MAX_BATCH_REQUESTS: usize = 256;
+const MAX_RAW_REQUEST_BYTES: usize = 1_024 * 1_024;
 const INTERNAL_SERIALIZATION_ERROR_RESPONSE: &str = r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"internal serialization error"},"id":null}"#;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +93,16 @@ impl<'a> StarknetRpcServer<'a> {
     }
 
     pub fn handle_raw(&self, raw: &str) -> String {
+        if raw.len() > MAX_RAW_REQUEST_BYTES {
+            return serialize_response(error_response(
+                Value::Null,
+                ERR_INVALID_REQUEST,
+                format!(
+                    "request too large: max {MAX_RAW_REQUEST_BYTES} bytes, got {}",
+                    raw.len()
+                ),
+            ));
+        }
         match serde_json::from_str::<Value>(raw) {
             Ok(value) => self.handle_value(value),
             Err(error) => {
@@ -1025,6 +1036,21 @@ mod tests {
         assert_eq!(
             value["error"]["message"],
             json!("internal serialization error")
+        );
+    }
+
+    #[test]
+    fn oversized_raw_request_is_rejected_before_json_parse() {
+        let server = seeded_server();
+        let oversized = "x".repeat(MAX_RAW_REQUEST_BYTES.saturating_add(1));
+        let value: Value =
+            serde_json::from_str(&server.handle_raw(&oversized)).expect("response json");
+        assert_eq!(value["error"]["code"], json!(ERR_INVALID_REQUEST));
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .expect("error message")
+                .contains("request too large")
         );
     }
 }

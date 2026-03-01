@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{BufRead, BufReader, Write};
@@ -209,6 +209,46 @@ impl LocalChainJournal {
     }
 
     fn append_entry(&self, entry: &LocalJournalEntry) -> Result<(), String> {
+        let encoded = serde_json::to_string(entry).map_err(|error| {
+            format!(
+                "failed to encode local journal entry for {}: {error}",
+                self.path.display()
+            )
+        })?;
+        if encoded.len() > MAX_LOCAL_JOURNAL_LINE_BYTES {
+            return Err(format!(
+                "local journal {} entry size {} exceeds max allowed {} bytes",
+                self.path.display(),
+                encoded.len(),
+                MAX_LOCAL_JOURNAL_LINE_BYTES
+            ));
+        }
+        let existing_len = match fs::metadata(&self.path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect local journal {} before append: {error}",
+                    self.path.display()
+                ));
+            }
+        };
+        let required_growth = encoded
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| format!("local journal {} entry size overflow", self.path.display()))?;
+        let projected_len = existing_len
+            .checked_add(required_growth as u64)
+            .ok_or_else(|| format!("local journal {} size overflow", self.path.display()))?;
+        if projected_len > MAX_LOCAL_JOURNAL_FILE_BYTES {
+            return Err(format!(
+                "local journal {} append would exceed max allowed {} bytes (current={}, append={})",
+                self.path.display(),
+                MAX_LOCAL_JOURNAL_FILE_BYTES,
+                existing_len,
+                required_growth
+            ));
+        }
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|error| {
                 format!(
@@ -227,12 +267,6 @@ impl LocalChainJournal {
                     self.path.display()
                 )
             })?;
-        let encoded = serde_json::to_string(entry).map_err(|error| {
-            format!(
-                "failed to encode local journal entry for {}: {error}",
-                self.path.display()
-            )
-        })?;
         file.write_all(encoded.as_bytes()).map_err(|error| {
             format!(
                 "failed to write local journal entry to {}: {error}",
@@ -1019,11 +1053,19 @@ fn parse_rpc_result(body: Value, method: &str, expected_id: u64) -> Result<Value
         ));
     }
 
-    if let Some(error) = body.get("error") {
+    let result_payload = body.get("result");
+    let error_payload = body.get("error");
+    if result_payload.is_some() && error_payload.is_some() {
+        return Err(format!(
+            "RPC {method} response must not include both `result` and `error`: {body}"
+        ));
+    }
+
+    if let Some(error) = error_payload {
         return Err(format!("RPC {method} error payload: {error}"));
     }
 
-    body.get("result")
+    result_payload
         .cloned()
         .ok_or_else(|| format!("RPC {method} response missing `result`: {body}"))
 }
@@ -1297,6 +1339,7 @@ fn parse_block_with_txs(
         .ok_or_else(|| format!("getBlockWithTxs missing transactions array: {block_with_txs}"))?;
 
     let mut transaction_hashes = Vec::with_capacity(transactions.len());
+    let mut seen_hashes = BTreeSet::new();
     for (idx, tx) in transactions.iter().enumerate() {
         let tx_hash_raw = if let Some(raw) = tx.as_str() {
             raw
@@ -1313,6 +1356,11 @@ fn parse_block_with_txs(
             .map_err(|error| {
                 format!("invalid transaction_hash `{tx_hash_raw}` at index {idx}: {error}")
             })?;
+        if !seen_hashes.insert(tx_hash.clone()) {
+            return Err(format!(
+                "duplicate transaction_hash `{tx_hash}` at index {idx} in getBlockWithTxs"
+            ));
+        }
         transaction_hashes.push(tx_hash);
     }
 
@@ -1389,6 +1437,7 @@ fn parse_block_with_tx_hashes(
         })?;
 
     let mut transaction_hashes = Vec::with_capacity(transactions.len());
+    let mut seen_hashes = BTreeSet::new();
     for (idx, tx) in transactions.iter().enumerate() {
         let Some(tx_hash_raw) = tx.as_str() else {
             return Err(format!(
@@ -1402,6 +1451,11 @@ fn parse_block_with_tx_hashes(
                     "invalid getBlockWithTxHashes tx hash `{tx_hash_raw}` at index {idx}: {error}"
                 )
             })?;
+        if !seen_hashes.insert(tx_hash.clone()) {
+            return Err(format!(
+                "duplicate transaction hash `{tx_hash}` at index {idx} in getBlockWithTxHashes"
+            ));
+        }
         transaction_hashes.push(tx_hash);
     }
 
@@ -2120,6 +2174,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_block_with_txs_rejects_duplicate_transaction_hashes() {
+        let block = json!({
+            "block_number": 12,
+            "block_hash": "0xabc",
+            "parent_hash": "0x123",
+            "sequencer_address": "0x1",
+            "timestamp": 1_700_000_012_u64,
+            "transactions": [
+                {"transaction_hash": "0x1"},
+                {"transaction_hash": "0x1"}
+            ]
+        });
+
+        let mut warnings = Vec::new();
+        let error = parse_block_with_txs(&block, &mut warnings)
+            .expect_err("duplicate transaction hashes must fail closed");
+        assert!(error.contains("duplicate transaction_hash"));
+    }
+
+    #[test]
     fn parse_block_with_tx_hashes_parses_hash_array() {
         let block = json!({
             "block_number": 12,
@@ -2151,6 +2225,22 @@ mod tests {
         let error = parse_block_with_tx_hashes(&block, &mut warnings)
             .expect_err("missing transactions array must fail closed");
         assert!(error.contains("missing transactions array"));
+    }
+
+    #[test]
+    fn parse_block_with_tx_hashes_rejects_duplicate_transaction_hashes() {
+        let block = json!({
+            "block_number": 12,
+            "block_hash": "0xabc",
+            "parent_hash": "0x123",
+            "transactions": ["0x1", "0x1"],
+            "status": "ACCEPTED_ON_L2"
+        });
+
+        let mut warnings = Vec::new();
+        let error = parse_block_with_tx_hashes(&block, &mut warnings)
+            .expect_err("duplicate transaction hashes must fail closed");
+        assert!(error.contains("duplicate transaction hash"));
     }
 
     #[test]
@@ -2316,6 +2406,22 @@ mod tests {
         )
         .expect_err("error payload must fail");
         assert!(error.contains("error payload"));
+    }
+
+    #[test]
+    fn parse_rpc_result_rejects_envelope_with_result_and_error() {
+        let error = parse_rpc_result(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"ok": true},
+                "error": {"code": -32000, "message": "boom"}
+            }),
+            "starknet_test",
+            1,
+        )
+        .expect_err("result+error envelope must fail");
+        assert!(error.contains("both `result` and `error`"));
     }
 
     #[test]
@@ -2544,6 +2650,45 @@ mod tests {
             .load_entries(None)
             .expect_err("oversized journal must fail closed");
         assert!(error.contains("exceeds max allowed"));
+    }
+
+    #[test]
+    fn local_journal_rejects_oversized_entries_on_append() {
+        let dir = tempdir().expect("tempdir");
+        let journal_path = dir.path().join("local-journal.jsonl");
+        let journal = LocalChainJournal::new(&journal_path);
+        let mut block = ingest_block_from_fetch(1, &sample_fetch(1, "0x0", "0x1"))
+            .expect("sample block should ingest");
+        block.parent_hash = "a".repeat(MAX_LOCAL_JOURNAL_LINE_BYTES.saturating_add(1));
+        let entry = LocalJournalEntry {
+            block,
+            state_diff: StarknetStateDiff::default(),
+        };
+        let error = journal
+            .append_entry(&entry)
+            .expect_err("oversized entry must fail closed");
+        assert!(error.contains("exceeds max allowed"));
+    }
+
+    #[test]
+    fn local_journal_rejects_appends_that_exceed_file_limit() {
+        let dir = tempdir().expect("tempdir");
+        let journal_path = dir.path().join("local-journal.jsonl");
+        let file = std::fs::File::create(&journal_path).expect("create journal file");
+        file.set_len(MAX_LOCAL_JOURNAL_FILE_BYTES)
+            .expect("expand file to max");
+
+        let journal = LocalChainJournal::new(&journal_path);
+        let block = ingest_block_from_fetch(1, &sample_fetch(1, "0x0", "0x1"))
+            .expect("sample block should ingest");
+        let entry = LocalJournalEntry {
+            block,
+            state_diff: StarknetStateDiff::default(),
+        };
+        let error = journal
+            .append_entry(&entry)
+            .expect_err("append beyond max file size must fail closed");
+        assert!(error.contains("exceed max allowed"));
     }
 
     #[tokio::test]
