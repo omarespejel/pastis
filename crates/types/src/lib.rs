@@ -558,6 +558,9 @@ pub trait StateReader: Send + Sync {
         key: &str,
     ) -> Result<Option<StarknetFelt>, StateReadError>;
     fn nonce_of(&self, contract: &ContractAddress) -> Result<Option<StarknetFelt>, StateReadError>;
+    fn contract_exists(&self, contract: &ContractAddress) -> Result<bool, StateReadError> {
+        Ok(self.nonce_of(contract)?.is_some())
+    }
 }
 
 pub trait MutableState: StateReader {
@@ -684,6 +687,15 @@ impl StateReader for InMemoryState {
         )
         .map_err(|error| StateReadError::Backend(error.to_string()))?;
         Ok(self.nonces.get(&contract).copied())
+    }
+
+    fn contract_exists(&self, contract: &ContractAddress) -> Result<bool, StateReadError> {
+        let contract = ContractAddress::parse(
+            canonicalize_felt_hex("contract_address", contract.as_ref())
+                .map_err(|error| StateReadError::Backend(error.to_string()))?,
+        )
+        .map_err(|error| StateReadError::Backend(error.to_string()))?;
+        Ok(self.storage.contains_key(&contract) || self.nonces.contains_key(&contract))
     }
 }
 

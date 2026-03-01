@@ -1767,7 +1767,8 @@ mod tests {
             .expect("response body should be readable");
         let payload: Value =
             serde_json::from_slice(&bytes).expect("response body should be valid JSON");
-        assert_eq!(payload["result"], serde_json::json!(0));
+        assert_eq!(payload["error"]["code"], serde_json::json!(32));
+        assert_eq!(payload["id"], serde_json::json!(7));
     }
 
     #[tokio::test]

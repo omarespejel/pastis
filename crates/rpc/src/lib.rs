@@ -16,8 +16,11 @@ const ERR_INVALID_REQUEST: i64 = -32600;
 const ERR_METHOD_NOT_FOUND: i64 = -32601;
 const ERR_INVALID_PARAMS: i64 = -32602;
 const ERR_INTERNAL: i64 = -32603;
-const ERR_BLOCK_NOT_FOUND: i64 = -32001;
-const ERR_TX_NOT_FOUND: i64 = -32003;
+const ERR_CONTRACT_NOT_FOUND: i64 = 20;
+const ERR_BLOCK_NOT_FOUND: i64 = 24;
+const ERR_INVALID_TXN_INDEX: i64 = 27;
+const ERR_TX_NOT_FOUND: i64 = 29;
+const ERR_NO_BLOCKS: i64 = 32;
 const MAX_BATCH_REQUESTS: usize = 256;
 const MAX_RAW_REQUEST_BYTES: usize = 1_024 * 1_024;
 const INTERNAL_SERIALIZATION_ERROR_RESPONSE: &str = r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"internal serialization error"},"id":null}"#;
@@ -65,6 +68,12 @@ pub enum RpcError {
     InvalidParams(String),
     #[error("requested block was not found")]
     BlockNotFound,
+    #[error("requested block index was invalid")]
+    InvalidTxnIndex,
+    #[error("there are no blocks")]
+    NoBlocks,
+    #[error("requested contract was not found")]
+    ContractNotFound,
     #[error("requested transaction was not found")]
     TxNotFound,
     #[error("state read failed: {0}")]
@@ -255,6 +264,9 @@ impl<'a> StarknetRpcServer<'a> {
     fn block_number(&self, params: &Value) -> Result<Value, RpcError> {
         ensure_no_params(params)?;
         let number = self.storage.latest_block_number()?;
+        if self.storage.get_block(BlockId::Number(number))?.is_none() {
+            return Err(RpcError::NoBlocks);
+        }
         Ok(json!(number))
     }
 
@@ -274,7 +286,7 @@ impl<'a> StarknetRpcServer<'a> {
         let block = self
             .storage
             .get_block(BlockId::Number(latest))?
-            .ok_or(RpcError::BlockNotFound)?;
+            .ok_or(RpcError::NoBlocks)?;
         let block_hash = self.canonical_block_hash(block.number)?;
         Ok(json!({
             "block_hash": block_hash,
@@ -423,7 +435,7 @@ impl<'a> StarknetRpcServer<'a> {
         let tx = block
             .transactions
             .get(tx_index)
-            .ok_or(RpcError::TxNotFound)?;
+            .ok_or(RpcError::InvalidTxnIndex)?;
         Ok(json!({
             "transaction_hash": tx.hash,
             "block_number": block.number,
@@ -436,6 +448,12 @@ impl<'a> StarknetRpcServer<'a> {
         let (block_id, contract_address) = parse_block_id_and_contract_params(params)?;
         let block_number = self.resolve_block_number(block_id)?;
         let state_reader = self.storage.get_state_reader(block_number)?;
+        let contract_exists = state_reader
+            .contract_exists(&contract_address)
+            .map_err(|error| RpcError::StateRead(error.to_string()))?;
+        if !contract_exists {
+            return Err(RpcError::ContractNotFound);
+        }
         let nonce = state_reader
             .nonce_of(&contract_address)
             .map_err(|error| RpcError::StateRead(error.to_string()))?
@@ -447,6 +465,12 @@ impl<'a> StarknetRpcServer<'a> {
         let (contract_address, storage_key, block_id) = parse_storage_at_params(params)?;
         let block_number = self.resolve_block_number(block_id)?;
         let state_reader = self.storage.get_state_reader(block_number)?;
+        let contract_exists = state_reader
+            .contract_exists(&contract_address)
+            .map_err(|error| RpcError::StateRead(error.to_string()))?;
+        if !contract_exists {
+            return Err(RpcError::ContractNotFound);
+        }
         let value = state_reader
             .get_storage(&contract_address, &storage_key)
             .map_err(|error| RpcError::StateRead(error.to_string()))?
@@ -898,6 +922,15 @@ fn map_error_to_response(id: Value, error: RpcError) -> JsonRpcResponse {
         ),
         RpcError::InvalidParams(message) => error_response(id, ERR_INVALID_PARAMS, message),
         RpcError::BlockNotFound => error_response(id, ERR_BLOCK_NOT_FOUND, "block not found"),
+        RpcError::InvalidTxnIndex => error_response(
+            id,
+            ERR_INVALID_TXN_INDEX,
+            "invalid transaction index in block",
+        ),
+        RpcError::NoBlocks => error_response(id, ERR_NO_BLOCKS, "there are no blocks"),
+        RpcError::ContractNotFound => {
+            error_response(id, ERR_CONTRACT_NOT_FOUND, "contract not found")
+        }
         RpcError::TxNotFound => error_response(id, ERR_TX_NOT_FOUND, "transaction not found"),
         RpcError::StateRead(message) => {
             error_response(id, ERR_INTERNAL, format!("state reader error: {message}"))
@@ -1115,6 +1148,12 @@ mod tests {
         StarknetRpcServer::new(leaked, "SN_MAIN")
     }
 
+    fn empty_server() -> StarknetRpcServer<'static> {
+        let storage = InMemoryStorage::new(InMemoryState::default());
+        let leaked: &'static mut InMemoryStorage = Box::leak(Box::new(storage));
+        StarknetRpcServer::new(leaked, "SN_MAIN")
+    }
+
     fn seeded_server_with_reverted_tx() -> StarknetRpcServer<'static> {
         let mut storage = InMemoryStorage::new(InMemoryState::default());
         let mut diff_1 = StarknetStateDiff::default();
@@ -1210,6 +1249,14 @@ mod tests {
     }
 
     #[test]
+    fn block_number_returns_no_blocks_for_empty_chain() {
+        let server = empty_server();
+        let raw = r#"{"jsonrpc":"2.0","id":86,"method":"starknet_blockNumber","params":[]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["error"]["code"], json!(ERR_NO_BLOCKS));
+    }
+
+    #[test]
     fn chain_id_works() {
         let server = seeded_server();
         let raw = r#"{"jsonrpc":"2.0","id":"x","method":"starknet_chainId","params":[]}"#;
@@ -1232,6 +1279,14 @@ mod tests {
         let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
         assert_eq!(value["result"]["block_number"], json!(2));
         assert_eq!(value["result"]["block_hash"], json!("0x2"));
+    }
+
+    #[test]
+    fn block_hash_and_number_returns_no_blocks_for_empty_chain() {
+        let server = empty_server();
+        let raw = r#"{"jsonrpc":"2.0","id":87,"method":"starknet_blockHashAndNumber","params":[]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["error"]["code"], json!(ERR_NO_BLOCKS));
     }
 
     #[test]
@@ -1453,6 +1508,14 @@ mod tests {
     }
 
     #[test]
+    fn get_transaction_by_block_id_and_index_invalid_index() {
+        let server = seeded_server();
+        let raw = r#"{"jsonrpc":"2.0","id":88,"method":"starknet_getTransactionByBlockIdAndIndex","params":[{"block_number":2},9]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["error"]["code"], json!(ERR_INVALID_TXN_INDEX));
+    }
+
+    #[test]
     fn get_block_with_tx_hashes_works() {
         let server = seeded_server();
         let raw = r#"{"jsonrpc":"2.0","id":15,"method":"starknet_getBlockWithTxHashes","params":[{"block_number":2}]}"#;
@@ -1498,11 +1561,11 @@ mod tests {
     }
 
     #[test]
-    fn get_nonce_returns_zero_for_missing_contract() {
+    fn get_nonce_returns_contract_not_found_for_missing_contract() {
         let server = seeded_server();
         let raw = r#"{"jsonrpc":"2.0","id":17,"method":"starknet_getNonce","params":[{"block_number":2},"0x999"]}"#;
         let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
-        assert_eq!(value["result"], json!("0x0"));
+        assert_eq!(value["error"]["code"], json!(ERR_CONTRACT_NOT_FOUND));
     }
 
     #[test]
@@ -1519,6 +1582,14 @@ mod tests {
         let raw = r#"{"jsonrpc":"2.0","id":19,"method":"starknet_getStorageAt","params":["0x2","0xdead",{"block_number":2}]}"#;
         let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
         assert_eq!(value["result"], json!("0x0"));
+    }
+
+    #[test]
+    fn get_storage_at_returns_contract_not_found_for_missing_contract() {
+        let server = seeded_server();
+        let raw = r#"{"jsonrpc":"2.0","id":89,"method":"starknet_getStorageAt","params":["0x999","0x1",{"block_number":2}]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["error"]["code"], json!(ERR_CONTRACT_NOT_FOUND));
     }
 
     #[test]
