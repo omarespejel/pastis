@@ -317,10 +317,21 @@ struct RuntimeBlockHashes {
 }
 
 #[derive(Debug, Clone)]
+struct RuntimeBlockReceipts {
+    external_block_number: u64,
+    block_hash: String,
+    parent_hash: String,
+    state_root: Option<String>,
+    transaction_hashes: Vec<String>,
+    receipts: Vec<StarknetReceipt>,
+}
+
+#[derive(Debug, Clone)]
 struct RuntimeFetch {
     replay: RuntimeBlockReplay,
     state_diff: StarknetStateDiff,
     state_root: String,
+    receipts: Vec<StarknetReceipt>,
 }
 
 type SyncSourceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
@@ -649,22 +660,19 @@ impl NodeRuntime {
             })?;
             let local_block_for_journal = local_block.clone();
 
-            let execution_output = match self
+            if let Err(error) = self
                 .node
                 .execution
                 .execute_block(&local_block, &mut self.execution_state)
             {
-                Ok(output) => output,
-                Err(error) => {
-                    self.diagnostics.execution_failures =
-                        self.diagnostics.execution_failures.saturating_add(1);
-                    let message = format!(
-                        "execution failed for local block {local_block_number} (external {external_block}): {error}"
-                    );
-                    self.record_failure(message.clone());
-                    return Err(message);
-                }
-            };
+                self.diagnostics.execution_failures =
+                    self.diagnostics.execution_failures.saturating_add(1);
+                let message = format!(
+                    "execution failed for local block {local_block_number} (external {external_block}): {error}"
+                );
+                self.record_failure(message.clone());
+                return Err(message);
+            }
 
             let mut staged_execution_state = self.execution_state.clone();
             if let Err(error) =
@@ -683,7 +691,7 @@ impl NodeRuntime {
                 let journal_entry = LocalJournalEntry {
                     block: local_block_for_journal,
                     state_diff: fetch.state_diff.clone(),
-                    receipts: execution_output.receipts.clone(),
+                    receipts: fetch.receipts.clone(),
                 };
                 if let Err(error) = journal.append_entry(&journal_entry) {
                     self.diagnostics.journal_failures =
@@ -698,7 +706,7 @@ impl NodeRuntime {
             if let Err(error) = self.node.storage.insert_block_with_receipts(
                 local_block,
                 fetch.state_diff.clone(),
-                execution_output.receipts,
+                fetch.receipts.clone(),
             ) {
                 self.diagnostics.commit_failures =
                     self.diagnostics.commit_failures.saturating_add(1);
@@ -908,12 +916,14 @@ impl UpstreamRpcClient {
     async fn fetch_block(&self, block_number: u64) -> Result<RuntimeFetch, String> {
         let block_selector = json!([{ "block_number": block_number }]);
 
-        let (block_with_txs, tx_count_raw, block_with_hashes, state_update) = tokio::try_join!(
-            self.call("starknet_getBlockWithTxs", block_selector.clone()),
-            self.call("starknet_getBlockTransactionCount", block_selector.clone()),
-            self.call("starknet_getBlockWithTxHashes", block_selector.clone()),
-            self.call("starknet_getStateUpdate", block_selector),
-        )?;
+        let (block_with_txs, tx_count_raw, block_with_hashes, block_with_receipts, state_update) =
+            tokio::try_join!(
+                self.call("starknet_getBlockWithTxs", block_selector.clone()),
+                self.call("starknet_getBlockTransactionCount", block_selector.clone()),
+                self.call("starknet_getBlockWithTxHashes", block_selector.clone()),
+                self.call("starknet_getBlockWithReceipts", block_selector.clone()),
+                self.call("starknet_getStateUpdate", block_selector),
+            )?;
 
         let mut warnings = Vec::new();
         let replay = parse_block_with_txs(&block_with_txs, &mut warnings)?;
@@ -926,6 +936,8 @@ impl UpstreamRpcClient {
 
         let hashes_view = parse_block_with_tx_hashes(&block_with_hashes, &mut warnings)?;
         compare_block_views(&replay, &hashes_view, &mut warnings);
+        let receipts_view = parse_block_with_receipts(&block_with_receipts, &mut warnings)?;
+        compare_receipt_view(&replay, &receipts_view, &mut warnings);
 
         let tx_count_from_rpc = value_as_u64(&tx_count_raw)
             .ok_or_else(|| format!("invalid tx count payload: {tx_count_raw}"))?;
@@ -950,6 +962,13 @@ impl UpstreamRpcClient {
                 "state root mismatch between getBlockWithTxHashes ({block_state_root}) and getStateUpdate ({state_root})"
             ));
         }
+        if let Some(block_state_root) = receipts_view.state_root.as_deref()
+            && block_state_root != state_root
+        {
+            warnings.push(format!(
+                "state root mismatch between getBlockWithReceipts ({block_state_root}) and getStateUpdate ({state_root})"
+            ));
+        }
         if let Some(state_update_block_hash) = parse_state_update_block_hash(&state_update)?
             && state_update_block_hash != replay.block_hash
         {
@@ -972,6 +991,7 @@ impl UpstreamRpcClient {
             replay,
             state_diff,
             state_root,
+            receipts: receipts_view.receipts,
         })
     }
 
@@ -1515,6 +1535,190 @@ fn parse_block_with_tx_hashes(
     })
 }
 
+fn parse_block_with_receipts(
+    block_with_receipts: &Value,
+    warnings: &mut Vec<String>,
+) -> Result<RuntimeBlockReceipts, String> {
+    let external_block_number =
+        value_as_u64(block_with_receipts.get("block_number").ok_or_else(|| {
+            format!("getBlockWithReceipts missing block_number: {block_with_receipts}")
+        })?)
+        .ok_or_else(|| {
+            format!("invalid getBlockWithReceipts block_number: {block_with_receipts}")
+        })?;
+
+    let block_hash_raw = block_with_receipts
+        .get("block_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("getBlockWithReceipts missing block_hash: {block_with_receipts}"))?;
+    let block_hash_normalized = normalize_hex_prefix(block_hash_raw);
+    let block_hash = StarknetFelt::from_str(&block_hash_normalized)
+        .map(|felt| format!("{:#x}", felt))
+        .map_err(|error| {
+            format!("invalid getBlockWithReceipts block_hash `{block_hash_raw}`: {error}")
+        })?;
+
+    let parent_hash_raw = block_with_receipts
+        .get("parent_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            format!("getBlockWithReceipts missing parent_hash: {block_with_receipts}")
+        })?;
+    let parent_hash_normalized = normalize_hex_prefix(parent_hash_raw);
+    let parent_hash = StarknetFelt::from_str(&parent_hash_normalized)
+        .map(|felt| format!("{:#x}", felt))
+        .map_err(|error| {
+            format!("invalid getBlockWithReceipts parent_hash `{parent_hash_raw}`: {error}")
+        })?;
+    let state_root = parse_optional_block_state_root(block_with_receipts, "getBlockWithReceipts")?;
+
+    let transactions = block_with_receipts
+        .get("transactions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            format!("getBlockWithReceipts missing transactions array: {block_with_receipts}")
+        })?;
+    let mut transaction_hashes = Vec::with_capacity(transactions.len());
+    let mut seen_hashes = HashSet::with_capacity(transactions.len());
+    for (idx, tx) in transactions.iter().enumerate() {
+        let tx_hash_raw = if let Some(raw) = tx.as_str() {
+            raw
+        } else {
+            tx.get("transaction_hash")
+                .or_else(|| tx.get("hash"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "transaction {idx} in getBlockWithReceipts missing transaction_hash: {tx}"
+                    )
+                })?
+        };
+        let tx_hash_normalized = normalize_hex_prefix(tx_hash_raw);
+        let tx_hash = StarknetFelt::from_str(&tx_hash_normalized)
+            .map(|felt| format!("{:#x}", felt))
+            .map_err(|error| {
+                format!(
+                    "invalid getBlockWithReceipts tx hash `{tx_hash_raw}` at index {idx}: {error}"
+                )
+            })?;
+        if !seen_hashes.insert(tx_hash.clone()) {
+            return Err(format!(
+                "duplicate transaction hash `{tx_hash}` at index {idx} in getBlockWithReceipts"
+            ));
+        }
+        transaction_hashes.push(tx_hash);
+    }
+
+    let receipts = block_with_receipts
+        .get("receipts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            format!("getBlockWithReceipts missing receipts array: {block_with_receipts}")
+        })?;
+    if receipts.len() != transaction_hashes.len() {
+        return Err(format!(
+            "getBlockWithReceipts tx/receipt length mismatch: transactions={}, receipts={}",
+            transaction_hashes.len(),
+            receipts.len()
+        ));
+    }
+
+    let mut parsed_receipts = Vec::with_capacity(receipts.len());
+    for (idx, receipt_raw) in receipts.iter().enumerate() {
+        let tx_hash_raw = receipt_raw
+            .get("transaction_hash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "receipt {idx} in getBlockWithReceipts missing transaction_hash: {receipt_raw}"
+                )
+            })?;
+        let tx_hash_normalized = normalize_hex_prefix(tx_hash_raw);
+        let tx_hash = StarknetFelt::from_str(&tx_hash_normalized)
+            .map(|felt| format!("{:#x}", felt))
+            .map_err(|error| {
+                format!(
+                    "invalid getBlockWithReceipts receipt transaction_hash `{tx_hash_raw}` at index {idx}: {error}"
+                )
+            })?;
+        if tx_hash != transaction_hashes[idx] {
+            return Err(format!(
+                "receipt hash/order mismatch at index {idx} in getBlockWithReceipts: txs={}, receipts={}",
+                transaction_hashes[idx], tx_hash
+            ));
+        }
+
+        let execution_status = match receipt_raw.get("execution_status").and_then(Value::as_str) {
+            Some(status) if status.eq_ignore_ascii_case("SUCCEEDED") => true,
+            Some(status) if status.eq_ignore_ascii_case("REVERTED") => false,
+            Some(status) => {
+                warnings.push(format!(
+                    "unexpected receipt execution_status `{status}` at index {idx}; treating as success"
+                ));
+                true
+            }
+            None => true,
+        };
+
+        let events = match receipt_raw.get("events") {
+            Some(Value::Array(entries)) => entries.len() as u64,
+            Some(value) => value_as_u64(value).unwrap_or_else(|| {
+                warnings.push(format!(
+                    "unsupported receipt events payload at index {idx}: {value}"
+                ));
+                0
+            }),
+            None => 0,
+        };
+        let gas_consumed = receipt_raw
+            .get("gas_consumed")
+            .and_then(value_as_u64)
+            .or_else(|| {
+                receipt_raw
+                    .get("actual_fee")
+                    .and_then(|actual_fee| match actual_fee {
+                        Value::Object(map) => map.get("amount").and_then(value_as_u64),
+                        other => value_as_u64(other),
+                    })
+            })
+            .unwrap_or(0);
+
+        parsed_receipts.push(StarknetReceipt {
+            tx_hash: TxHash::parse(tx_hash)
+                .map_err(|error| format!("invalid canonical receipt tx hash: {error}"))?,
+            execution_status,
+            events,
+            gas_consumed,
+        });
+    }
+
+    if let Some(status_raw) = block_with_receipts.get("status").and_then(Value::as_str) {
+        if status_raw.eq_ignore_ascii_case("PENDING") {
+            return Err(
+                "getBlockWithReceipts returned status=PENDING; daemon only replays finalized blocks"
+                    .to_string(),
+            );
+        }
+        if !status_raw.eq_ignore_ascii_case("ACCEPTED_ON_L2")
+            && !status_raw.eq_ignore_ascii_case("ACCEPTED_ON_L1")
+            && !status_raw.eq_ignore_ascii_case("FINALIZED")
+        {
+            warnings.push(format!(
+                "unexpected receipt block status `{status_raw}`; replay continues but should be verified"
+            ));
+        }
+    }
+
+    Ok(RuntimeBlockReceipts {
+        external_block_number,
+        block_hash,
+        parent_hash,
+        state_root,
+        transaction_hashes,
+        receipts: parsed_receipts,
+    })
+}
+
 fn compare_block_views(
     txs_view: &RuntimeBlockReplay,
     hashes_view: &RuntimeBlockHashes,
@@ -1549,6 +1753,44 @@ fn compare_block_views(
             "transaction hash list mismatch between getBlockWithTxs ({} txs) and getBlockWithTxHashes ({} txs)",
             txs_view.transaction_hashes.len(),
             hashes_view.transaction_hashes.len()
+        ));
+    }
+}
+
+fn compare_receipt_view(
+    txs_view: &RuntimeBlockReplay,
+    receipts_view: &RuntimeBlockReceipts,
+    warnings: &mut Vec<String>,
+) {
+    if receipts_view.external_block_number != txs_view.external_block_number {
+        warnings.push(format!(
+            "block number mismatch between getBlockWithTxs ({}) and getBlockWithReceipts ({})",
+            txs_view.external_block_number, receipts_view.external_block_number
+        ));
+    }
+    if receipts_view.block_hash != txs_view.block_hash {
+        warnings.push(format!(
+            "block hash mismatch between getBlockWithTxs ({}) and getBlockWithReceipts ({})",
+            txs_view.block_hash, receipts_view.block_hash
+        ));
+    }
+    if receipts_view.parent_hash != txs_view.parent_hash {
+        warnings.push(format!(
+            "parent hash mismatch between getBlockWithTxs ({}) and getBlockWithReceipts ({})",
+            txs_view.parent_hash, receipts_view.parent_hash
+        ));
+    }
+    if receipts_view.state_root != txs_view.state_root {
+        warnings.push(format!(
+            "state root mismatch between getBlockWithTxs ({:?}) and getBlockWithReceipts ({:?})",
+            txs_view.state_root, receipts_view.state_root
+        ));
+    }
+    if receipts_view.transaction_hashes != txs_view.transaction_hashes {
+        warnings.push(format!(
+            "transaction hash list mismatch between getBlockWithTxs ({} txs) and getBlockWithReceipts ({} txs)",
+            txs_view.transaction_hashes.len(),
+            receipts_view.transaction_hashes.len()
         ));
     }
 }
@@ -2130,6 +2372,7 @@ mod tests {
         parent_hash: &str,
         block_hash: &str,
     ) -> RuntimeFetch {
+        let tx_hash = TxHash::parse("0x111").expect("sample tx hash should parse");
         RuntimeFetch {
             replay: RuntimeBlockReplay {
                 external_block_number,
@@ -2142,6 +2385,12 @@ mod tests {
             },
             state_diff: StarknetStateDiff::default(),
             state_root: "0x10".to_string(),
+            receipts: vec![StarknetReceipt {
+                tx_hash,
+                execution_status: true,
+                events: 2,
+                gas_consumed: 7,
+            }],
         }
     }
 
@@ -2320,6 +2569,69 @@ mod tests {
     }
 
     #[test]
+    fn parse_block_with_receipts_parses_receipts_and_execution_status() {
+        let block = json!({
+            "block_number": 12,
+            "block_hash": "0xabc",
+            "parent_hash": "0x123",
+            "state_root": "0x10",
+            "transactions": [
+                {"transaction_hash": "0x1"},
+                {"transaction_hash": "0x2"}
+            ],
+            "receipts": [
+                {
+                    "transaction_hash": "0x1",
+                    "execution_status": "SUCCEEDED",
+                    "events": [{"from_address":"0x1"}],
+                    "gas_consumed": "0x7"
+                },
+                {
+                    "transaction_hash": "0x2",
+                    "execution_status": "REVERTED",
+                    "events": 3,
+                    "actual_fee": {"amount":"0x9"}
+                }
+            ]
+        });
+
+        let mut warnings = Vec::new();
+        let parsed = parse_block_with_receipts(&block, &mut warnings).expect("must parse");
+        assert_eq!(parsed.external_block_number, 12);
+        assert_eq!(parsed.transaction_hashes, vec!["0x1", "0x2"]);
+        assert_eq!(parsed.receipts.len(), 2);
+        assert!(parsed.receipts[0].execution_status);
+        assert_eq!(parsed.receipts[0].events, 1);
+        assert_eq!(parsed.receipts[0].gas_consumed, 7);
+        assert!(!parsed.receipts[1].execution_status);
+        assert_eq!(parsed.receipts[1].events, 3);
+        assert_eq!(parsed.receipts[1].gas_consumed, 9);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn parse_block_with_receipts_rejects_tx_and_receipt_order_mismatch() {
+        let block = json!({
+            "block_number": 12,
+            "block_hash": "0xabc",
+            "parent_hash": "0x123",
+            "transactions": [
+                {"transaction_hash": "0x1"},
+                {"transaction_hash": "0x2"}
+            ],
+            "receipts": [
+                {"transaction_hash": "0x2"},
+                {"transaction_hash": "0x1"}
+            ]
+        });
+
+        let mut warnings = Vec::new();
+        let error = parse_block_with_receipts(&block, &mut warnings)
+            .expect_err("mismatched receipt ordering must fail closed");
+        assert!(error.contains("receipt hash/order mismatch"));
+    }
+
+    #[test]
     fn compare_block_views_detects_mismatch() {
         let txs_view = RuntimeBlockReplay {
             external_block_number: 7,
@@ -2340,6 +2652,39 @@ mod tests {
 
         let mut warnings = Vec::new();
         compare_block_views(&txs_view, &hashes_view, &mut warnings);
+        assert_eq!(warnings.len(), 3);
+        assert!(warnings[0].contains("block hash mismatch"));
+        assert!(warnings[1].contains("state root mismatch"));
+        assert!(warnings[2].contains("transaction hash list mismatch"));
+    }
+
+    #[test]
+    fn compare_receipt_view_detects_mismatch() {
+        let txs_view = RuntimeBlockReplay {
+            external_block_number: 7,
+            block_hash: "0xaaa".to_string(),
+            parent_hash: "0xbbb".to_string(),
+            state_root: Some("0x111".to_string()),
+            sequencer_address: "0x1".to_string(),
+            timestamp: 1_700_000_007,
+            transaction_hashes: vec!["0x1".to_string(), "0x2".to_string()],
+        };
+        let receipts_view = RuntimeBlockReceipts {
+            external_block_number: 7,
+            block_hash: "0xddd".to_string(),
+            parent_hash: "0xbbb".to_string(),
+            state_root: Some("0x222".to_string()),
+            transaction_hashes: vec!["0x1".to_string()],
+            receipts: vec![StarknetReceipt {
+                tx_hash: TxHash::parse("0x1").expect("valid tx hash"),
+                execution_status: true,
+                events: 0,
+                gas_consumed: 0,
+            }],
+        };
+
+        let mut warnings = Vec::new();
+        compare_receipt_view(&txs_view, &receipts_view, &mut warnings);
         assert_eq!(warnings.len(), 3);
         assert!(warnings[0].contains("block hash mismatch"));
         assert!(warnings[1].contains("state root mismatch"));
@@ -2629,7 +2974,7 @@ mod tests {
         assert_eq!(block_number, 1);
         assert_eq!(tx_index, 0);
         assert_eq!(receipt.tx_hash, tx_hash);
-        assert_eq!(receipt.gas_consumed, 1);
+        assert_eq!(receipt.gas_consumed, 7);
         assert!(receipt.execution_status);
     }
 
@@ -2688,7 +3033,7 @@ mod tests {
             .get_transaction_receipt(&tx_hash)
             .expect("receipt lookup should succeed")
             .expect("restored receipt should exist");
-        assert_eq!(receipt.gas_consumed, 1);
+        assert_eq!(receipt.gas_consumed, 7);
         assert!(receipt.execution_status);
         let progress = restarted
             .sync_progress_handle()
