@@ -33,6 +33,9 @@ pub const DEFAULT_MAX_REPLAY_PER_POLL: u64 = 16;
 pub const DEFAULT_RPC_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_RPC_MAX_RETRIES: u32 = 3;
 pub const DEFAULT_RPC_RETRY_BACKOFF_MS: u64 = 250;
+const MAX_UPSTREAM_RPC_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_LOCAL_JOURNAL_FILE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_LOCAL_JOURNAL_LINE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECENT_ERRORS: usize = 128;
 
 #[derive(Debug, Clone)]
@@ -145,6 +148,20 @@ impl LocalChainJournal {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
+        let metadata = fs::metadata(&self.path).map_err(|error| {
+            format!(
+                "failed to inspect local journal {}: {error}",
+                self.path.display()
+            )
+        })?;
+        if metadata.len() > MAX_LOCAL_JOURNAL_FILE_BYTES {
+            return Err(format!(
+                "local journal {} size {} exceeds max allowed {} bytes",
+                self.path.display(),
+                metadata.len(),
+                MAX_LOCAL_JOURNAL_FILE_BYTES
+            ));
+        }
         let file = File::open(&self.path).map_err(|error| {
             format!(
                 "failed to open local journal {}: {error}",
@@ -161,6 +178,14 @@ impl LocalChainJournal {
                     idx + 1
                 )
             })?;
+            if line.len() > MAX_LOCAL_JOURNAL_LINE_BYTES {
+                return Err(format!(
+                    "local journal {} line {} exceeds max allowed {} bytes",
+                    self.path.display(),
+                    idx + 1,
+                    MAX_LOCAL_JOURNAL_LINE_BYTES
+                ));
+            }
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -829,11 +854,7 @@ impl UpstreamRpcClient {
         let state_update = self
             .call("starknet_getStateUpdate", block_selector.clone())
             .await?;
-        let state_root = state_update
-            .get("new_root")
-            .and_then(Value::as_str)
-            .unwrap_or("0x0")
-            .to_string();
+        let state_root = parse_state_root_from_state_update(&state_update)?;
         let (state_diff, mut state_diff_warnings) = state_update_to_diff(&state_update)?;
         warnings.append(&mut state_diff_warnings);
 
@@ -859,7 +880,7 @@ impl UpstreamRpcClient {
             "params": params,
         });
 
-        let response = self
+        let mut response = self
             .http
             .post(&self.rpc_url)
             .json(&request)
@@ -867,10 +888,14 @@ impl UpstreamRpcClient {
             .await
             .map_err(|error| format!("RPC {method} request failed: {error}"))?;
         let http_status = response.status();
-        let body: Value = response
-            .json()
-            .await
-            .map_err(|error| format!("RPC {method} invalid JSON response: {error}"))?;
+        let content_length = response.content_length();
+        let body = read_json_body_with_limit(
+            &mut response,
+            content_length,
+            MAX_UPSTREAM_RPC_RESPONSE_BYTES,
+            method,
+        )
+        .await?;
 
         if !http_status.is_success() {
             return Err(format!(
@@ -885,6 +910,51 @@ impl UpstreamRpcClient {
             .cloned()
             .ok_or_else(|| format!("RPC {method} response missing `result`: {body}"))
     }
+}
+
+async fn read_json_body_with_limit(
+    response: &mut reqwest::Response,
+    content_length: Option<u64>,
+    max_bytes: usize,
+    method: &str,
+) -> Result<Value, String> {
+    if let Some(length) = content_length
+        && length > max_bytes as u64
+    {
+        return Err(format!(
+            "RPC {method} response too large: content-length={length} exceeds {max_bytes} bytes"
+        ));
+    }
+    let mut buffer = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("RPC {method} failed reading response chunk: {error}"))?
+    {
+        append_limited_chunk(&mut buffer, &chunk, max_bytes, method)?;
+    }
+    serde_json::from_slice(&buffer)
+        .map_err(|error| format!("RPC {method} invalid JSON response: {error}"))
+}
+
+fn append_limited_chunk(
+    buffer: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: usize,
+    method: &str,
+) -> Result<(), String> {
+    let new_len = buffer
+        .len()
+        .checked_add(chunk.len())
+        .ok_or_else(|| format!("RPC {method} response size overflow"))?;
+    if new_len > max_bytes {
+        return Err(format!(
+            "RPC {method} response too large: {} exceeds {} bytes",
+            new_len, max_bytes
+        ));
+    }
+    buffer.extend_from_slice(chunk);
+    Ok(())
 }
 
 impl SyncSource for UpstreamRpcClient {
@@ -943,14 +1013,12 @@ fn restore_storage_from_journal(
 ) -> Result<u64, String> {
     let entries = journal.load_entries(max_entries)?;
     let mut restored = 0_u64;
+    let mut expected = node
+        .storage
+        .latest_block_number()
+        .map_err(|error| format!("failed to read storage tip while replaying journal: {error}"))?
+        .saturating_add(1);
     for (idx, entry) in entries.into_iter().enumerate() {
-        let expected = node
-            .storage
-            .latest_block_number()
-            .map_err(|error| {
-                format!("failed to read storage tip while replaying journal: {error}")
-            })?
-            .saturating_add(1);
         if entry.block.number != expected {
             return Err(format!(
                 "local journal {} entry {} is non-sequential: expected block {}, found {}",
@@ -971,6 +1039,7 @@ fn restore_storage_from_journal(
             })?;
         apply_state_diff_to_in_memory_state(execution_state, &entry.state_diff);
         restored = restored.saturating_add(1);
+        expected = expected.saturating_add(1);
     }
     Ok(restored)
 }
@@ -1221,6 +1290,21 @@ fn state_update_to_diff(state_update: &Value) -> Result<(StarknetStateDiff, Vec<
     diff.validate()
         .map_err(|error| format!("converted state diff is invalid: {error}"))?;
     Ok((diff, warnings))
+}
+
+fn parse_state_root_from_state_update(state_update: &Value) -> Result<String, String> {
+    let new_root_raw = state_update
+        .get("new_root")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("state_update is missing new_root: {state_update}"))?;
+    let normalized_root = if let Some(raw) = new_root_raw.strip_prefix("0X") {
+        format!("0x{raw}")
+    } else {
+        new_root_raw.to_string()
+    };
+    StarknetFelt::from_str(&normalized_root)
+        .map(|felt| format!("{:#x}", felt))
+        .map_err(|error| format!("invalid state_update new_root `{new_root_raw}`: {error}"))
 }
 
 fn parse_storage_diffs(raw: &Value, diff: &mut StarknetStateDiff, warnings: &mut Vec<String>) {
@@ -1804,6 +1888,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_state_root_requires_new_root() {
+        let state_update = json!({
+            "state_diff": {}
+        });
+        let error = parse_state_root_from_state_update(&state_update)
+            .expect_err("missing new_root must fail closed");
+        assert!(error.contains("missing new_root"));
+    }
+
+    #[test]
+    fn parse_state_root_canonicalizes_hex() {
+        let state_update = json!({
+            "new_root": "0X000A",
+            "state_diff": {}
+        });
+        let root =
+            parse_state_root_from_state_update(&state_update).expect("valid new_root should parse");
+        assert_eq!(root, "0xa");
+    }
+
+    #[test]
+    fn append_limited_chunk_rejects_oversized_payload() {
+        let mut buffer = vec![1, 2, 3];
+        let error = append_limited_chunk(&mut buffer, &[4, 5, 6], 5, "starknet_test")
+            .expect_err("chunk growth beyond limit must fail");
+        assert!(error.contains("response too large"));
+    }
+
+    #[test]
     fn normalize_chain_id_accepts_hex_encoded_ascii() {
         assert_eq!(normalize_chain_id("SN_MAIN"), "SN_MAIN");
         assert_eq!(normalize_chain_id("0x534e5f4d41494e"), "SN_MAIN");
@@ -1973,6 +2086,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn local_journal_rejects_oversized_files() {
+        let dir = tempdir().expect("tempdir");
+        let journal_path = dir.path().join("local-journal.jsonl");
+        let file = std::fs::File::create(&journal_path).expect("create journal file");
+        file.set_len(MAX_LOCAL_JOURNAL_FILE_BYTES.saturating_add(1))
+            .expect("expand file");
+
+        let journal = LocalChainJournal::new(&journal_path);
+        let error = journal
+            .load_entries(None)
+            .expect_err("oversized journal must fail closed");
+        assert!(error.contains("exceeds max allowed"));
+    }
+
     #[tokio::test]
     async fn chain_id_validation_retries_transient_upstream_errors() {
         let sync_source = Arc::new(FlakyChainIdSyncSource::new("SN_MAIN", 1));
@@ -2019,9 +2147,8 @@ mod tests {
             base_backoff: Duration::ZERO,
         };
 
-        let mut runtime =
-            NodeRuntime::new_with_backends(config, sync_source, consensus, network)
-                .expect("runtime should initialize");
+        let mut runtime = NodeRuntime::new_with_backends(config, sync_source, consensus, network)
+            .expect("runtime should initialize");
         runtime
             .ensure_chain_id_validated()
             .await

@@ -18,6 +18,7 @@ const ERR_INTERNAL: i64 = -32603;
 const ERR_BLOCK_NOT_FOUND: i64 = -32001;
 const ERR_TX_NOT_FOUND: i64 = -32003;
 const MAX_BATCH_REQUESTS: usize = 256;
+const INTERNAL_SERIALIZATION_ERROR_RESPONSE: &str = r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"internal serialization error"},"id":null}"#;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncStatus {
@@ -103,7 +104,7 @@ impl<'a> StarknetRpcServer<'a> {
                     }),
                     id: Value::Null,
                 };
-                serde_json::to_string(&response).expect("serialize parse error response")
+                serialize_json_or_internal_error(&response)
             }
         }
     }
@@ -146,7 +147,7 @@ impl<'a> StarknetRpcServer<'a> {
                 if responses.is_empty() {
                     return String::new();
                 }
-                serde_json::to_string(&responses).expect("serialize batch response")
+                serialize_json_or_internal_error(&responses)
             }
             other => {
                 let response = match serde_json::from_value::<JsonRpcRequest>(other) {
@@ -665,7 +666,12 @@ fn error_response(id: Value, code: i64, message: impl Into<String>) -> JsonRpcRe
 }
 
 fn serialize_response(response: JsonRpcResponse) -> String {
-    serde_json::to_string(&response).expect("serialize json-rpc response")
+    serialize_json_or_internal_error(&response)
+}
+
+fn serialize_json_or_internal_error<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|_| INTERNAL_SERIALIZATION_ERROR_RESPONSE.to_string())
 }
 
 #[cfg(test)]
@@ -998,5 +1004,27 @@ mod tests {
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["id"], json!(9));
         assert_eq!(arr[0]["result"], json!("SN_MAIN"));
+    }
+
+    struct FailingSerialize;
+
+    impl serde::Serialize for FailingSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("intentional failure"))
+        }
+    }
+
+    #[test]
+    fn serializer_fallback_returns_internal_error_payload() {
+        let raw = serialize_json_or_internal_error(&FailingSerialize);
+        let value: Value = serde_json::from_str(&raw).expect("valid fallback JSON");
+        assert_eq!(value["error"]["code"], json!(ERR_INTERNAL));
+        assert_eq!(
+            value["error"]["message"],
+            json!("internal serialization error")
+        );
     }
 }
