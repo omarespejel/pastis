@@ -38,6 +38,8 @@ const MAX_UPSTREAM_RPC_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LOCAL_JOURNAL_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_LOCAL_JOURNAL_LINE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECENT_ERRORS: usize = 128;
+const MAX_RPC_ERROR_CONTEXT_CHARS: usize = 1_024;
+const MAX_RUNTIME_ERROR_CHARS: usize = 2_048;
 const UPSTREAM_REQUEST_ID: u64 = 1;
 
 #[derive(Debug, Clone)]
@@ -847,16 +849,17 @@ impl NodeRuntime {
     }
 
     fn record_failure(&mut self, message: String) {
+        let sanitized = sanitize_error_message(&message, MAX_RUNTIME_ERROR_CHARS);
         self.diagnostics.failure_count = self.diagnostics.failure_count.saturating_add(1);
         self.diagnostics.consecutive_failures =
             self.diagnostics.consecutive_failures.saturating_add(1);
-        self.diagnostics.last_error = Some(message.clone());
-        push_recent_error(&mut self.recent_errors, message.clone());
+        self.diagnostics.last_error = Some(sanitized.clone());
+        push_recent_error(&mut self.recent_errors, sanitized.clone());
         self.diagnostics.recent_errors = self.recent_errors.iter().cloned().collect();
 
         let _ = self.update_sync_progress(|progress| {
             progress.consecutive_failures = progress.consecutive_failures.saturating_add(1);
-            progress.last_error = Some(message);
+            progress.last_error = Some(sanitized);
             progress.reorg_events = self.replay.reorg_events();
         });
     }
@@ -1009,7 +1012,13 @@ impl UpstreamRpcClient {
             .json(&request)
             .send()
             .await
-            .map_err(|error| format!("RPC {method} request failed: {error}"))?;
+            .map_err(|error| {
+                let error = redact_upstream_url(error.to_string(), &self.rpc_url);
+                format!(
+                    "RPC {method} request failed: {}",
+                    sanitize_error_message(&error, MAX_RPC_ERROR_CONTEXT_CHARS)
+                )
+            })?;
         let http_status = response.status();
         let content_length = response.content_length();
         let body = read_json_body_with_limit(
@@ -1021,9 +1030,10 @@ impl UpstreamRpcClient {
         .await?;
 
         if !http_status.is_success() {
+            let body_summary = summarize_json_for_error(&body);
             return Err(format!(
                 "RPC {method} returned HTTP {} with body {}",
-                http_status, body
+                http_status, body_summary
             ));
         }
         parse_rpc_result(body, method, UPSTREAM_REQUEST_ID)
@@ -1076,20 +1086,21 @@ fn append_limited_chunk(
 }
 
 fn parse_rpc_result(body: Value, method: &str, expected_id: u64) -> Result<Value, String> {
+    let body_summary = summarize_json_for_error(&body);
     let jsonrpc = body
         .get("jsonrpc")
         .and_then(Value::as_str)
-        .ok_or_else(|| format!("RPC {method} response missing `jsonrpc`: {body}"))?;
+        .ok_or_else(|| format!("RPC {method} response missing `jsonrpc`: {body_summary}"))?;
     if jsonrpc != "2.0" {
         return Err(format!(
-            "RPC {method} response has invalid jsonrpc version `{jsonrpc}`: {body}"
+            "RPC {method} response has invalid jsonrpc version `{jsonrpc}`: {body_summary}"
         ));
     }
 
     let id = body
         .get("id")
         .and_then(Value::as_u64)
-        .ok_or_else(|| format!("RPC {method} response has invalid/missing id: {body}"))?;
+        .ok_or_else(|| format!("RPC {method} response has invalid/missing id: {body_summary}"))?;
     if id != expected_id {
         return Err(format!(
             "RPC {method} response id mismatch: expected {expected_id}, got {id}"
@@ -1100,17 +1111,51 @@ fn parse_rpc_result(body: Value, method: &str, expected_id: u64) -> Result<Value
     let error_payload = body.get("error");
     if result_payload.is_some() && error_payload.is_some() {
         return Err(format!(
-            "RPC {method} response must not include both `result` and `error`: {body}"
+            "RPC {method} response must not include both `result` and `error`: {body_summary}"
         ));
     }
 
     if let Some(error) = error_payload {
-        return Err(format!("RPC {method} error payload: {error}"));
+        return Err(format!(
+            "RPC {method} error payload: {}",
+            sanitize_error_message(&error.to_string(), MAX_RPC_ERROR_CONTEXT_CHARS)
+        ));
     }
 
     result_payload
         .cloned()
-        .ok_or_else(|| format!("RPC {method} response missing `result`: {body}"))
+        .ok_or_else(|| format!("RPC {method} response missing `result`: {body_summary}"))
+}
+
+fn summarize_json_for_error(body: &Value) -> String {
+    sanitize_error_message(&body.to_string(), MAX_RPC_ERROR_CONTEXT_CHARS)
+}
+
+fn sanitize_error_message(raw: &str, max_chars: usize) -> String {
+    let trimmed = raw.trim();
+    let count = trimmed.chars().count();
+    if count <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut out = String::new();
+    out.extend(trimmed.chars().take(max_chars));
+    out.push_str("...<truncated>");
+    out
+}
+
+fn redact_upstream_url(raw: String, rpc_url: &str) -> String {
+    let redacted = match reqwest::Url::parse(rpc_url) {
+        Ok(url) => {
+            let host = url.host_str().unwrap_or("unknown-host");
+            let port = url
+                .port()
+                .map(|value| format!(":{value}"))
+                .unwrap_or_default();
+            format!("{}://{}{port}", url.scheme(), host)
+        }
+        Err(_) => "<upstream-rpc-url>".to_string(),
+    };
+    raw.replace(rpc_url, &redacted)
 }
 
 impl SyncSource for UpstreamRpcClient {
@@ -2864,6 +2909,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_rpc_result_truncates_large_error_context() {
+        let oversized_context = "x".repeat(MAX_RPC_ERROR_CONTEXT_CHARS + 512);
+        let error = parse_rpc_result(
+            json!({
+                "id": 1,
+                "result": {},
+                "oversized": oversized_context,
+            }),
+            "starknet_test",
+            1,
+        )
+        .expect_err("missing jsonrpc should fail");
+        assert!(error.contains("missing `jsonrpc`"));
+        assert!(error.contains("<truncated>"));
+        assert!(error.len() < MAX_RPC_ERROR_CONTEXT_CHARS + 256);
+    }
+
+    #[test]
     fn normalize_chain_id_accepts_hex_encoded_ascii() {
         assert_eq!(normalize_chain_id("SN_MAIN"), "SN_MAIN");
         assert_eq!(normalize_chain_id("0x534e5f4d41494e"), "SN_MAIN");
@@ -2962,6 +3025,38 @@ mod tests {
                 .nonce_of(&contract)
                 .expect("read nonce"),
             Some(StarknetFelt::from(2_u64))
+        );
+    }
+
+    #[tokio::test]
+    async fn record_failure_truncates_diagnostics_error_payload() {
+        let sync_source = Arc::new(MockSyncSource::with_blocks("SN_MAIN", 0, Vec::new()));
+        let consensus = Arc::new(HealthyConsensus);
+        let network = Arc::new(MockNetwork {
+            healthy: true,
+            peers: 1,
+        });
+        let mut runtime =
+            NodeRuntime::new_with_backends(runtime_config(), sync_source, consensus, network)
+                .expect("runtime should initialize");
+
+        runtime.record_failure("z".repeat(MAX_RUNTIME_ERROR_CHARS + 1_000));
+        let diagnostics = runtime.diagnostics();
+        let stored = diagnostics
+            .last_error
+            .expect("last_error should be populated after failure");
+        assert!(stored.contains("<truncated>"));
+        assert!(stored.chars().count() <= MAX_RUNTIME_ERROR_CHARS + 20);
+        let progress = runtime
+            .sync_progress_handle()
+            .lock()
+            .expect("sync progress lock should not be poisoned")
+            .clone();
+        assert!(
+            progress
+                .last_error
+                .expect("sync progress must include last error")
+                .contains("<truncated>")
         );
     }
 
