@@ -37,6 +37,7 @@ const MAX_UPSTREAM_RPC_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LOCAL_JOURNAL_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_LOCAL_JOURNAL_LINE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECENT_ERRORS: usize = 128;
+const UPSTREAM_REQUEST_ID: u64 = 1;
 
 #[derive(Debug, Clone)]
 pub struct RpcRetryConfig {
@@ -896,7 +897,7 @@ impl UpstreamRpcClient {
     async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
         let request = json!({
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": UPSTREAM_REQUEST_ID,
             "method": method,
             "params": params,
         });
@@ -924,12 +925,7 @@ impl UpstreamRpcClient {
                 http_status, body
             ));
         }
-        if let Some(error) = body.get("error") {
-            return Err(format!("RPC {method} error payload: {error}"));
-        }
-        body.get("result")
-            .cloned()
-            .ok_or_else(|| format!("RPC {method} response missing `result`: {body}"))
+        parse_rpc_result(body, method, UPSTREAM_REQUEST_ID)
     }
 }
 
@@ -976,6 +972,36 @@ fn append_limited_chunk(
     }
     buffer.extend_from_slice(chunk);
     Ok(())
+}
+
+fn parse_rpc_result(body: Value, method: &str, expected_id: u64) -> Result<Value, String> {
+    let jsonrpc = body
+        .get("jsonrpc")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("RPC {method} response missing `jsonrpc`: {body}"))?;
+    if jsonrpc != "2.0" {
+        return Err(format!(
+            "RPC {method} response has invalid jsonrpc version `{jsonrpc}`: {body}"
+        ));
+    }
+
+    let id = body
+        .get("id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("RPC {method} response has invalid/missing id: {body}"))?;
+    if id != expected_id {
+        return Err(format!(
+            "RPC {method} response id mismatch: expected {expected_id}, got {id}"
+        ));
+    }
+
+    if let Some(error) = body.get("error") {
+        return Err(format!("RPC {method} error payload: {error}"));
+    }
+
+    body.get("result")
+        .cloned()
+        .ok_or_else(|| format!("RPC {method} response missing `result`: {body}"))
 }
 
 impl SyncSource for UpstreamRpcClient {
@@ -2125,6 +2151,66 @@ mod tests {
         let error = append_limited_chunk(&mut buffer, &[4, 5, 6], 5, "starknet_test")
             .expect_err("chunk growth beyond limit must fail");
         assert!(error.contains("response too large"));
+    }
+
+    #[test]
+    fn parse_rpc_result_accepts_valid_envelope() {
+        let result = parse_rpc_result(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"ok": true}
+            }),
+            "starknet_test",
+            1,
+        )
+        .expect("valid envelope");
+        assert_eq!(result, json!({"ok": true}));
+    }
+
+    #[test]
+    fn parse_rpc_result_rejects_mismatched_response_id() {
+        let error = parse_rpc_result(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {}
+            }),
+            "starknet_test",
+            1,
+        )
+        .expect_err("id mismatch must fail");
+        assert!(error.contains("id mismatch"));
+    }
+
+    #[test]
+    fn parse_rpc_result_rejects_invalid_jsonrpc_version() {
+        let error = parse_rpc_result(
+            json!({
+                "jsonrpc": "1.0",
+                "id": 1,
+                "result": {}
+            }),
+            "starknet_test",
+            1,
+        )
+        .expect_err("invalid version must fail");
+        assert!(error.contains("invalid jsonrpc version"));
+    }
+
+    #[test]
+    fn parse_rpc_result_surfaces_error_payload() {
+        let error = parse_rpc_result(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"code": -32000, "message": "boom"}
+            }),
+            "starknet_test",
+            1,
+        )
+        .expect_err("error payload must fail");
+        assert!(error.contains("error payload"));
     }
 
     #[test]
