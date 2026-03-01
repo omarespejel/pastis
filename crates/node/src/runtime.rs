@@ -1369,21 +1369,40 @@ impl NodeRuntime {
             })?;
             let local_block_for_journal = local_block.clone();
 
-            if let Err(error) = self
+            let base_execution_state = self.execution_state.clone();
+            let mut execution_validation_state = base_execution_state.clone();
+            let execution_output = match self
                 .node
                 .execution
-                .execute_block(&local_block, &mut self.execution_state)
+                .execute_block(&local_block, &mut execution_validation_state)
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    self.diagnostics.execution_failures =
+                        self.diagnostics.execution_failures.saturating_add(1);
+                    let message = format!(
+                        "execution failed for local block {local_block_number} (external {external_block}): {error}"
+                    );
+                    self.record_failure(message.clone());
+                    return Err(message);
+                }
+            };
+
+            if state_diff_has_mutations(&execution_output.state_diff)
+                && execution_output.state_diff != fetch.state_diff
             {
                 self.diagnostics.execution_failures =
                     self.diagnostics.execution_failures.saturating_add(1);
                 let message = format!(
-                    "execution failed for local block {local_block_number} (external {external_block}): {error}"
+                    "execution state diff mismatch for local block {local_block_number} (external {external_block}): expected {} from upstream, got {} from execution backend",
+                    summarize_state_diff(&fetch.state_diff),
+                    summarize_state_diff(&execution_output.state_diff)
                 );
                 self.record_failure(message.clone());
                 return Err(message);
             }
 
-            let mut staged_execution_state = self.execution_state.clone();
+            let mut staged_execution_state = base_execution_state;
             if let Err(error) =
                 apply_state_diff_checked(&mut staged_execution_state, &fetch.state_diff)
             {
@@ -2491,6 +2510,23 @@ fn apply_state_diff_checked(
     state
         .apply_state_diff(diff)
         .map_err(|error| format!("state diff application failed: {error}"))
+}
+
+fn state_diff_has_mutations(diff: &StarknetStateDiff) -> bool {
+    !diff.storage_diffs.is_empty() || !diff.nonces.is_empty() || !diff.declared_classes.is_empty()
+}
+
+fn summarize_state_diff(diff: &StarknetStateDiff) -> String {
+    let storage_writes = diff
+        .storage_diffs
+        .values()
+        .map(BTreeMap::len)
+        .sum::<usize>();
+    format!(
+        "writes={storage_writes}, nonces={}, classes={}",
+        diff.nonces.len(),
+        diff.declared_classes.len()
+    )
 }
 
 struct RuntimeExecutionBackend;
@@ -3995,6 +4031,82 @@ mod tests {
 
         fn peer_count(&self) -> usize {
             self.peers
+        }
+    }
+
+    struct MutatingFailingExecutionBackend;
+
+    impl ExecutionBackend for MutatingFailingExecutionBackend {
+        fn execute_block(
+            &self,
+            _block: &StarknetBlock,
+            state: &mut dyn MutableState,
+        ) -> Result<ExecutionOutput, ExecutionError> {
+            let contract =
+                ContractAddress::parse("0xabc").expect("test contract address should parse");
+            state.set_storage(contract, "0x1".to_string(), StarknetFelt::from(999_u64));
+            Err(ExecutionError::Backend(
+                "intentional mutating failure".to_string(),
+            ))
+        }
+
+        fn simulate_tx(
+            &self,
+            _tx: &StarknetTransaction,
+            _state: &dyn StateReader,
+            _block_context: &BlockContext,
+        ) -> Result<SimulationResult, ExecutionError> {
+            Err(ExecutionError::Backend(
+                "intentional mutating failure".to_string(),
+            ))
+        }
+    }
+
+    struct DivergingStateDiffExecutionBackend;
+
+    impl ExecutionBackend for DivergingStateDiffExecutionBackend {
+        fn execute_block(
+            &self,
+            block: &StarknetBlock,
+            _state: &mut dyn MutableState,
+        ) -> Result<ExecutionOutput, ExecutionError> {
+            let mut diff = StarknetStateDiff::default();
+            diff.storage_diffs
+                .entry(ContractAddress::parse("0x123").expect("test contract should parse"))
+                .or_default()
+                .insert("0x10".to_string(), StarknetFelt::from(42_u64));
+            Ok(ExecutionOutput {
+                receipts: block
+                    .transactions
+                    .iter()
+                    .map(|tx| StarknetReceipt {
+                        tx_hash: tx.hash.clone(),
+                        execution_status: true,
+                        events: 0,
+                        gas_consumed: 1,
+                    })
+                    .collect(),
+                state_diff: diff,
+                builtin_stats: BuiltinStats::default(),
+                execution_time: Duration::from_millis(1),
+            })
+        }
+
+        fn simulate_tx(
+            &self,
+            tx: &StarknetTransaction,
+            _state: &dyn StateReader,
+            _block_context: &BlockContext,
+        ) -> Result<SimulationResult, ExecutionError> {
+            Ok(SimulationResult {
+                receipt: StarknetReceipt {
+                    tx_hash: tx.hash.clone(),
+                    execution_status: true,
+                    events: 0,
+                    gas_consumed: 1,
+                },
+                estimated_fee: 1,
+            })
         }
     }
 
@@ -5539,6 +5651,105 @@ mod tests {
                 .nonce_of(&contract)
                 .expect("read nonce"),
             Some(StarknetFelt::from(2_u64))
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_once_does_not_mutate_live_state_when_execution_backend_fails() {
+        let sync_source = Arc::new(MockSyncSource::with_blocks(
+            "SN_MAIN",
+            1,
+            vec![sample_fetch(1, "0x0", "0x1")],
+        ));
+        let consensus = Arc::new(HealthyConsensus);
+        let network = Arc::new(MockNetwork {
+            healthy: true,
+            peers: 3,
+        });
+        let mut runtime =
+            NodeRuntime::new_with_backends(runtime_config(), sync_source, consensus, network)
+                .expect("runtime should initialize");
+        runtime.node.execution = DualExecutionBackend::new(
+            None,
+            Box::new(MutatingFailingExecutionBackend),
+            ExecutionMode::CanonicalOnly,
+            MismatchPolicy::WarnAndFallback,
+        );
+        let contract = ContractAddress::parse("0xabc").expect("test contract should parse");
+        assert_eq!(
+            runtime
+                .execution_state
+                .get_storage(&contract, "0x1")
+                .expect("state lookup should succeed"),
+            None
+        );
+
+        let error = runtime
+            .poll_once()
+            .await
+            .expect_err("execution failure must fail closed");
+        assert!(error.contains("execution failed for local block"));
+        assert_eq!(
+            runtime
+                .execution_state
+                .get_storage(&contract, "0x1")
+                .expect("state lookup should succeed"),
+            None
+        );
+        assert_eq!(
+            runtime
+                .storage()
+                .latest_block_number()
+                .expect("storage lookup should succeed"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_once_fails_closed_when_execution_state_diff_mismatches_upstream() {
+        let contract = ContractAddress::parse("0x123").expect("test contract should parse");
+        let mut upstream_diff = StarknetStateDiff::default();
+        upstream_diff
+            .storage_diffs
+            .entry(contract)
+            .or_default()
+            .insert("0x10".to_string(), StarknetFelt::from(777_u64));
+        let sync_source = Arc::new(MockSyncSource::with_blocks(
+            "SN_MAIN",
+            1,
+            vec![sample_fetch_with_state_diff(
+                1,
+                "0x0",
+                "0x1",
+                upstream_diff.clone(),
+            )],
+        ));
+        let consensus = Arc::new(HealthyConsensus);
+        let network = Arc::new(MockNetwork {
+            healthy: true,
+            peers: 2,
+        });
+        let mut runtime =
+            NodeRuntime::new_with_backends(runtime_config(), sync_source, consensus, network)
+                .expect("runtime should initialize");
+        runtime.node.execution = DualExecutionBackend::new(
+            None,
+            Box::new(DivergingStateDiffExecutionBackend),
+            ExecutionMode::CanonicalOnly,
+            MismatchPolicy::WarnAndFallback,
+        );
+
+        let error = runtime
+            .poll_once()
+            .await
+            .expect_err("state diff mismatch must fail closed");
+        assert!(error.contains("execution state diff mismatch"));
+        assert_eq!(
+            runtime
+                .storage()
+                .latest_block_number()
+                .expect("storage lookup should succeed"),
+            0
         );
     }
 
