@@ -75,6 +75,7 @@ struct DaemonConfig {
     rpc_rate_limit_per_minute: u32,
     disable_batch_requests: bool,
     strict_canonical_execution: bool,
+    allow_synthetic_execution_fallback: bool,
     bootnodes: Vec<String>,
     min_peers: u64,
     p2p_heartbeat_ms: u64,
@@ -395,6 +396,7 @@ async fn main() -> Result<(), String> {
         disable_batch_requests: config.disable_batch_requests,
         network_stale_after: derive_network_stale_after(config.p2p_heartbeat_ms),
         strict_canonical_execution: config.strict_canonical_execution,
+        allow_synthetic_execution_fallback: config.allow_synthetic_execution_fallback,
         peer_count_hint: initial_peers,
         require_peers: config.min_peers > 0,
         storage: None,
@@ -504,6 +506,10 @@ async fn main() -> Result<(), String> {
     println!(
         "strict_canonical_execution: {}",
         config.strict_canonical_execution
+    );
+    println!(
+        "allow_synthetic_execution_fallback: {}",
+        config.allow_synthetic_execution_fallback
     );
     println!("rpc_auth_enabled: {}", config.rpc_auth_token.is_some());
     println!("allow_public_rpc_bind: {}", config.allow_public_rpc_bind);
@@ -1350,6 +1356,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
     let mut cli_rpc_rate_limit_per_minute: Option<u32> = None;
     let mut cli_disable_batch_requests = false;
     let mut cli_strict_canonical_execution: Option<bool> = None;
+    let mut cli_allow_synthetic_execution_fallback: Option<bool> = None;
     let mut cli_bootnodes: Vec<String> = Vec::new();
     let mut cli_require_peers = false;
     let mut cli_exit_on_unhealthy = false;
@@ -1482,6 +1489,12 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
             "--no-strict-canonical-execution" => {
                 cli_strict_canonical_execution = Some(false);
             }
+            "--allow-synthetic-execution-fallback" => {
+                cli_allow_synthetic_execution_fallback = Some(true);
+            }
+            "--no-allow-synthetic-execution-fallback" => {
+                cli_allow_synthetic_execution_fallback = Some(false);
+            }
             "--bootnode" => {
                 cli_bootnodes.push(
                     args.next()
@@ -1514,6 +1527,15 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
                     cli_strict_canonical_execution = Some(parse_bool_literal(
                         raw_value,
                         "--strict-canonical-execution",
+                    )?);
+                    continue;
+                }
+                if let Some(raw_value) =
+                    unknown.strip_prefix("--allow-synthetic-execution-fallback=")
+                {
+                    cli_allow_synthetic_execution_fallback = Some(parse_bool_literal(
+                        raw_value,
+                        "--allow-synthetic-execution-fallback",
                     )?);
                     continue;
                 }
@@ -1607,6 +1629,11 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         parse_env_bool("PASTIS_STRICT_CANONICAL_EXECUTION")?,
         default_strict_canonical_execution(),
     );
+    let allow_synthetic_execution_fallback = resolve_allow_synthetic_execution_fallback(
+        cli_allow_synthetic_execution_fallback,
+        parse_env_bool("PASTIS_ALLOW_SYNTHETIC_EXECUTION_FALLBACK")?,
+        default_allow_synthetic_execution_fallback(),
+    );
     let p2p_heartbeat_ms = match cli_p2p_heartbeat_ms {
         Some(value) => value,
         None => parse_env_u64("PASTIS_P2P_HEARTBEAT_MS")?.unwrap_or(DEFAULT_P2P_HEARTBEAT_MS),
@@ -1684,6 +1711,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         rpc_rate_limit_per_minute,
         disable_batch_requests,
         strict_canonical_execution,
+        allow_synthetic_execution_fallback,
         bootnodes,
         min_peers,
         p2p_heartbeat_ms,
@@ -1752,6 +1780,18 @@ fn resolve_strict_canonical_execution(
 
 fn default_strict_canonical_execution() -> bool {
     cfg!(feature = "production-adapters")
+}
+
+fn resolve_allow_synthetic_execution_fallback(
+    cli_override: Option<bool>,
+    env_override: Option<bool>,
+    default: bool,
+) -> bool {
+    cli_override.or(env_override).unwrap_or(default)
+}
+
+fn default_allow_synthetic_execution_fallback() -> bool {
+    !cfg!(feature = "production-adapters")
 }
 
 fn parse_positive_u64(raw: &str, field: &str) -> Result<u64, String> {
@@ -2190,6 +2230,10 @@ options:\n\
   --strict-canonical-execution[=bool]\n\
                                      Require canonical execution for committed blocks (CLI overrides env; default=true with production-adapters)\n\
   --no-strict-canonical-execution    Disable strict canonical execution (equivalent to --strict-canonical-execution=false)\n\
+  --allow-synthetic-execution-fallback[=bool]\n\
+                                     Allow synthetic execution/simulation fallback when canonical execution is unavailable (default=false with production-adapters)\n\
+  --no-allow-synthetic-execution-fallback\n\
+                                     Disable synthetic execution/simulation fallback explicitly\n\
   --bootnode <multiaddr>             Configure bootnode (repeatable)\n\
   --require-peers                    Fail closed when no peers are configured/available\n\
   --min-peers <n>                    Minimum healthy peer count requirement (0 disables; implies require-peers when n > 0)\n\
@@ -2216,6 +2260,7 @@ environment:\n\
   PASTIS_RPC_RATE_LIMIT_PER_MINUTE   Per-IP RPC request rate limit (0 disables)\n\
   PASTIS_DISABLE_UPSTREAM_BATCH      Disable outbound upstream JSON-RPC batch requests (true/false)\n\
   PASTIS_STRICT_CANONICAL_EXECUTION  Require canonical execution for committed blocks (true/false; used only when strict canonical CLI flags are absent; default=true with production-adapters)\n\
+  PASTIS_ALLOW_SYNTHETIC_EXECUTION_FALLBACK  Allow synthetic execution fallback when canonical execution is unavailable (true/false; used only when synthetic fallback CLI flags are absent; default=false with production-adapters)\n\
   PASTIS_BOOTNODES                   Comma-separated bootnodes\n\
   PASTIS_REQUIRE_PEERS               Require peers for sync loop health (true/false)\n\
   PASTIS_MIN_PEERS                   Minimum healthy peer count (0 disables)\n\
@@ -2592,6 +2637,18 @@ mod tests {
         assert!(!default_strict_canonical_execution());
     }
 
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn synthetic_fallback_defaults_disabled_for_production_builds() {
+        assert!(!default_allow_synthetic_execution_fallback());
+    }
+
+    #[cfg(not(feature = "production-adapters"))]
+    #[test]
+    fn synthetic_fallback_defaults_enabled_without_production_adapters() {
+        assert!(default_allow_synthetic_execution_fallback());
+    }
+
     #[test]
     fn parse_bool_literal_accepts_common_true_values() {
         for value in ["true", "TRUE", "1", "yes", "on"] {
@@ -2635,6 +2692,26 @@ mod tests {
     fn resolve_strict_canonical_execution_uses_default_when_no_overrides_set() {
         assert!(resolve_strict_canonical_execution(None, None, true));
         assert!(!resolve_strict_canonical_execution(None, None, false));
+    }
+
+    #[test]
+    fn resolve_allow_synthetic_execution_fallback_prefers_cli_over_env_and_default() {
+        let resolved = resolve_allow_synthetic_execution_fallback(Some(false), Some(true), true);
+        assert!(!resolved);
+    }
+
+    #[test]
+    fn resolve_allow_synthetic_execution_fallback_prefers_env_over_default() {
+        let resolved = resolve_allow_synthetic_execution_fallback(None, Some(false), true);
+        assert!(!resolved);
+    }
+
+    #[test]
+    fn resolve_allow_synthetic_execution_fallback_uses_default_when_unset() {
+        assert!(resolve_allow_synthetic_execution_fallback(None, None, true));
+        assert!(!resolve_allow_synthetic_execution_fallback(
+            None, None, false
+        ));
     }
 
     #[tokio::test]
