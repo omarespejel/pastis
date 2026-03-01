@@ -260,6 +260,7 @@ struct RuntimeBlockReplay {
     external_block_number: u64,
     block_hash: String,
     parent_hash: String,
+    state_root: Option<String>,
     sequencer_address: String,
     timestamp: u64,
     transaction_hashes: Vec<String>,
@@ -270,6 +271,7 @@ struct RuntimeBlockHashes {
     external_block_number: u64,
     block_hash: String,
     parent_hash: String,
+    state_root: Option<String>,
     transaction_hashes: Vec<String>,
 }
 
@@ -877,6 +879,28 @@ impl UpstreamRpcClient {
             ));
         }
         let state_root = parse_state_root_from_state_update(&state_update)?;
+        if let Some(block_state_root) = replay.state_root.as_deref()
+            && block_state_root != state_root
+        {
+            warnings.push(format!(
+                "state root mismatch between getBlockWithTxs ({block_state_root}) and getStateUpdate ({state_root})"
+            ));
+        }
+        if let Some(block_state_root) = hashes_view.state_root.as_deref()
+            && block_state_root != state_root
+        {
+            warnings.push(format!(
+                "state root mismatch between getBlockWithTxHashes ({block_state_root}) and getStateUpdate ({state_root})"
+            ));
+        }
+        if let Some(state_update_block_hash) = parse_state_update_block_hash(&state_update)?
+            && state_update_block_hash != replay.block_hash
+        {
+            warnings.push(format!(
+                "block hash mismatch between getStateUpdate ({state_update_block_hash}) and getBlockWithTxs ({})",
+                replay.block_hash
+            ));
+        }
         let (state_diff, mut state_diff_warnings) = state_update_to_diff(&state_update)?;
         warnings.append(&mut state_diff_warnings);
 
@@ -1248,6 +1272,7 @@ fn parse_block_with_txs(
         .map_err(|error| {
             format!("invalid getBlockWithTxs parent_hash `{parent_hash_raw}`: {error}")
         })?;
+    let state_root = parse_optional_block_state_root(block_with_txs, "getBlockWithTxs")?;
 
     let sequencer_raw = block_with_txs
         .get("sequencer_address")
@@ -1312,6 +1337,7 @@ fn parse_block_with_txs(
         external_block_number,
         block_hash,
         parent_hash,
+        state_root,
         sequencer_address,
         timestamp,
         transaction_hashes,
@@ -1353,6 +1379,7 @@ fn parse_block_with_tx_hashes(
         .map_err(|error| {
             format!("invalid getBlockWithTxHashes parent_hash `{parent_hash_raw}`: {error}")
         })?;
+    let state_root = parse_optional_block_state_root(block_with_tx_hashes, "getBlockWithTxHashes")?;
 
     let transactions = block_with_tx_hashes
         .get("transactions")
@@ -1399,6 +1426,7 @@ fn parse_block_with_tx_hashes(
         external_block_number,
         block_hash,
         parent_hash,
+        state_root,
         transaction_hashes,
     })
 }
@@ -1424,6 +1452,12 @@ fn compare_block_views(
         warnings.push(format!(
             "parent hash mismatch between getBlockWithTxs ({}) and getBlockWithTxHashes ({})",
             txs_view.parent_hash, hashes_view.parent_hash
+        ));
+    }
+    if hashes_view.state_root != txs_view.state_root {
+        warnings.push(format!(
+            "state root mismatch between getBlockWithTxs ({:?}) and getBlockWithTxHashes ({:?})",
+            txs_view.state_root, hashes_view.state_root
         ));
     }
     if hashes_view.transaction_hashes != txs_view.transaction_hashes {
@@ -1473,6 +1507,32 @@ fn parse_state_root_from_state_update(state_update: &Value) -> Result<String, St
     StarknetFelt::from_str(&normalized_root)
         .map(|felt| format!("{:#x}", felt))
         .map_err(|error| format!("invalid state_update new_root `{new_root_raw}`: {error}"))
+}
+
+fn parse_state_update_block_hash(state_update: &Value) -> Result<Option<String>, String> {
+    let Some(block_hash_raw) = state_update.get("block_hash").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let normalized_hash = if let Some(raw) = block_hash_raw.strip_prefix("0X") {
+        format!("0x{raw}")
+    } else {
+        block_hash_raw.to_string()
+    };
+    StarknetFelt::from_str(&normalized_hash)
+        .map(|felt| Some(format!("{:#x}", felt)))
+        .map_err(|error| format!("invalid state_update block_hash `{block_hash_raw}`: {error}"))
+}
+
+fn parse_optional_block_state_root(
+    block_payload: &Value,
+    method: &str,
+) -> Result<Option<String>, String> {
+    let Some(state_root_raw) = block_payload.get("state_root").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    StarknetFelt::from_str(state_root_raw)
+        .map(|felt| Some(format!("{:#x}", felt)))
+        .map_err(|error| format!("invalid {method} state_root `{state_root_raw}`: {error}"))
 }
 
 fn parse_storage_diffs(raw: &Value, diff: &mut StarknetStateDiff, warnings: &mut Vec<String>) {
@@ -1985,6 +2045,7 @@ mod tests {
                 external_block_number,
                 block_hash: block_hash.to_string(),
                 parent_hash: parent_hash.to_string(),
+                state_root: Some("0x10".to_string()),
                 sequencer_address: "0x1".to_string(),
                 timestamp: 1_700_000_000 + external_block_number,
                 transaction_hashes: vec!["0x111".to_string()],
@@ -2042,6 +2103,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_block_with_txs_parses_optional_state_root() {
+        let block = json!({
+            "block_number": 12,
+            "block_hash": "0xabc",
+            "parent_hash": "0x123",
+            "state_root": "0x00ff",
+            "sequencer_address": "0x1",
+            "timestamp": 1_700_000_012_u64,
+            "transactions": [{"transaction_hash": "0x1"}]
+        });
+
+        let mut warnings = Vec::new();
+        let parsed = parse_block_with_txs(&block, &mut warnings).expect("must parse");
+        assert_eq!(parsed.state_root, Some("0xff".to_string()));
+    }
+
+    #[test]
     fn parse_block_with_tx_hashes_parses_hash_array() {
         let block = json!({
             "block_number": 12,
@@ -2081,6 +2159,7 @@ mod tests {
             external_block_number: 7,
             block_hash: "0xaaa".to_string(),
             parent_hash: "0xbbb".to_string(),
+            state_root: Some("0x111".to_string()),
             sequencer_address: "0x1".to_string(),
             timestamp: 1_700_000_007,
             transaction_hashes: vec!["0x1".to_string(), "0x2".to_string()],
@@ -2089,14 +2168,16 @@ mod tests {
             external_block_number: 7,
             block_hash: "0xccc".to_string(),
             parent_hash: "0xbbb".to_string(),
+            state_root: Some("0x222".to_string()),
             transaction_hashes: vec!["0x1".to_string()],
         };
 
         let mut warnings = Vec::new();
         compare_block_views(&txs_view, &hashes_view, &mut warnings);
-        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings.len(), 3);
         assert!(warnings[0].contains("block hash mismatch"));
-        assert!(warnings[1].contains("transaction hash list mismatch"));
+        assert!(warnings[1].contains("state root mismatch"));
+        assert!(warnings[2].contains("transaction hash list mismatch"));
     }
 
     #[test]
@@ -2132,6 +2213,30 @@ mod tests {
         let error = parse_state_root_from_state_update(&state_update)
             .expect_err("missing new_root must fail closed");
         assert!(error.contains("missing new_root"));
+    }
+
+    #[test]
+    fn parse_state_update_block_hash_parses_optional_hash() {
+        let state_update = json!({
+            "block_hash": "0X0abc",
+            "new_root": "0x1",
+            "state_diff": {}
+        });
+        let parsed =
+            parse_state_update_block_hash(&state_update).expect("block_hash parsing should work");
+        assert_eq!(parsed, Some("0xabc".to_string()));
+    }
+
+    #[test]
+    fn parse_state_update_block_hash_rejects_invalid_hash() {
+        let state_update = json!({
+            "block_hash": "invalid",
+            "new_root": "0x1",
+            "state_diff": {}
+        });
+        let error =
+            parse_state_update_block_hash(&state_update).expect_err("invalid block_hash must fail");
+        assert!(error.contains("invalid state_update block_hash"));
     }
 
     #[test]
