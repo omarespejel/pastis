@@ -158,19 +158,19 @@ fn parse_upstream_rpc_urls(raw: &str) -> Result<Vec<String>, String> {
         }
         validate_upstream_rpc_url(candidate)?;
         if seen.insert(candidate.to_string()) {
+            if urls.len().saturating_add(1) > MAX_UPSTREAM_RPC_ENDPOINTS {
+                return Err(format!(
+                    "upstream_rpc_url config has {} endpoints; max supported is {}",
+                    urls.len().saturating_add(1),
+                    MAX_UPSTREAM_RPC_ENDPOINTS
+                ));
+            }
             urls.push(candidate.to_string());
         }
     }
 
     if urls.is_empty() {
         return Err("upstream_rpc_url must include at least one valid URL".to_string());
-    }
-    if urls.len() > MAX_UPSTREAM_RPC_ENDPOINTS {
-        return Err(format!(
-            "upstream_rpc_url config has {} endpoints; max supported is {}",
-            urls.len(),
-            MAX_UPSTREAM_RPC_ENDPOINTS
-        ));
     }
     Ok(urls)
 }

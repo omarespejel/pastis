@@ -1415,19 +1415,19 @@ fn parse_upstream_rpc_urls(raw: &str) -> Result<Vec<String>, String> {
             return Err("invalid upstream RPC URL entry: host is required".to_string());
         }
         if seen.insert(candidate.to_string()) {
+            if urls.len().saturating_add(1) > MAX_UPSTREAM_RPC_ENDPOINTS {
+                return Err(format!(
+                    "invalid upstream RPC URL list: {} endpoints configured; max supported is {}",
+                    urls.len().saturating_add(1),
+                    MAX_UPSTREAM_RPC_ENDPOINTS
+                ));
+            }
             urls.push(candidate.to_string());
         }
     }
 
     if urls.is_empty() {
         return Err("invalid upstream RPC URL list: no valid URLs provided".to_string());
-    }
-    if urls.len() > MAX_UPSTREAM_RPC_ENDPOINTS {
-        return Err(format!(
-            "invalid upstream RPC URL list: {} endpoints configured; max supported is {}",
-            urls.len(),
-            MAX_UPSTREAM_RPC_ENDPOINTS
-        ));
     }
     Ok(urls)
 }
