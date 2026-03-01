@@ -704,16 +704,22 @@ where
     }
 
     let mut reachable = 0usize;
-    let chunk_size = endpoints.len().clamp(1, MAX_BOOTNODE_PROBE_CONCURRENCY);
-    for chunk in endpoints.chunks(chunk_size) {
-        let mut probes = tokio::task::JoinSet::new();
-        for endpoint in chunk {
-            probes.spawn(probe(endpoint.clone(), timeout));
+    let max_in_flight = endpoints.len().clamp(1, MAX_BOOTNODE_PROBE_CONCURRENCY);
+    let mut next_endpoint = endpoints.iter().cloned();
+    let mut probes = tokio::task::JoinSet::new();
+
+    for _ in 0..max_in_flight {
+        if let Some(endpoint) = next_endpoint.next() {
+            probes.spawn(probe(endpoint, timeout));
         }
-        while let Some(result) = probes.join_next().await {
-            if let Ok(true) = result {
-                reachable = reachable.saturating_add(1);
-            }
+    }
+
+    while let Some(result) = probes.join_next().await {
+        if let Ok(true) = result {
+            reachable = reachable.saturating_add(1);
+        }
+        if let Some(endpoint) = next_endpoint.next() {
+            probes.spawn(probe(endpoint, timeout));
         }
     }
     reachable
@@ -1607,7 +1613,7 @@ environment:\n\
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::time::Instant;
 
     use axum::body::to_bytes;
@@ -1809,6 +1815,57 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(350),
             "expected bounded-concurrency probe to finish quickly, elapsed={elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn probe_bootnodes_streams_work_without_chunk_barriers() {
+        let endpoint_count = MAX_BOOTNODE_PROBE_CONCURRENCY as u16 + 2;
+        let base_port = 20_000_u16;
+        let endpoints = (0..endpoint_count)
+            .map(|idx| {
+                BootnodeEndpoint::Socket(SocketAddr::from((
+                    [127, 0, 0, 1],
+                    base_port.saturating_add(idx),
+                )))
+            })
+            .collect::<Vec<_>>();
+
+        let slow_finished = Arc::new(AtomicBool::new(false));
+        let late_started_before_slow_finished = Arc::new(AtomicBool::new(false));
+        let probe = {
+            let slow_finished = Arc::clone(&slow_finished);
+            let late_started_before_slow_finished = Arc::clone(&late_started_before_slow_finished);
+            move |endpoint: BootnodeEndpoint, _timeout: Duration| {
+                let slow_finished = Arc::clone(&slow_finished);
+                let late_started_before_slow_finished =
+                    Arc::clone(&late_started_before_slow_finished);
+                async move {
+                    let BootnodeEndpoint::Socket(addr) = endpoint else {
+                        return false;
+                    };
+                    let index = addr.port().saturating_sub(base_port);
+                    if index == 0 {
+                        tokio::time::sleep(Duration::from_millis(120)).await;
+                        slow_finished.store(true, Ordering::SeqCst);
+                        return true;
+                    }
+                    if index >= MAX_BOOTNODE_PROBE_CONCURRENCY as u16
+                        && !slow_finished.load(Ordering::SeqCst)
+                    {
+                        late_started_before_slow_finished.store(true, Ordering::SeqCst);
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    true
+                }
+            }
+        };
+
+        let reachable = probe_bootnodes_with(&endpoints, Duration::from_millis(1), &probe).await;
+        assert_eq!(reachable, endpoints.len());
+        assert!(
+            late_started_before_slow_finished.load(Ordering::SeqCst),
+            "expected post-initial probes to start before the slow first probe completed"
         );
     }
 
