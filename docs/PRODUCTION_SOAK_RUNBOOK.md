@@ -22,6 +22,7 @@ Example (6h):
 ```
 
 Default run length if omitted: 60 minutes.
+Default startup wait is 900 seconds (configurable with `--startup-timeout-seconds`).
 
 ## 3. Output Artifacts
 

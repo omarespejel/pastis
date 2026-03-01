@@ -11,6 +11,7 @@ Options:
   --rpc-url <url>                  Upstream Starknet RPC URL (or STARKNET_RPC_URL)
   --duration-minutes <n>           Soak duration in minutes (default: 60)
   --poll-seconds <n>               Poll interval for health/status checks (default: 15)
+  --startup-timeout-seconds <n>    Max wait for daemon endpoint startup (default: 900)
   --daemon-bind <host:port>        Daemon bind address (default: 127.0.0.1:9545)
   --auth-token <token>             Daemon bearer token (default: pastis-soak-token)
   --state-dir <path>               State directory (default: .pastis/soak-daemon)
@@ -23,6 +24,7 @@ Environment overrides:
   STARKNET_RPC_URL
   PASTIS_SOAK_DURATION_MINUTES
   PASTIS_SOAK_POLL_SECONDS
+  PASTIS_SOAK_STARTUP_TIMEOUT_SECONDS
   PASTIS_SOAK_DAEMON_BIND
   PASTIS_SOAK_AUTH_TOKEN
   PASTIS_SOAK_STATE_DIR
@@ -139,6 +141,7 @@ cd "$ROOT_DIR"
 UPSTREAM_RPC_URL="${STARKNET_RPC_URL:-}"
 DURATION_MINUTES="${PASTIS_SOAK_DURATION_MINUTES:-60}"
 POLL_SECONDS="${PASTIS_SOAK_POLL_SECONDS:-15}"
+STARTUP_TIMEOUT_SECONDS="${PASTIS_SOAK_STARTUP_TIMEOUT_SECONDS:-900}"
 DAEMON_BIND="${PASTIS_SOAK_DAEMON_BIND:-127.0.0.1:9545}"
 DAEMON_TOKEN="${PASTIS_SOAK_AUTH_TOKEN:-pastis-soak-token}"
 STATE_DIR="${PASTIS_SOAK_STATE_DIR:-${ROOT_DIR}/.pastis/soak-daemon}"
@@ -160,6 +163,11 @@ while [[ $# -gt 0 ]]; do
     --poll-seconds)
       [[ $# -ge 2 ]] || { echo "--poll-seconds requires a value" >&2; exit 1; }
       POLL_SECONDS="$2"
+      shift 2
+      ;;
+    --startup-timeout-seconds)
+      [[ $# -ge 2 ]] || { echo "--startup-timeout-seconds requires a value" >&2; exit 1; }
+      STARTUP_TIMEOUT_SECONDS="$2"
       shift 2
       ;;
     --daemon-bind)
@@ -217,6 +225,10 @@ if [[ ! "$POLL_SECONDS" =~ ^[0-9]+$ ]] || [[ "$POLL_SECONDS" -eq 0 ]]; then
   echo "error: --poll-seconds must be a positive integer" >&2
   exit 1
 fi
+if [[ ! "$STARTUP_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || [[ "$STARTUP_TIMEOUT_SECONDS" -eq 0 ]]; then
+  echo "error: --startup-timeout-seconds must be a positive integer" >&2
+  exit 1
+fi
 
 mkdir -p "$STATE_DIR"
 CHECKPOINT_PATH="$STATE_DIR/replay-checkpoint.json"
@@ -241,6 +253,7 @@ echo "daemon_chain_id: $CHAIN_ID"
 echo "daemon_bind: $DAEMON_BIND"
 echo "duration_minutes: $DURATION_MINUTES"
 echo "poll_seconds: $POLL_SECONDS"
+echo "startup_timeout_seconds: $STARTUP_TIMEOUT_SECONDS"
 echo "allow_synthetic_fallback: $ALLOW_SYNTHETIC_FALLBACK"
 echo "state_dir: $STATE_DIR"
 
@@ -273,7 +286,7 @@ cleanup() {
 trap cleanup EXIT
 
 # Wait for endpoint reachability.
-for _ in $(seq 1 120); do
+for _ in $(seq 1 "$STARTUP_TIMEOUT_SECONDS"); do
   if [[ "$(http_code "http://$DAEMON_BIND/healthz")" != "000" ]]; then
     break
   fi
