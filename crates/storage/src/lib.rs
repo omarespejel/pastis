@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
+use serde::{Deserialize, Serialize};
+
 #[cfg(feature = "apollo-adapter")]
 use apollo_storage::body::BodyStorageReader;
 #[cfg(feature = "apollo-adapter")]
@@ -27,14 +29,13 @@ use starknet_api::state::ThinStateDiff as ApolloThinStateDiff;
 use starknet_api::state::{StateNumber as ApolloStateNumber, StorageKey as ApolloStorageKey};
 
 #[cfg(feature = "apollo-adapter")]
-use starknet_node_types::ContractAddress;
-#[cfg(feature = "apollo-adapter")]
 use starknet_node_types::StateReadError;
 #[cfg(feature = "apollo-adapter")]
 use starknet_node_types::{BlockGasPrices, GasPricePerToken};
 use starknet_node_types::{
-    BlockId, BlockNumber, ComponentHealth, HealthCheck, HealthStatus, InMemoryState, StarknetBlock,
-    StarknetFelt, StarknetReceipt, StarknetStateDiff, StarknetTransaction, StateReader, TxHash,
+    BlockId, BlockNumber, ComponentHealth, ContractAddress, HealthCheck, HealthStatus,
+    InMemoryState, StarknetBlock, StarknetFelt, StarknetReceipt, StarknetStateDiff,
+    StarknetTransaction, StateReader, TxHash,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -204,6 +205,14 @@ impl<S> ThreadSafeStorage<S> {
             inner: Arc::new(RwLock::new(inner)),
         }
     }
+
+    pub fn with_read<T>(&self, f: impl FnOnce(&S) -> T) -> Result<T, StorageError> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| StorageError::UnsupportedOperation("thread-safe storage lock poisoned"))?;
+        Ok(f(&guard))
+    }
 }
 
 impl<S: StorageBackend> HealthCheck for ThreadSafeStorage<S> {
@@ -367,6 +376,39 @@ pub struct InMemoryStorage {
     receipts: BTreeMap<BlockNumber, Vec<StarknetReceipt>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InMemoryStateSnapshot {
+    pub storage: BTreeMap<ContractAddress, BTreeMap<String, StarknetFelt>>,
+    pub nonces: BTreeMap<ContractAddress, StarknetFelt>,
+}
+
+impl From<&InMemoryState> for InMemoryStateSnapshot {
+    fn from(value: &InMemoryState) -> Self {
+        Self {
+            storage: (*value.storage).clone(),
+            nonces: (*value.nonces).clone(),
+        }
+    }
+}
+
+impl From<InMemoryStateSnapshot> for InMemoryState {
+    fn from(value: InMemoryStateSnapshot) -> Self {
+        Self {
+            storage: Arc::new(value.storage),
+            nonces: Arc::new(value.nonces),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InMemoryStorageSnapshot {
+    pub blocks: BTreeMap<BlockNumber, StarknetBlock>,
+    pub block_hashes: BTreeMap<BlockNumber, String>,
+    pub state_diffs: BTreeMap<BlockNumber, StarknetStateDiff>,
+    pub states: BTreeMap<BlockNumber, InMemoryStateSnapshot>,
+    pub receipts: BTreeMap<BlockNumber, Vec<StarknetReceipt>>,
+}
+
 impl InMemoryStorage {
     pub fn new(genesis_state: InMemoryState) -> Self {
         let mut states = BTreeMap::new();
@@ -380,6 +422,158 @@ impl InMemoryStorage {
             receipt_index: BTreeMap::new(),
             receipts: BTreeMap::new(),
         }
+    }
+
+    pub fn export_snapshot(&self) -> InMemoryStorageSnapshot {
+        InMemoryStorageSnapshot {
+            blocks: self.blocks.clone(),
+            block_hashes: self.block_hashes.clone(),
+            state_diffs: self.state_diffs.clone(),
+            states: self
+                .states
+                .iter()
+                .map(|(number, state)| (*number, InMemoryStateSnapshot::from(state)))
+                .collect(),
+            receipts: self.receipts.clone(),
+        }
+    }
+
+    pub fn from_snapshot(snapshot: InMemoryStorageSnapshot) -> Result<Self, StorageError> {
+        let mut states: BTreeMap<BlockNumber, InMemoryState> = snapshot
+            .states
+            .into_iter()
+            .map(|(number, state)| (number, state.into()))
+            .collect();
+        states.entry(0).or_default();
+        let mut storage = Self {
+            blocks: snapshot.blocks,
+            block_hashes: snapshot.block_hashes,
+            state_diffs: snapshot.state_diffs,
+            states,
+            tx_index: BTreeMap::new(),
+            receipt_index: BTreeMap::new(),
+            receipts: snapshot.receipts,
+        };
+        storage.validate_snapshot_shape()?;
+        storage.rebuild_indexes_from_blocks()?;
+        Ok(storage)
+    }
+
+    fn validate_snapshot_shape(&self) -> Result<(), StorageError> {
+        let latest = self.blocks.keys().next_back().copied().unwrap_or(0);
+        for expected in 1..=latest {
+            if !self.blocks.contains_key(&expected) {
+                return Err(StorageError::IndexInconsistency(format!(
+                    "snapshot missing block {expected}"
+                )));
+            }
+            if !self.state_diffs.contains_key(&expected) {
+                return Err(StorageError::IndexInconsistency(format!(
+                    "snapshot missing state diff for block {expected}"
+                )));
+            }
+            if !self.states.contains_key(&expected) {
+                return Err(StorageError::IndexInconsistency(format!(
+                    "snapshot missing state snapshot for block {expected}"
+                )));
+            }
+            if !self.receipts.contains_key(&expected) {
+                return Err(StorageError::IndexInconsistency(format!(
+                    "snapshot missing receipts for block {expected}"
+                )));
+            }
+        }
+        if !self.states.contains_key(&0) {
+            return Err(StorageError::IndexInconsistency(
+                "snapshot missing genesis state (block 0)".to_string(),
+            ));
+        }
+
+        for number in self.state_diffs.keys() {
+            if *number == 0 || !self.blocks.contains_key(number) {
+                return Err(StorageError::IndexInconsistency(format!(
+                    "snapshot state_diffs contains non-canonical block key {number}"
+                )));
+            }
+        }
+        for number in self.receipts.keys() {
+            if *number == 0 || !self.blocks.contains_key(number) {
+                return Err(StorageError::IndexInconsistency(format!(
+                    "snapshot receipts contains non-canonical block key {number}"
+                )));
+            }
+        }
+        for number in self.block_hashes.keys() {
+            if *number == 0 || !self.blocks.contains_key(number) {
+                return Err(StorageError::IndexInconsistency(format!(
+                    "snapshot block_hashes contains non-canonical block key {number}"
+                )));
+            }
+        }
+        for number in self.states.keys() {
+            if *number > latest {
+                return Err(StorageError::IndexInconsistency(format!(
+                    "snapshot states contains out-of-range block key {number} (latest={latest})"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn rebuild_indexes_from_blocks(&mut self) -> Result<(), StorageError> {
+        self.tx_index.clear();
+        self.receipt_index.clear();
+        for (block_number, block) in &self.blocks {
+            if block.number != *block_number {
+                return Err(StorageError::IndexInconsistency(format!(
+                    "snapshot block key {block_number} does not match payload number {}",
+                    block.number
+                )));
+            }
+            block
+                .validate()
+                .map_err(|error| StorageError::InvalidBlock(error.to_string()))?;
+
+            let receipts = self.receipts.get(block_number).ok_or_else(|| {
+                StorageError::IndexInconsistency(format!(
+                    "missing receipts for block {block_number}"
+                ))
+            })?;
+            if receipts.len() != block.transactions.len() {
+                return Err(StorageError::ReceiptCountMismatch {
+                    block: *block_number,
+                    tx_count: block.transactions.len(),
+                    receipt_count: receipts.len(),
+                });
+            }
+            for (index, tx) in block.transactions.iter().enumerate() {
+                if let Some((existing_block, _)) = self.tx_index.get(&tx.hash) {
+                    return Err(StorageError::DuplicateTransactionHash {
+                        hash: tx.hash.clone(),
+                        existing_block: *existing_block,
+                        new_block: *block_number,
+                    });
+                }
+                let receipt = receipts.get(index).ok_or_else(|| {
+                    StorageError::IndexInconsistency(format!(
+                        "missing receipt index {index} for block {block_number}"
+                    ))
+                })?;
+                if receipt.tx_hash != tx.hash {
+                    return Err(StorageError::ReceiptHashMismatch {
+                        block: *block_number,
+                        index,
+                        expected: tx.hash.clone(),
+                        actual: receipt.tx_hash.clone(),
+                    });
+                }
+                self.tx_index
+                    .insert(tx.hash.clone(), (*block_number, index));
+                self.receipt_index
+                    .insert(receipt.tx_hash.clone(), (*block_number, index));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1533,6 +1727,56 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn in_memory_storage_snapshot_roundtrip_preserves_chain_and_receipts() {
+        let mut original = InMemoryStorage::new(InMemoryState::default());
+        original
+            .insert_block_with_metadata(
+                block(1),
+                StarknetStateDiff::default(),
+                Vec::new(),
+                Some("0xabc".to_string()),
+            )
+            .expect("insert block 1");
+        let block_2 = block(2);
+        let tx_hash = block_2.transactions[0].hash.clone();
+        original
+            .insert_block_with_metadata(
+                block_2,
+                StarknetStateDiff::default(),
+                vec![StarknetReceipt {
+                    tx_hash: tx_hash.clone(),
+                    execution_status: false,
+                    events: 4,
+                    gas_consumed: 99,
+                }],
+                Some("0xdef".to_string()),
+            )
+            .expect("insert block 2");
+
+        let snapshot = original.export_snapshot();
+        let restored =
+            InMemoryStorage::from_snapshot(snapshot).expect("snapshot roundtrip should restore");
+
+        assert_eq!(restored.latest_block_number().expect("latest"), 2);
+        assert_eq!(
+            restored.get_block_hash(1).expect("block hash lookup"),
+            Some("0xabc".to_string())
+        );
+        assert_eq!(
+            restored.get_block_hash(2).expect("block hash lookup"),
+            Some("0xdef".to_string())
+        );
+        let receipt = restored
+            .get_transaction_receipt(&tx_hash)
+            .expect("receipt lookup")
+            .expect("receipt should exist")
+            .2;
+        assert!(!receipt.execution_status);
+        assert_eq!(receipt.events, 4);
+        assert_eq!(receipt.gas_consumed, 99);
     }
 
     #[test]

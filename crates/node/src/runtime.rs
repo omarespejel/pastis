@@ -8,6 +8,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bincode::Options;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -20,7 +21,10 @@ use crate::{ChainId, NodeConfig, StarknetNode, StarknetNodeBuilder};
 use starknet_node_execution::{
     DualExecutionBackend, ExecutionBackend, ExecutionError, ExecutionMode, MismatchPolicy,
 };
-use starknet_node_storage::{InMemoryStorage, StorageBackend, ThreadSafeStorage};
+use starknet_node_storage::{
+    InMemoryStateSnapshot, InMemoryStorage, InMemoryStorageSnapshot, StorageBackend,
+    ThreadSafeStorage,
+};
 use starknet_node_types::{
     BlockContext, BlockGasPrices, BuiltinStats, ClassHash, ContractAddress, ExecutionOutput,
     GasPricePerToken, InMemoryState, MutableState, SimulationResult, StarknetBlock, StarknetFelt,
@@ -37,10 +41,13 @@ pub const DEFAULT_CHAIN_ID_REVALIDATE_POLLS: u64 = 64;
 const MAX_UPSTREAM_RPC_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LOCAL_JOURNAL_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_LOCAL_JOURNAL_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RUNTIME_STORAGE_SNAPSHOT_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_RECENT_ERRORS: usize = 128;
 const MAX_RPC_ERROR_CONTEXT_CHARS: usize = 1_024;
 const MAX_RUNTIME_ERROR_CHARS: usize = 2_048;
 const UPSTREAM_REQUEST_ID: u64 = 1;
+const RUNTIME_STORAGE_SNAPSHOT_VERSION: u32 = 1;
+pub const DEFAULT_STORAGE_SNAPSHOT_INTERVAL_BLOCKS: u64 = 128;
 
 #[derive(Debug, Clone)]
 pub struct RpcRetryConfig {
@@ -72,6 +79,8 @@ pub struct RuntimeConfig {
     pub peer_count_hint: usize,
     pub require_peers: bool,
     pub local_journal_path: Option<String>,
+    pub storage_snapshot_path: Option<String>,
+    pub storage_snapshot_interval_blocks: u64,
     pub storage: Option<ThreadSafeStorage<InMemoryStorage>>,
 }
 
@@ -111,6 +120,14 @@ impl RuntimeConfig {
         {
             return Err("local_journal_path cannot be empty".to_string());
         }
+        if let Some(path) = self.storage_snapshot_path.as_deref()
+            && path.trim().is_empty()
+        {
+            return Err("storage_snapshot_path cannot be empty".to_string());
+        }
+        if self.storage_snapshot_path.is_some() && self.storage_snapshot_interval_blocks == 0 {
+            return Err("storage_snapshot_interval_blocks must be > 0 when storage_snapshot_path is configured".to_string());
+        }
         Ok(())
     }
 }
@@ -144,6 +161,14 @@ pub struct RuntimeDiagnostics {
 }
 
 type RuntimeNode = StarknetNode<ThreadSafeStorage<InMemoryStorage>, DualExecutionBackend>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RuntimeStorageSnapshot {
+    version: u32,
+    local_tip: u64,
+    storage: InMemoryStorageSnapshot,
+    execution_state: InMemoryStateSnapshot,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalJournalEntry {
@@ -324,6 +349,157 @@ impl LocalChainJournal {
         })?;
         Ok(())
     }
+
+    fn clear(&self) -> Result<(), String> {
+        self.ensure_not_symlink()?;
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "failed to remove local journal {}: {error}",
+                self.path.display()
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeStorageSnapshotStore {
+    path: PathBuf,
+}
+
+impl RuntimeStorageSnapshotStore {
+    fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    fn ensure_not_symlink(&self) -> Result<(), String> {
+        match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(format!(
+                        "runtime storage snapshot {} must not be a symlink",
+                        self.path.display()
+                    ));
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "failed to inspect runtime storage snapshot {}: {error}",
+                self.path.display()
+            )),
+        }
+    }
+
+    fn load(&self) -> Result<Option<RuntimeStorageSnapshot>, String> {
+        self.ensure_not_symlink()?;
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let metadata = fs::metadata(&self.path).map_err(|error| {
+            format!(
+                "failed to inspect runtime storage snapshot {}: {error}",
+                self.path.display()
+            )
+        })?;
+        if metadata.len() > MAX_RUNTIME_STORAGE_SNAPSHOT_FILE_BYTES {
+            return Err(format!(
+                "runtime storage snapshot {} size {} exceeds max allowed {} bytes",
+                self.path.display(),
+                metadata.len(),
+                MAX_RUNTIME_STORAGE_SNAPSHOT_FILE_BYTES
+            ));
+        }
+        let raw = fs::read(&self.path).map_err(|error| {
+            format!(
+                "failed to read runtime storage snapshot {}: {error}",
+                self.path.display()
+            )
+        })?;
+        let options = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(MAX_RUNTIME_STORAGE_SNAPSHOT_FILE_BYTES);
+        let snapshot = options
+            .deserialize::<RuntimeStorageSnapshot>(&raw)
+            .map_err(|error| {
+                format!(
+                    "failed to decode runtime storage snapshot {}: {error}",
+                    self.path.display()
+                )
+            })?;
+        if snapshot.version != RUNTIME_STORAGE_SNAPSHOT_VERSION {
+            return Err(format!(
+                "unsupported runtime storage snapshot version {} at {} (expected {})",
+                snapshot.version,
+                self.path.display(),
+                RUNTIME_STORAGE_SNAPSHOT_VERSION
+            ));
+        }
+        Ok(Some(snapshot))
+    }
+
+    fn save(&self, snapshot: &RuntimeStorageSnapshot) -> Result<(), String> {
+        self.ensure_not_symlink()?;
+        let options = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(MAX_RUNTIME_STORAGE_SNAPSHOT_FILE_BYTES);
+        let encoded = options.serialize(snapshot).map_err(|error| {
+            format!(
+                "failed to encode runtime storage snapshot {}: {error}",
+                self.path.display()
+            )
+        })?;
+        if encoded.len() as u64 > MAX_RUNTIME_STORAGE_SNAPSHOT_FILE_BYTES {
+            return Err(format!(
+                "runtime storage snapshot {} encoded size {} exceeds max allowed {} bytes",
+                self.path.display(),
+                encoded.len(),
+                MAX_RUNTIME_STORAGE_SNAPSHOT_FILE_BYTES
+            ));
+        }
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "failed to create runtime storage snapshot directory {}: {error}",
+                    parent.display()
+                )
+            })?;
+        }
+        let tmp_path = self
+            .path
+            .with_extension(format!("tmp-{}", std::process::id()));
+        let mut tmp_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|error| {
+                format!(
+                    "failed to open temporary runtime storage snapshot {}: {error}",
+                    tmp_path.display()
+                )
+            })?;
+        tmp_file.write_all(&encoded).map_err(|error| {
+            format!(
+                "failed to write temporary runtime storage snapshot {}: {error}",
+                tmp_path.display()
+            )
+        })?;
+        tmp_file.sync_data().map_err(|error| {
+            format!(
+                "failed to fsync temporary runtime storage snapshot {}: {error}",
+                tmp_path.display()
+            )
+        })?;
+        fs::rename(&tmp_path, &self.path).map_err(|error| {
+            format!(
+                "failed to atomically replace runtime storage snapshot {}: {error}",
+                self.path.display()
+            )
+        })?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -455,6 +631,8 @@ pub struct NodeRuntime {
     diagnostics: RuntimeDiagnostics,
     recent_errors: VecDeque<String>,
     sync_progress: Arc<Mutex<SyncProgress>>,
+    snapshot_store: Option<RuntimeStorageSnapshotStore>,
+    snapshot_interval_blocks: u64,
     chain_id_validated: bool,
     chain_id_revalidate_polls: u64,
     polls_since_chain_id_validation: u64,
@@ -488,26 +666,44 @@ impl NodeRuntime {
             config.replay_checkpoint_path.as_deref(),
         )
         .map_err(|error| format!("failed to initialize replay pipeline: {error}"))?;
-        let storage = config.storage.clone().unwrap_or_else(|| {
-            ThreadSafeStorage::new(InMemoryStorage::new(InMemoryState::default()))
-        });
-        let mut node = build_runtime_node(config.chain_id.clone(), storage);
         let mut execution_state = InMemoryState::default();
+        let snapshot_store = config
+            .storage_snapshot_path
+            .as_deref()
+            .map(RuntimeStorageSnapshotStore::new);
+        let storage = if let Some(storage) = config.storage.clone() {
+            storage
+        } else if let Some(store) = snapshot_store.as_ref() {
+            match store.load()? {
+                Some(snapshot) => {
+                    execution_state = snapshot.execution_state.into();
+                    let restored =
+                        InMemoryStorage::from_snapshot(snapshot.storage).map_err(|error| {
+                            format!("failed to restore storage from runtime snapshot: {error}")
+                        })?;
+                    ThreadSafeStorage::new(restored)
+                }
+                None => ThreadSafeStorage::new(InMemoryStorage::new(InMemoryState::default())),
+            }
+        } else {
+            ThreadSafeStorage::new(InMemoryStorage::new(InMemoryState::default()))
+        };
+        let mut node = build_runtime_node(config.chain_id.clone(), storage);
         let journal = config
             .local_journal_path
             .as_deref()
             .map(LocalChainJournal::new);
         if let Some(journal) = journal.as_ref() {
             let target_local_blocks = replay.next_local_block().saturating_sub(1);
-            let restored = restore_storage_from_journal(
+            let restored_tip = restore_storage_from_journal(
                 &mut node,
                 &mut execution_state,
                 journal,
                 Some(target_local_blocks),
             )?;
-            if restored < target_local_blocks {
+            if restored_tip < target_local_blocks {
                 return Err(format!(
-                    "local journal {} has {restored} entries but replay checkpoint requires {target_local_blocks}",
+                    "local journal {} restored to local block {restored_tip} but replay checkpoint requires {target_local_blocks}",
                     journal.path().display()
                 ));
             }
@@ -572,6 +768,12 @@ impl NodeRuntime {
             diagnostics: RuntimeDiagnostics::default(),
             recent_errors: VecDeque::new(),
             sync_progress: Arc::new(Mutex::new(progress)),
+            snapshot_store,
+            snapshot_interval_blocks: if config.storage_snapshot_interval_blocks == 0 {
+                DEFAULT_STORAGE_SNAPSHOT_INTERVAL_BLOCKS
+            } else {
+                config.storage_snapshot_interval_blocks
+            },
             chain_id_validated: false,
             chain_id_revalidate_polls: config.chain_id_revalidate_polls,
             polls_since_chain_id_validation: 0,
@@ -788,6 +990,14 @@ impl NodeRuntime {
                 .diagnostics
                 .replayed_tx_count
                 .saturating_add(fetch.replay.transaction_hashes.len() as u64);
+            if let Err(error) = self.maybe_persist_storage_snapshot(local_block_number) {
+                self.diagnostics.journal_failures =
+                    self.diagnostics.journal_failures.saturating_add(1);
+                let sanitized = sanitize_error_message(&error, MAX_RUNTIME_ERROR_CHARS);
+                push_recent_error(&mut self.recent_errors, sanitized.clone());
+                self.diagnostics.recent_errors = self.recent_errors.iter().cloned().collect();
+                eprintln!("warning: {sanitized}");
+            }
 
             self.update_sync_progress(|progress| {
                 progress.current_block = external_block;
@@ -895,6 +1105,33 @@ impl NodeRuntime {
         let base_ms = self.retry.base_backoff.as_millis();
         let backoff_ms = base_ms.saturating_mul(factor).min(5_000);
         Duration::from_millis(backoff_ms as u64)
+    }
+
+    fn maybe_persist_storage_snapshot(&mut self, local_block_number: u64) -> Result<(), String> {
+        let Some(store) = self.snapshot_store.as_ref() else {
+            return Ok(());
+        };
+        if local_block_number == 0
+            || !local_block_number.is_multiple_of(self.snapshot_interval_blocks)
+        {
+            return Ok(());
+        }
+        let storage_snapshot = self
+            .node
+            .storage
+            .with_read(|inner| inner.export_snapshot())
+            .map_err(|error| format!("failed to export storage snapshot: {error}"))?;
+        let snapshot = RuntimeStorageSnapshot {
+            version: RUNTIME_STORAGE_SNAPSHOT_VERSION,
+            local_tip: local_block_number,
+            storage: storage_snapshot,
+            execution_state: InMemoryStateSnapshot::from(&self.execution_state),
+        };
+        store.save(&snapshot)?;
+        if let Some(journal) = &self.journal {
+            journal.clear()?;
+        }
+        Ok(())
     }
 
     fn record_failure(&mut self, message: String) {
@@ -1261,16 +1498,23 @@ fn restore_storage_from_journal(
     node: &mut RuntimeNode,
     execution_state: &mut InMemoryState,
     journal: &LocalChainJournal,
-    max_entries: Option<u64>,
+    up_to_local_block: Option<u64>,
 ) -> Result<u64, String> {
-    let entries = journal.load_entries(max_entries)?;
-    let mut restored = 0_u64;
-    let mut expected = node
+    let entries = journal.load_entries(None)?;
+    let current_tip = node
         .storage
         .latest_block_number()
-        .map_err(|error| format!("failed to read storage tip while replaying journal: {error}"))?
-        .saturating_add(1);
+        .map_err(|error| format!("failed to read storage tip while replaying journal: {error}"))?;
+    let mut expected = current_tip.saturating_add(1);
     for (idx, entry) in entries.into_iter().enumerate() {
+        if let Some(limit) = up_to_local_block
+            && entry.block.number > limit
+        {
+            break;
+        }
+        if entry.block.number <= current_tip {
+            continue;
+        }
         if entry.block.number != expected {
             return Err(format!(
                 "local journal {} entry {} is non-sequential: expected block {}, found {}",
@@ -1301,10 +1545,11 @@ fn restore_storage_from_journal(
                 idx + 1
             )
         })?;
-        restored = restored.saturating_add(1);
         expected = expected.saturating_add(1);
     }
-    Ok(restored)
+    node.storage
+        .latest_block_number()
+        .map_err(|error| format!("failed to read storage tip after replaying journal: {error}"))
 }
 
 fn apply_state_diff_checked(
@@ -2469,6 +2714,8 @@ mod tests {
             peer_count_hint: 0,
             require_peers: false,
             local_journal_path: None,
+            storage_snapshot_path: None,
+            storage_snapshot_interval_blocks: DEFAULT_STORAGE_SNAPSHOT_INTERVAL_BLOCKS,
             storage: None,
         }
     }
@@ -3337,6 +3584,63 @@ mod tests {
             .clone();
         assert_eq!(progress.starting_block, 1);
         assert_eq!(progress.current_block, 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_restores_local_chain_from_storage_snapshot() {
+        let dir = tempdir().expect("tempdir");
+        let journal_path = dir.path().join("local-journal.jsonl");
+        let snapshot_path = dir.path().join("runtime-storage.snapshot");
+        let checkpoint_path = dir.path().join("replay-checkpoint.json");
+
+        let mut config = runtime_config();
+        config.local_journal_path = Some(journal_path.display().to_string());
+        config.storage_snapshot_path = Some(snapshot_path.display().to_string());
+        config.storage_snapshot_interval_blocks = 1;
+        config.replay_checkpoint_path = Some(checkpoint_path.display().to_string());
+
+        let consensus = Arc::new(HealthyConsensus);
+        let network = Arc::new(MockNetwork {
+            healthy: true,
+            peers: 3,
+        });
+        let mut runtime = NodeRuntime::new_with_backends(
+            config.clone(),
+            Arc::new(MockSyncSource::with_blocks(
+                "SN_MAIN",
+                1,
+                vec![sample_fetch(1, "0x0", "0x1")],
+            )),
+            consensus.clone(),
+            network.clone(),
+        )
+        .expect("runtime should initialize");
+        runtime.poll_once().await.expect("first poll should commit");
+        assert!(snapshot_path.exists());
+        assert!(!journal_path.exists());
+
+        let restarted = NodeRuntime::new_with_backends(
+            config,
+            Arc::new(MockSyncSource::with_blocks("SN_MAIN", 1, Vec::new())),
+            consensus,
+            network,
+        )
+        .expect("runtime should restore from storage snapshot");
+        assert_eq!(
+            restarted
+                .storage()
+                .latest_block_number()
+                .expect("restored storage read should work"),
+            1
+        );
+        let tx_hash = TxHash::parse("0x111").expect("sample tx hash must parse");
+        let (_, _, receipt) = restarted
+            .storage()
+            .get_transaction_receipt(&tx_hash)
+            .expect("receipt lookup should succeed")
+            .expect("restored receipt should exist");
+        assert_eq!(receipt.gas_consumed, 7);
+        assert!(receipt.execution_status);
     }
 
     #[tokio::test]

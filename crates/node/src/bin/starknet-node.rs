@@ -22,7 +22,8 @@ use starknet_node::ChainId;
 use starknet_node::runtime::{
     DEFAULT_CHAIN_ID_REVALIDATE_POLLS, DEFAULT_MAX_REPLAY_PER_POLL, DEFAULT_REPLAY_WINDOW,
     DEFAULT_RPC_MAX_RETRIES, DEFAULT_RPC_RETRY_BACKOFF_MS, DEFAULT_RPC_TIMEOUT_SECS,
-    DEFAULT_SYNC_POLL_MS, NodeRuntime, RpcRetryConfig, RuntimeConfig, SyncProgress,
+    DEFAULT_STORAGE_SNAPSHOT_INTERVAL_BLOCKS, DEFAULT_SYNC_POLL_MS, NodeRuntime, RpcRetryConfig,
+    RuntimeConfig, SyncProgress,
 };
 use starknet_node_rpc::{StarknetRpcServer, SyncStatus};
 use starknet_node_storage::{InMemoryStorage, ThreadSafeStorage};
@@ -30,6 +31,7 @@ use starknet_node_storage::{InMemoryStorage, ThreadSafeStorage};
 const DEFAULT_RPC_BIND: &str = "127.0.0.1:9545";
 const DEFAULT_REPLAY_CHECKPOINT_PATH: &str = ".pastis/node-replay-checkpoint.json";
 const DEFAULT_LOCAL_JOURNAL_PATH: &str = ".pastis/node-local-journal.jsonl";
+const DEFAULT_STORAGE_SNAPSHOT_PATH: &str = ".pastis/node-storage.snapshot";
 const DEFAULT_P2P_HEARTBEAT_MS: u64 = 30_000;
 const DEFAULT_RPC_MAX_CONCURRENCY: usize = 256;
 const DEFAULT_RPC_RATE_LIMIT_PER_MINUTE: u32 = 1_200;
@@ -51,6 +53,8 @@ struct DaemonConfig {
     chain_id_revalidate_polls: u64,
     replay_checkpoint_path: Option<String>,
     local_journal_path: Option<String>,
+    storage_snapshot_path: Option<String>,
+    storage_snapshot_interval_blocks: u64,
     rpc_timeout_secs: u64,
     rpc_max_retries: u32,
     rpc_retry_backoff_ms: u64,
@@ -200,6 +204,8 @@ async fn main() -> Result<(), String> {
         replay_checkpoint_path: config.replay_checkpoint_path.clone(),
         delete_checkpoints_on_zero_tip: false,
         local_journal_path: config.local_journal_path.clone(),
+        storage_snapshot_path: config.storage_snapshot_path.clone(),
+        storage_snapshot_interval_blocks: config.storage_snapshot_interval_blocks,
         poll_interval: Duration::from_millis(config.poll_ms),
         rpc_timeout: Duration::from_secs(config.rpc_timeout_secs),
         retry: RpcRetryConfig {
@@ -299,6 +305,13 @@ async fn main() -> Result<(), String> {
     println!("exit_on_unhealthy: {}", config.exit_on_unhealthy);
     if let Some(path) = &config.local_journal_path {
         println!("local_journal_path: {path}");
+    }
+    if let Some(path) = &config.storage_snapshot_path {
+        println!("storage_snapshot_path: {path}");
+        println!(
+            "storage_snapshot_interval_blocks: {}",
+            config.storage_snapshot_interval_blocks
+        );
     }
     println!("require_peers: {}", config.require_peers);
 
@@ -767,6 +780,8 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
     let mut cli_chain_id_revalidate_polls: Option<u64> = None;
     let mut cli_replay_checkpoint_path: Option<String> = None;
     let mut cli_local_journal_path: Option<String> = None;
+    let mut cli_storage_snapshot_path: Option<String> = None;
+    let mut cli_storage_snapshot_interval_blocks: Option<u64> = None;
     let mut cli_rpc_timeout_secs: Option<u64> = None;
     let mut cli_rpc_max_retries: Option<u32> = None;
     let mut cli_rpc_retry_backoff_ms: Option<u64> = None;
@@ -845,6 +860,21 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
                     args.next()
                         .ok_or_else(|| "--local-journal requires a value".to_string())?,
                 );
+            }
+            "--storage-snapshot" => {
+                cli_storage_snapshot_path = Some(
+                    args.next()
+                        .ok_or_else(|| "--storage-snapshot requires a value".to_string())?,
+                );
+            }
+            "--storage-snapshot-interval-blocks" => {
+                let raw = args.next().ok_or_else(|| {
+                    "--storage-snapshot-interval-blocks requires a value".to_string()
+                })?;
+                cli_storage_snapshot_interval_blocks = Some(parse_positive_u64(
+                    &raw,
+                    "--storage-snapshot-interval-blocks",
+                )?);
             }
             "--rpc-timeout-secs" => {
                 let raw = args
@@ -994,6 +1024,11 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         Some(value) => value,
         None => parse_env_u64("PASTIS_P2P_HEARTBEAT_MS")?.unwrap_or(DEFAULT_P2P_HEARTBEAT_MS),
     };
+    let storage_snapshot_interval_blocks = match cli_storage_snapshot_interval_blocks {
+        Some(value) => value,
+        None => parse_env_u64("PASTIS_STORAGE_SNAPSHOT_INTERVAL_BLOCKS")?
+            .unwrap_or(DEFAULT_STORAGE_SNAPSHOT_INTERVAL_BLOCKS),
+    };
     let health_max_consecutive_failures = parse_env_u64("PASTIS_HEALTH_MAX_CONSECUTIVE_FAILURES")?
         .unwrap_or(DEFAULT_HEALTH_MAX_CONSECUTIVE_FAILURES);
     let health_max_sync_lag_blocks = parse_env_u64("PASTIS_HEALTH_MAX_SYNC_LAG_BLOCKS")?
@@ -1036,6 +1071,10 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         local_journal_path: cli_local_journal_path
             .or_else(|| env::var("PASTIS_LOCAL_JOURNAL_PATH").ok())
             .or_else(|| Some(DEFAULT_LOCAL_JOURNAL_PATH.to_string())),
+        storage_snapshot_path: cli_storage_snapshot_path
+            .or_else(|| env::var("PASTIS_STORAGE_SNAPSHOT_PATH").ok())
+            .or_else(|| Some(DEFAULT_STORAGE_SNAPSHOT_PATH.to_string())),
+        storage_snapshot_interval_blocks,
         rpc_timeout_secs,
         rpc_max_retries,
         rpc_retry_backoff_ms,
@@ -1322,6 +1361,9 @@ options:\n\
   --chain-id-revalidate-polls <n>    Polls between upstream chain-id checks (default: {DEFAULT_CHAIN_ID_REVALIDATE_POLLS})\n\
   --replay-checkpoint <path>         Replay checkpoint file path\n\
   --local-journal <path>             Local block/state journal path\n\
+  --storage-snapshot <path>          Runtime storage snapshot path\n\
+  --storage-snapshot-interval-blocks <n>\n\
+                                     Snapshot every N committed local blocks (default: {DEFAULT_STORAGE_SNAPSHOT_INTERVAL_BLOCKS})\n\
   --rpc-timeout-secs <secs>          Upstream RPC timeout\n\
   --rpc-max-retries <n>              Upstream RPC max retries\n\
   --rpc-retry-backoff-ms <ms>        Retry backoff base\n\
@@ -1343,6 +1385,8 @@ environment:\n\
   PASTIS_CHAIN_ID_REVALIDATE_POLLS   Polls between upstream chain-id checks\n\
   PASTIS_REPLAY_CHECKPOINT_PATH      Replay checkpoint path\n\
   PASTIS_LOCAL_JOURNAL_PATH          Local block/state journal path\n\
+  PASTIS_STORAGE_SNAPSHOT_PATH       Runtime storage snapshot path\n\
+  PASTIS_STORAGE_SNAPSHOT_INTERVAL_BLOCKS   Snapshot every N committed local blocks\n\
   PASTIS_RPC_TIMEOUT_SECS            Upstream RPC timeout seconds\n\
   PASTIS_RPC_MAX_RETRIES             Upstream RPC max retries\n\
   PASTIS_RPC_RETRY_BACKOFF_MS        Upstream RPC retry backoff ms\n\

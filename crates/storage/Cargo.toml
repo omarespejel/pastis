@@ -9,6 +9,7 @@ apollo-adapter = ["dep:apollo_storage", "dep:starknet_api"]
 
 [dependencies]
 semver = { workspace = true }
+serde = { workspace = true }
 starknet-node-types = { path = "../types" }
 thiserror = { workspace = true }
 
