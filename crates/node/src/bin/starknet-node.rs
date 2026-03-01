@@ -2,7 +2,7 @@ use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -112,6 +112,7 @@ async fn main() -> Result<(), String> {
         .route("/", post(handle_rpc))
         .route("/healthz", get(healthz))
         .route("/status", get(status))
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .with_state(app_state);
 
     let listener = TcpListener::bind(&config.rpc_bind)
@@ -348,6 +349,8 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         .ok_or_else(|| {
             "missing upstream RPC URL; pass --upstream-rpc-url or set STARKNET_RPC_URL".to_string()
         })?;
+    reqwest::Url::parse(&upstream_rpc_url)
+        .map_err(|error| format!("invalid upstream RPC URL `{upstream_rpc_url}`: {error}"))?;
 
     let chain_id = match cli_chain_id {
         Some(id) => id,

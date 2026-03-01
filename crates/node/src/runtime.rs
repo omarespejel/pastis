@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::future::Future;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
@@ -141,18 +141,26 @@ impl LocalChainJournal {
         &self.path
     }
 
-    fn load_entries(&self) -> Result<Vec<LocalJournalEntry>, String> {
+    fn load_entries(&self, limit: Option<u64>) -> Result<Vec<LocalJournalEntry>, String> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
-        let raw = fs::read_to_string(&self.path).map_err(|error| {
+        let file = File::open(&self.path).map_err(|error| {
             format!(
-                "failed to read local journal {}: {error}",
+                "failed to open local journal {}: {error}",
                 self.path.display()
             )
         })?;
+        let reader = BufReader::new(file);
         let mut entries = Vec::new();
-        for (idx, line) in raw.lines().enumerate() {
+        for (idx, line) in reader.lines().enumerate() {
+            let line = line.map_err(|error| {
+                format!(
+                    "failed to read local journal {} line {}: {error}",
+                    self.path.display(),
+                    idx + 1
+                )
+            })?;
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -165,6 +173,11 @@ impl LocalChainJournal {
                 )
             })?;
             entries.push(entry);
+            if let Some(limit) = limit
+                && entries.len() as u64 >= limit
+            {
+                break;
+            }
         }
         Ok(entries)
     }
@@ -349,6 +362,12 @@ impl NodeRuntime {
         network: Arc<dyn NetworkBackend>,
     ) -> Result<Self, String> {
         config.validate()?;
+        let mut replay = new_replay_pipeline(
+            config.replay_window,
+            config.max_replay_per_poll,
+            config.replay_checkpoint_path.as_deref(),
+        )
+        .map_err(|error| format!("failed to initialize replay pipeline: {error}"))?;
         let mut node = build_runtime_node(config.chain_id.clone());
         let mut execution_state = InMemoryState::default();
         let journal = config
@@ -356,15 +375,20 @@ impl NodeRuntime {
             .as_deref()
             .map(LocalChainJournal::new);
         if let Some(journal) = journal.as_ref() {
-            restore_storage_from_journal(&mut node, &mut execution_state, journal)?;
+            let target_local_blocks = replay.next_local_block().saturating_sub(1);
+            let restored = restore_storage_from_journal(
+                &mut node,
+                &mut execution_state,
+                journal,
+                Some(target_local_blocks),
+            )?;
+            if restored < target_local_blocks {
+                return Err(format!(
+                    "local journal {} has {restored} entries but replay checkpoint requires {target_local_blocks}",
+                    journal.path().display()
+                ));
+            }
         }
-
-        let mut replay = new_replay_pipeline(
-            config.replay_window,
-            config.max_replay_per_poll,
-            config.replay_checkpoint_path.as_deref(),
-        )
-        .map_err(|error| format!("failed to initialize replay pipeline: {error}"))?;
 
         let storage_tip = node
             .storage
@@ -558,6 +582,21 @@ impl NodeRuntime {
                 return Err(message);
             }
 
+            if let Some(journal) = &self.journal {
+                let journal_entry = LocalJournalEntry {
+                    block: local_block_for_journal,
+                    state_diff: fetch.state_diff.clone(),
+                };
+                if let Err(error) = journal.append_entry(&journal_entry) {
+                    self.diagnostics.journal_failures =
+                        self.diagnostics.journal_failures.saturating_add(1);
+                    let message = format!(
+                        "local journal append failed before committing local block {local_block_number}: {error}"
+                    );
+                    self.record_failure(message.clone());
+                    return Err(message);
+                }
+            }
             if let Err(error) = self
                 .node
                 .storage
@@ -570,21 +609,6 @@ impl NodeRuntime {
                 );
                 self.record_failure(message.clone());
                 return Err(message);
-            }
-            if let Some(journal) = &self.journal {
-                let journal_entry = LocalJournalEntry {
-                    block: local_block_for_journal,
-                    state_diff: fetch.state_diff.clone(),
-                };
-                if let Err(error) = journal.append_entry(&journal_entry) {
-                    self.diagnostics.journal_failures =
-                        self.diagnostics.journal_failures.saturating_add(1);
-                    let message = format!(
-                        "local journal append failed after committing local block {local_block_number}: {error}"
-                    );
-                    self.record_failure(message.clone());
-                    return Err(message);
-                }
             }
 
             if let Err(error) = self
@@ -796,7 +820,9 @@ impl UpstreamRpcClient {
 
         if !warnings.is_empty() {
             let joined = warnings.join(" | ");
-            eprintln!("warning: block {block_number} parse issues: {joined}");
+            return Err(format!(
+                "block {block_number} failed strict parsing checks: {joined}"
+            ));
         }
 
         Ok(RuntimeFetch {
@@ -894,8 +920,10 @@ fn restore_storage_from_journal(
     node: &mut RuntimeNode,
     execution_state: &mut InMemoryState,
     journal: &LocalChainJournal,
-) -> Result<(), String> {
-    let entries = journal.load_entries()?;
+    max_entries: Option<u64>,
+) -> Result<u64, String> {
+    let entries = journal.load_entries(max_entries)?;
+    let mut restored = 0_u64;
     for (idx, entry) in entries.into_iter().enumerate() {
         let expected = node
             .storage
@@ -923,8 +951,9 @@ fn restore_storage_from_journal(
                 )
             })?;
         apply_state_diff_to_in_memory_state(execution_state, &entry.state_diff);
+        restored = restored.saturating_add(1);
     }
-    Ok(())
+    Ok(restored)
 }
 
 fn apply_state_diff_to_in_memory_state(state: &mut InMemoryState, diff: &StarknetStateDiff) {
@@ -1080,7 +1109,7 @@ fn parse_block_with_txs(
     let sequencer_raw = block_with_txs
         .get("sequencer_address")
         .and_then(Value::as_str)
-        .unwrap_or("0x1");
+        .ok_or_else(|| format!("getBlockWithTxs missing sequencer_address: {block_with_txs}"))?;
     let sequencer_address = StarknetFelt::from_str(sequencer_raw)
         .map(|felt| format!("{:#x}", felt))
         .map_err(|error| {
@@ -1448,7 +1477,7 @@ fn normalize_chain_id(raw: &str) -> String {
 }
 
 fn decode_ascii_hex(hex: &str) -> Option<String> {
-    if hex.is_empty() || hex.len() % 2 != 0 {
+    if hex.is_empty() || !hex.len().is_multiple_of(2) {
         return None;
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
@@ -1607,6 +1636,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_block_with_txs_requires_sequencer_address() {
+        let block = json!({
+            "block_number": 12,
+            "block_hash": "0xabc",
+            "parent_hash": "0x123",
+            "timestamp": 1_700_000_012_u64,
+            "transactions": [{"transaction_hash": "0x1"}]
+        });
+        let mut warnings = Vec::new();
+        let error = parse_block_with_txs(&block, &mut warnings)
+            .expect_err("missing sequencer_address must fail closed");
+        assert!(error.contains("missing sequencer_address"));
+    }
+
+    #[test]
     fn converts_state_update_to_state_diff() {
         let state_update = json!({
             "state_diff": {
@@ -1746,5 +1790,58 @@ mod tests {
             .clone();
         assert_eq!(progress.starting_block, 1);
         assert_eq!(progress.current_block, 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_ignores_journal_entries_beyond_checkpoint_cursor() {
+        let dir = tempdir().expect("tempdir");
+        let journal_path = dir.path().join("local-journal.jsonl");
+        let checkpoint_path = dir.path().join("replay-checkpoint.json");
+
+        let mut config = runtime_config();
+        config.local_journal_path = Some(journal_path.display().to_string());
+        config.replay_checkpoint_path = Some(checkpoint_path.display().to_string());
+
+        let consensus = Arc::new(HealthyConsensus);
+        let network = Arc::new(MockNetwork {
+            healthy: true,
+            peers: 3,
+        });
+        let mut runtime = NodeRuntime::new_with_backends(
+            config.clone(),
+            Arc::new(MockSyncSource::with_blocks(
+                "SN_MAIN",
+                1,
+                vec![sample_fetch(1, "0x0", "0x1")],
+            )),
+            consensus.clone(),
+            network.clone(),
+        )
+        .expect("runtime should initialize");
+        runtime.poll_once().await.expect("first poll should commit");
+
+        let extra_fetch = sample_fetch(2, "0x1", "0x2");
+        let extra_block = ingest_block_from_fetch(2, &extra_fetch).expect("build extra block");
+        LocalChainJournal::new(&journal_path)
+            .append_entry(&LocalJournalEntry {
+                block: extra_block,
+                state_diff: extra_fetch.state_diff,
+            })
+            .expect("append extra journal entry");
+
+        let restarted = NodeRuntime::new_with_backends(
+            config,
+            Arc::new(MockSyncSource::with_blocks("SN_MAIN", 1, Vec::new())),
+            consensus,
+            network,
+        )
+        .expect("runtime should restore from checkpoint-aligned journal prefix");
+        assert_eq!(
+            restarted
+                .storage()
+                .latest_block_number()
+                .expect("restored storage read should work"),
+            1
+        );
     }
 }
