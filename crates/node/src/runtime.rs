@@ -106,6 +106,7 @@ pub struct RuntimeConfig {
     pub disable_batch_requests: bool,
     pub network_stale_after: Duration,
     pub strict_canonical_execution: bool,
+    pub allow_synthetic_execution_fallback: bool,
     pub storage: Option<ThreadSafeStorage<InMemoryStorage>>,
 }
 
@@ -1127,6 +1128,7 @@ impl NodeRuntime {
             config.chain_id.clone(),
             storage,
             config.strict_canonical_execution,
+            config.allow_synthetic_execution_fallback,
         );
         let journal = config
             .local_journal_path
@@ -2427,18 +2429,28 @@ fn build_runtime_node(
     chain_id: ChainId,
     storage: ThreadSafeStorage<InMemoryStorage>,
     strict_canonical_execution: bool,
+    allow_synthetic_execution_fallback: bool,
 ) -> RuntimeNode {
     StarknetNodeBuilder::new(NodeConfig { chain_id })
         .with_storage(storage)
-        .with_execution(build_runtime_execution_backend(strict_canonical_execution))
+        .with_execution(build_runtime_execution_backend(
+            strict_canonical_execution,
+            allow_synthetic_execution_fallback,
+        ))
         .with_rpc(true)
         .build()
 }
 
-fn build_runtime_execution_backend(strict_canonical_execution: bool) -> DualExecutionBackend {
+fn build_runtime_execution_backend(
+    strict_canonical_execution: bool,
+    allow_synthetic_execution_fallback: bool,
+) -> DualExecutionBackend {
     DualExecutionBackend::new(
         None,
-        Box::new(RuntimeExecutionBackend::new(strict_canonical_execution)),
+        Box::new(RuntimeExecutionBackend::new(
+            strict_canonical_execution,
+            allow_synthetic_execution_fallback,
+        )),
         ExecutionMode::CanonicalOnly,
         MismatchPolicy::WarnAndFallback,
     )
@@ -2544,6 +2556,7 @@ fn summarize_state_diff(diff: &StarknetStateDiff) -> String {
 
 struct RuntimeExecutionBackend {
     strict_canonical_execution: bool,
+    allow_synthetic_execution_fallback: bool,
     #[cfg(feature = "production-adapters")]
     canonical: BlockifierVmBackend,
     #[cfg(feature = "production-adapters")]
@@ -2553,9 +2566,10 @@ struct RuntimeExecutionBackend {
 }
 
 impl RuntimeExecutionBackend {
-    fn new(strict_canonical_execution: bool) -> Self {
+    fn new(strict_canonical_execution: bool, allow_synthetic_execution_fallback: bool) -> Self {
         Self {
             strict_canonical_execution,
+            allow_synthetic_execution_fallback,
             #[cfg(feature = "production-adapters")]
             canonical: BlockifierVmBackend::starknet_mainnet(),
             #[cfg(feature = "production-adapters")]
@@ -2618,6 +2632,20 @@ impl RuntimeExecutionBackend {
             "warning: runtime canonical execution backend disabled after first failure ({context}): {sanitized}"
         );
     }
+
+    fn fallback_disabled_execution_error(block_number: u64) -> ExecutionError {
+        ExecutionError::Backend(format!(
+            "synthetic execution fallback disabled for block {block_number}; \
+             enable allow_synthetic_execution_fallback only for non-production troubleshooting"
+        ))
+    }
+
+    fn fallback_disabled_simulation_error(tx_hash: &TxHash) -> ExecutionError {
+        ExecutionError::Backend(format!(
+            "synthetic simulation fallback disabled for tx {tx_hash}; \
+             enable allow_synthetic_execution_fallback only for non-production troubleshooting"
+        ))
+    }
 }
 
 impl ExecutionBackend for RuntimeExecutionBackend {
@@ -2663,6 +2691,9 @@ impl ExecutionBackend for RuntimeExecutionBackend {
         #[cfg(not(feature = "production-adapters"))]
         let _ = state;
 
+        if !self.allow_synthetic_execution_fallback {
+            return Err(Self::fallback_disabled_execution_error(block.number));
+        }
         Ok(Self::synthetic_execute_block(block))
     }
 
@@ -2707,6 +2738,9 @@ impl ExecutionBackend for RuntimeExecutionBackend {
             let _ = block_context;
         }
 
+        if !self.allow_synthetic_execution_fallback {
+            return Err(Self::fallback_disabled_simulation_error(&tx.hash));
+        }
         Ok(Self::synthetic_simulation(tx))
     }
 }
@@ -4280,6 +4314,7 @@ mod tests {
             disable_batch_requests: false,
             network_stale_after: Duration::from_secs(120),
             strict_canonical_execution: false,
+            allow_synthetic_execution_fallback: true,
             storage: None,
         }
     }
@@ -4297,7 +4332,7 @@ mod tests {
 
     #[test]
     fn runtime_execution_backend_runs_canonical_path_once_per_block() {
-        let backend = build_runtime_execution_backend(false);
+        let backend = build_runtime_execution_backend(false, true);
         let fetch = sample_fetch(1, "0x0", "0x1");
         let block = ingest_block_from_fetch(1, &fetch).expect("sample block should ingest");
         let mut state = InMemoryState::default();
@@ -4315,7 +4350,7 @@ mod tests {
     #[cfg(not(feature = "production-adapters"))]
     #[test]
     fn runtime_execution_backend_strict_mode_requires_production_adapters() {
-        let backend = build_runtime_execution_backend(true);
+        let backend = build_runtime_execution_backend(true, true);
         let fetch = sample_fetch(1, "0x0", "0x1");
         let block = ingest_block_from_fetch(1, &fetch).expect("sample block should ingest");
         let mut state = InMemoryState::default();
@@ -4334,7 +4369,7 @@ mod tests {
     #[cfg(feature = "production-adapters")]
     #[test]
     fn runtime_execution_backend_strict_mode_rejects_missing_executable_payloads() {
-        let backend = build_runtime_execution_backend(true);
+        let backend = build_runtime_execution_backend(true, true);
         let fetch = sample_fetch(1, "0x0", "0x1");
         let block = ingest_block_from_fetch(1, &fetch).expect("sample block should ingest");
         let mut state = InMemoryState::default();
@@ -4345,6 +4380,24 @@ mod tests {
         match error {
             ExecutionError::Backend(message) => {
                 assert!(message.contains("requires embedded executable payloads"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_execution_backend_rejects_synthetic_fallback_when_disabled() {
+        let backend = build_runtime_execution_backend(false, false);
+        let fetch = sample_fetch(1, "0x0", "0x1");
+        let block = ingest_block_from_fetch(1, &fetch).expect("sample block should ingest");
+        let mut state = InMemoryState::default();
+
+        let error = backend
+            .execute_block(&block, &mut state)
+            .expect_err("disabled synthetic fallback must fail closed");
+        match error {
+            ExecutionError::Backend(message) => {
+                assert!(message.contains("synthetic execution fallback disabled"));
             }
             other => panic!("unexpected error variant: {other:?}"),
         }
