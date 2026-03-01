@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use starknet_node_storage::{StorageBackend, StorageError};
 use starknet_node_types::{
     BlockId, ContractAddress, StarknetBlock, StarknetFelt, StarknetReceipt, StarknetStateDiff,
-    TxHash,
+    StarknetTransaction, TxHash,
 };
 
 const JSONRPC_VERSION: &str = "2.0";
@@ -709,27 +709,63 @@ fn parse_tx_hash_param(params: &Value) -> Result<TxHash, RpcError> {
 
 fn block_to_json(block: &StarknetBlock) -> Value {
     json!({
+        "status": "ACCEPTED_ON_L2",
+        "block_hash": format!("0x{:x}", block.number),
+        "block_number": block.number,
+        "new_root": block.state_root,
         "number": block.number,
         "parent_hash": block.parent_hash,
         "state_root": block.state_root,
         "timestamp": block.timestamp,
         "sequencer_address": block.sequencer_address,
+        "l1_gas_price": gas_price_to_json(block.gas_prices.l1_gas),
+        "l1_data_gas_price": gas_price_to_json(block.gas_prices.l1_data_gas),
+        "l2_gas_price": gas_price_to_json(block.gas_prices.l2_gas),
+        "l1_da_mode": "CALLDATA",
+        "starknet_version": block.protocol_version.to_string(),
         "protocol_version": block.protocol_version.to_string(),
-        "transactions": block.transactions.iter().map(|tx| json!({
-            "hash": tx.hash,
-        })).collect::<Vec<_>>(),
+        "transactions": block
+            .transactions
+            .iter()
+            .map(transaction_to_json)
+            .collect::<Vec<_>>(),
     })
 }
 
 fn block_with_hashes_to_json(block: &StarknetBlock) -> Value {
     json!({
+        "status": "ACCEPTED_ON_L2",
+        "block_hash": format!("0x{:x}", block.number),
+        "block_number": block.number,
+        "new_root": block.state_root,
         "number": block.number,
         "parent_hash": block.parent_hash,
         "state_root": block.state_root,
         "timestamp": block.timestamp,
         "sequencer_address": block.sequencer_address,
+        "l1_gas_price": gas_price_to_json(block.gas_prices.l1_gas),
+        "l1_data_gas_price": gas_price_to_json(block.gas_prices.l1_data_gas),
+        "l2_gas_price": gas_price_to_json(block.gas_prices.l2_gas),
+        "l1_da_mode": "CALLDATA",
+        "starknet_version": block.protocol_version.to_string(),
         "protocol_version": block.protocol_version.to_string(),
         "transactions": block.transactions.iter().map(|tx| tx.hash.as_ref()).collect::<Vec<_>>(),
+    })
+}
+
+fn transaction_to_json(tx: &StarknetTransaction) -> Value {
+    json!({
+        "hash": tx.hash,
+        "transaction_hash": tx.hash,
+        "type": "INVOKE",
+        "version": "0x0",
+    })
+}
+
+fn gas_price_to_json(price: starknet_node_types::GasPricePerToken) -> Value {
+    json!({
+        "price_in_fri": format!("0x{:x}", price.price_in_fri),
+        "price_in_wei": format!("0x{:x}", price.price_in_wei),
     })
 }
 
@@ -1095,6 +1131,8 @@ mod tests {
         let raw = r#"{"jsonrpc":"2.0","id":2,"method":"starknet_getBlockWithTxs","params":[{"block_number":1}]}"#;
         let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
         assert_eq!(value["result"]["number"], json!(1));
+        assert_eq!(value["result"]["block_number"], json!(1));
+        assert_eq!(value["result"]["status"], json!("ACCEPTED_ON_L2"));
     }
 
     #[test]
@@ -1274,7 +1312,26 @@ mod tests {
         let raw = r#"{"jsonrpc":"2.0","id":15,"method":"starknet_getBlockWithTxHashes","params":[{"block_number":2}]}"#;
         let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
         assert_eq!(value["result"]["number"], json!(2));
+        assert_eq!(value["result"]["block_number"], json!(2));
         assert_eq!(value["result"]["transactions"], json!(["0x1f6"]));
+    }
+
+    #[test]
+    fn get_block_with_txs_includes_canonical_block_fields() {
+        let server = seeded_server();
+        let raw = r#"{"jsonrpc":"2.0","id":77,"method":"starknet_getBlockWithTxs","params":[{"block_number":2}]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        let block = &value["result"];
+        assert_eq!(block["status"], json!("ACCEPTED_ON_L2"));
+        assert_eq!(block["block_hash"], json!("0x2"));
+        assert_eq!(block["block_number"], json!(2));
+        assert_eq!(block["new_root"], json!("0x66"));
+        assert_eq!(block["starknet_version"], json!("0.14.2"));
+        assert_eq!(block["l1_da_mode"], json!("CALLDATA"));
+        assert_eq!(block["l1_gas_price"]["price_in_wei"], json!("0x1"));
+        assert_eq!(block["l1_data_gas_price"]["price_in_fri"], json!("0x1"));
+        assert_eq!(block["transactions"][0]["transaction_hash"], json!("0x1f6"));
+        assert_eq!(block["transactions"][0]["type"], json!("INVOKE"));
     }
 
     #[test]
