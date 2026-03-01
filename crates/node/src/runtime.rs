@@ -1044,13 +1044,18 @@ fn ingest_block_from_fetch(
                 .map_err(|error| format!("invalid replay tx hash: {error}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let parsed_sequencer = ContractAddress::parse(sequencer_address).map_err(|error| {
+        format!(
+            "invalid canonical replay sequencer address `{}`: {error}",
+            replay.sequencer_address
+        )
+    })?;
     let block = StarknetBlock {
         number: local_number,
         parent_hash,
         state_root,
         timestamp: replay.timestamp,
-        sequencer_address: ContractAddress::parse(sequencer_address)
-            .expect("canonicalized sequencer address must be valid"),
+        sequencer_address: parsed_sequencer,
         gas_prices: BlockGasPrices {
             l1_gas: GasPricePerToken {
                 price_in_fri: 1,
@@ -1065,8 +1070,7 @@ fn ingest_block_from_fetch(
                 price_in_wei: 1,
             },
         },
-        protocol_version: Version::parse("0.14.2")
-            .expect("runtime protocol version literal must be valid"),
+        protocol_version: Version::new(0, 14, 2),
         transactions,
     };
     block
