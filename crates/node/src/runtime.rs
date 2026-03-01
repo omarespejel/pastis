@@ -13,6 +13,7 @@ use bincode::Options;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 use crate::replay::{
@@ -575,12 +576,87 @@ struct RuntimeFetch {
     receipts: Vec<StarknetReceipt>,
 }
 
+struct PrefetchedBlock {
+    external_block: u64,
+    handle: Option<JoinHandle<Result<RuntimeFetch, String>>>,
+}
+
+impl PrefetchedBlock {
+    fn spawn(sync_source: Arc<dyn SyncSource>, retry: RpcRetryConfig, external_block: u64) -> Self {
+        let handle = tokio::spawn(fetch_block_with_retry_from_source(
+            sync_source,
+            retry,
+            external_block,
+        ));
+        Self {
+            external_block,
+            handle: Some(handle),
+        }
+    }
+
+    async fn resolve(mut self) -> Result<(u64, RuntimeFetch), String> {
+        let Some(handle) = self.handle.take() else {
+            return Err(format!(
+                "block {} prefetch task missing handle",
+                self.external_block
+            ));
+        };
+        match handle.await {
+            Ok(Ok(fetch)) => Ok((self.external_block, fetch)),
+            Ok(Err(error)) => Err(format!(
+                "block {} RPC failed during prefetch: {error}",
+                self.external_block
+            )),
+            Err(error) => Err(format!(
+                "block {} prefetch task join failed: {error}",
+                self.external_block
+            )),
+        }
+    }
+}
+
+impl Drop for PrefetchedBlock {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+}
+
 type SyncSourceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
 
 trait SyncSource: Send + Sync {
     fn fetch_latest_block_number(&self) -> SyncSourceFuture<'_, u64>;
     fn fetch_chain_id(&self) -> SyncSourceFuture<'_, String>;
     fn fetch_block(&self, block_number: u64) -> SyncSourceFuture<'_, RuntimeFetch>;
+}
+
+async fn fetch_block_with_retry_from_source(
+    sync_source: Arc<dyn SyncSource>,
+    retry: RpcRetryConfig,
+    block_number: u64,
+) -> Result<RuntimeFetch, String> {
+    let mut attempt = 0_u32;
+    loop {
+        match sync_source.fetch_block(block_number).await {
+            Ok(fetch) => return Ok(fetch),
+            Err(error) => {
+                if attempt >= retry.max_retries {
+                    return Err(format!(
+                        "block {block_number} RPC failed after {} attempts: {error}",
+                        retry.max_retries.saturating_add(1)
+                    ));
+                }
+                let factor = 1_u128 << attempt.min(20);
+                let base_ms = retry.base_backoff.as_millis();
+                let backoff_ms = base_ms.saturating_mul(factor).min(5_000);
+                if backoff_ms > 0 {
+                    sleep(Duration::from_millis(backoff_ms as u64)).await;
+                }
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -878,16 +954,31 @@ impl NodeRuntime {
             return Ok(());
         }
 
-        for external_block in replay_plan {
-            let fetch = self
-                .fetch_block_with_retry(external_block)
-                .await
-                .map_err(|error| {
-                    let message =
-                        format!("failed to fetch external block {external_block}: {error}");
-                    self.record_failure(message.clone());
-                    message
-                })?;
+        let mut replay_iter = replay_plan.into_iter();
+        let Some(mut current_external_block) = replay_iter.next() else {
+            self.record_success();
+            return Ok(());
+        };
+        let mut current_fetch = self
+            .fetch_block_with_retry(current_external_block)
+            .await
+            .map_err(|error| {
+                let message =
+                    format!("failed to fetch external block {current_external_block}: {error}");
+                self.record_failure(message.clone());
+                message
+            })?;
+        let mut prefetched = replay_iter.next().map(|external_block| {
+            PrefetchedBlock::spawn(
+                Arc::clone(&self.sync_source),
+                self.retry.clone(),
+                external_block,
+            )
+        });
+
+        loop {
+            let external_block = current_external_block;
+            let fetch = current_fetch;
             let consensus_input = ConsensusInput::from(&fetch.replay);
             let consensus_verdict = self.consensus.validate_block(&consensus_input).map_err(
                 |error| {
@@ -1039,6 +1130,43 @@ impl NodeRuntime {
                 progress.reorg_events = self.replay.reorg_events();
                 progress.last_error = None;
             })?;
+
+            if let Some(next_prefetched) = prefetched.take() {
+                let next_external_block = next_prefetched.external_block;
+                let next_fetch = match next_prefetched.resolve().await {
+                    Ok((resolved_external_block, fetch)) => {
+                        if resolved_external_block != next_external_block {
+                            let message = format!(
+                                "prefetch resolved unexpected block number: expected {next_external_block}, got {resolved_external_block}"
+                            );
+                            self.record_failure(message.clone());
+                            return Err(message);
+                        }
+                        fetch
+                    }
+                    Err(prefetch_error) => self
+                        .fetch_block_with_retry(next_external_block)
+                        .await
+                        .map_err(|fallback_error| {
+                            let message = format!(
+                                "failed to fetch external block {next_external_block} after prefetch error ({prefetch_error}): {fallback_error}"
+                            );
+                            self.record_failure(message.clone());
+                            message
+                        })?,
+                };
+                current_external_block = next_external_block;
+                current_fetch = next_fetch;
+                prefetched = replay_iter.next().map(|external_block| {
+                    PrefetchedBlock::spawn(
+                        Arc::clone(&self.sync_source),
+                        self.retry.clone(),
+                        external_block,
+                    )
+                });
+                continue;
+            }
+            break;
         }
 
         self.record_success();
@@ -1068,25 +1196,12 @@ impl NodeRuntime {
     }
 
     async fn fetch_block_with_retry(&self, block_number: u64) -> Result<RuntimeFetch, String> {
-        let mut attempt = 0_u32;
-        loop {
-            match self.sync_source.fetch_block(block_number).await {
-                Ok(fetch) => return Ok(fetch),
-                Err(error) => {
-                    if attempt >= self.retry.max_retries {
-                        return Err(format!(
-                            "block {block_number} RPC failed after {} attempts: {error}",
-                            self.retry.max_retries.saturating_add(1)
-                        ));
-                    }
-                    let backoff = self.retry_backoff(attempt);
-                    if !backoff.is_zero() {
-                        sleep(backoff).await;
-                    }
-                    attempt = attempt.saturating_add(1);
-                }
-            }
-        }
+        fetch_block_with_retry_from_source(
+            Arc::clone(&self.sync_source),
+            self.retry.clone(),
+            block_number,
+        )
+        .await
     }
 
     async fn ensure_chain_id_validated(&mut self) -> Result<(), String> {
@@ -2548,6 +2663,8 @@ fn decode_ascii_hex(hex: &str) -> Option<String> {
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
+    use std::thread;
+    use std::time::Instant;
 
     use tempfile::tempdir;
 
@@ -2571,6 +2688,75 @@ mod tests {
                 head,
                 blocks: Arc::new(Mutex::new(mapped)),
             }
+        }
+    }
+
+    #[derive(Clone)]
+    struct DelayedMockSyncSource {
+        chain_id: String,
+        head: u64,
+        block_delay: Duration,
+        blocks: Arc<Mutex<BTreeMap<u64, RuntimeFetch>>>,
+    }
+
+    impl DelayedMockSyncSource {
+        fn with_blocks(
+            chain_id: &str,
+            head: u64,
+            block_delay: Duration,
+            blocks: Vec<RuntimeFetch>,
+        ) -> Self {
+            let mut mapped = BTreeMap::new();
+            for block in blocks {
+                mapped.insert(block.replay.external_block_number, block);
+            }
+            Self {
+                chain_id: chain_id.to_string(),
+                head,
+                block_delay,
+                blocks: Arc::new(Mutex::new(mapped)),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct PanicOnceSyncSource {
+        chain_id: String,
+        head: u64,
+        panic_block: u64,
+        panic_remaining: Arc<Mutex<u32>>,
+        attempts: Arc<Mutex<BTreeMap<u64, u32>>>,
+        blocks: Arc<Mutex<BTreeMap<u64, RuntimeFetch>>>,
+    }
+
+    impl PanicOnceSyncSource {
+        fn with_blocks(
+            chain_id: &str,
+            head: u64,
+            panic_block: u64,
+            blocks: Vec<RuntimeFetch>,
+        ) -> Self {
+            let mut mapped = BTreeMap::new();
+            for block in blocks {
+                mapped.insert(block.replay.external_block_number, block);
+            }
+            Self {
+                chain_id: chain_id.to_string(),
+                head,
+                panic_block,
+                panic_remaining: Arc::new(Mutex::new(1)),
+                attempts: Arc::new(Mutex::new(BTreeMap::new())),
+                blocks: Arc::new(Mutex::new(mapped)),
+            }
+        }
+
+        fn attempts_for(&self, block_number: u64) -> u32 {
+            self.attempts
+                .lock()
+                .expect("attempts lock should not be poisoned")
+                .get(&block_number)
+                .copied()
+                .unwrap_or(0)
         }
     }
 
@@ -2703,6 +2889,85 @@ mod tests {
         }
     }
 
+    impl SyncSource for DelayedMockSyncSource {
+        fn fetch_latest_block_number(&self) -> SyncSourceFuture<'_, u64> {
+            let head = self.head;
+            Box::pin(async move { Ok(head) })
+        }
+
+        fn fetch_chain_id(&self) -> SyncSourceFuture<'_, String> {
+            let chain_id = self.chain_id.clone();
+            Box::pin(async move { Ok(chain_id) })
+        }
+
+        fn fetch_block(&self, block_number: u64) -> SyncSourceFuture<'_, RuntimeFetch> {
+            let blocks = Arc::clone(&self.blocks);
+            let block_delay = self.block_delay;
+            Box::pin(async move {
+                tokio::time::sleep(block_delay).await;
+                blocks
+                    .lock()
+                    .map_err(|_| "mock block map lock poisoned".to_string())?
+                    .get(&block_number)
+                    .cloned()
+                    .ok_or_else(|| format!("mock block {block_number} missing"))
+            })
+        }
+    }
+
+    impl SyncSource for PanicOnceSyncSource {
+        fn fetch_latest_block_number(&self) -> SyncSourceFuture<'_, u64> {
+            let head = self.head;
+            Box::pin(async move { Ok(head) })
+        }
+
+        fn fetch_chain_id(&self) -> SyncSourceFuture<'_, String> {
+            let chain_id = self.chain_id.clone();
+            Box::pin(async move { Ok(chain_id) })
+        }
+
+        fn fetch_block(&self, block_number: u64) -> SyncSourceFuture<'_, RuntimeFetch> {
+            let panic_block = self.panic_block;
+            let panic_remaining = Arc::clone(&self.panic_remaining);
+            let attempts = Arc::clone(&self.attempts);
+            let blocks = Arc::clone(&self.blocks);
+            Box::pin(async move {
+                {
+                    let mut guard = attempts
+                        .lock()
+                        .map_err(|_| "attempts lock poisoned".to_string())?;
+                    let attempt = guard.entry(block_number).or_default();
+                    *attempt = attempt.saturating_add(1);
+                }
+
+                let should_panic = if block_number == panic_block {
+                    let mut guard = panic_remaining
+                        .lock()
+                        .map_err(|_| "panic_remaining lock poisoned".to_string())?;
+                    if *guard > 0 {
+                        *guard = guard.saturating_sub(1);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if should_panic {
+                    panic!("synthetic prefetch panic for block {block_number}");
+                }
+
+                blocks
+                    .lock()
+                    .map_err(|_| "mock block map lock poisoned".to_string())?
+                    .get(&block_number)
+                    .cloned()
+                    .ok_or_else(|| format!("mock block {block_number} missing"))
+            })
+        }
+    }
+
     struct RejectingConsensus;
 
     impl ConsensusBackend for RejectingConsensus {
@@ -2715,6 +2980,17 @@ mod tests {
 
     impl ConsensusBackend for HealthyConsensus {
         fn validate_block(&self, _input: &ConsensusInput) -> Result<ConsensusVerdict, String> {
+            Ok(ConsensusVerdict::Accept)
+        }
+    }
+
+    struct SlowConsensus {
+        delay: Duration,
+    }
+
+    impl ConsensusBackend for SlowConsensus {
+        fn validate_block(&self, _input: &ConsensusInput) -> Result<ConsensusVerdict, String> {
+            thread::sleep(self.delay);
             Ok(ConsensusVerdict::Accept)
         }
     }
@@ -2824,6 +3100,24 @@ mod tests {
     ) -> RuntimeFetch {
         let mut fetch = sample_fetch(external_block_number, parent_hash, block_hash);
         fetch.state_diff = state_diff;
+        fetch
+    }
+
+    fn sample_fetch_with_tx_hash(
+        external_block_number: u64,
+        parent_hash: &str,
+        block_hash: &str,
+        tx_hash_raw: &str,
+    ) -> RuntimeFetch {
+        let mut fetch = sample_fetch(external_block_number, parent_hash, block_hash);
+        fetch.replay.transaction_hashes = vec![tx_hash_raw.to_string()];
+        let tx_hash = TxHash::parse(tx_hash_raw).expect("sample tx hash should parse");
+        fetch.receipts = vec![StarknetReceipt {
+            tx_hash,
+            execution_status: true,
+            events: 2,
+            gas_consumed: 7,
+        }];
         fetch
     }
 
@@ -3553,6 +3847,85 @@ mod tests {
         assert_eq!(receipt.tx_hash, tx_hash);
         assert_eq!(receipt.gas_consumed, 7);
         assert!(receipt.execution_status);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn poll_once_overlaps_fetch_and_processing_for_multi_block_plan() {
+        let fetch_delay = Duration::from_millis(80);
+        let processing_delay = Duration::from_millis(80);
+        let sync_source = Arc::new(DelayedMockSyncSource::with_blocks(
+            "SN_MAIN",
+            3,
+            fetch_delay,
+            vec![
+                sample_fetch_with_tx_hash(1, "0x0", "0x1", "0x111"),
+                sample_fetch_with_tx_hash(2, "0x1", "0x2", "0x222"),
+                sample_fetch_with_tx_hash(3, "0x2", "0x3", "0x333"),
+            ],
+        ));
+        let consensus = Arc::new(SlowConsensus {
+            delay: processing_delay,
+        });
+        let network = Arc::new(MockNetwork {
+            healthy: true,
+            peers: 2,
+        });
+        let mut config = runtime_config();
+        config.replay_window = 3;
+        config.max_replay_per_poll = 3;
+        let mut runtime = NodeRuntime::new_with_backends(config, sync_source, consensus, network)
+            .expect("runtime should initialize");
+
+        let started = Instant::now();
+        runtime.poll_once().await.expect("poll should succeed");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(430),
+            "expected overlapped fetch/processing to complete under 430ms, elapsed={elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn poll_once_recovers_when_prefetch_task_panics() {
+        let sync_source = Arc::new(PanicOnceSyncSource::with_blocks(
+            "SN_MAIN",
+            2,
+            2,
+            vec![
+                sample_fetch_with_tx_hash(1, "0x0", "0x1", "0x111"),
+                sample_fetch_with_tx_hash(2, "0x1", "0x2", "0x222"),
+            ],
+        ));
+        let consensus = Arc::new(HealthyConsensus);
+        let network = Arc::new(MockNetwork {
+            healthy: true,
+            peers: 2,
+        });
+        let mut config = runtime_config();
+        config.replay_window = 2;
+        config.max_replay_per_poll = 2;
+        let mut runtime =
+            NodeRuntime::new_with_backends(config, sync_source.clone(), consensus, network)
+                .expect("runtime should initialize");
+
+        runtime
+            .poll_once()
+            .await
+            .expect("poll should recover from prefetch panic");
+
+        assert_eq!(
+            runtime
+                .storage()
+                .latest_block_number()
+                .expect("storage read should work"),
+            2
+        );
+        assert_eq!(
+            sync_source.attempts_for(2),
+            2,
+            "prefetch panic should trigger direct-fetch fallback"
+        );
     }
 
     #[tokio::test]
