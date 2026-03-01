@@ -1,6 +1,7 @@
 # Production Soak Runbook (Real Daemon, Real Data)
 
 This runbook executes a long-lived real-data soak against the `starknet-node` daemon and produces a machine-readable PASS/FAIL report.
+The helper script starts the daemon with `--features production-adapters --release --locked`.
 
 ## 1. Prerequisites
 
@@ -29,6 +30,8 @@ State directory default: `.pastis/soak-daemon`
 - `daemon.log`: daemon stdout/stderr
 - `soak-timeline.jsonl`: per-sample health/readiness/status timeline
 - `soak-report.json`: final summary and gate verdict
+
+For safety, upstream RPC URLs in logs/report are redacted to `scheme://host[:port]`.
 
 ## 4. Gate Semantics
 

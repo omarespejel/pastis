@@ -53,11 +53,42 @@ parse_bool() {
   esac
 }
 
+redact_url() {
+  local raw="$1"
+  if [[ "$raw" =~ ^([a-zA-Z][a-zA-Z0-9+.-]*)://([^/@]+@)?([^/:?#]+)(:([0-9]+))?.*$ ]]; then
+    local scheme="${BASH_REMATCH[1]}"
+    local host="${BASH_REMATCH[3]}"
+    local port="${BASH_REMATCH[5]:-}"
+    if [[ -n "$port" ]]; then
+      printf '%s://%s:%s' "$scheme" "$host" "$port"
+    else
+      printf '%s://%s' "$scheme" "$host"
+    fi
+    return 0
+  fi
+  printf '<invalid-rpc-url>'
+}
+
+iso8601_utc_from_epoch() {
+  local epoch="$1"
+  if date -u -d "@$epoch" '+%Y-%m-%dT%H:%M:%SZ' >/dev/null 2>&1; then
+    date -u -d "@$epoch" '+%Y-%m-%dT%H:%M:%SZ'
+    return 0
+  fi
+  if date -u -r "$epoch" '+%Y-%m-%dT%H:%M:%SZ' >/dev/null 2>&1; then
+    date -u -r "$epoch" '+%Y-%m-%dT%H:%M:%SZ'
+    return 0
+  fi
+  printf '<invalid-timestamp>'
+}
+
 json_rpc_call() {
   local endpoint="$1"
   local payload="$2"
   curl -sS -X POST "$endpoint" \
     -H 'content-type: application/json' \
+    --connect-timeout 5 \
+    --max-time 15 \
     --data "$payload"
 }
 
@@ -92,7 +123,10 @@ normalize_chain_id() {
 
 http_code() {
   local url="$1"
-  curl -s -o /dev/null -w '%{http_code}' "$url" || true
+  curl -s -o /dev/null -w '%{http_code}' \
+    --connect-timeout 3 \
+    --max-time 5 \
+    "$url" || true
 }
 
 require_cmd curl
@@ -201,7 +235,7 @@ CHAIN_ID_RAW="$(discover_chain_id "$UPSTREAM_RPC_URL")"
 CHAIN_ID="$(normalize_chain_id "$CHAIN_ID_RAW")"
 
 echo "starting daemon soak gate"
-echo "upstream_rpc_url: $UPSTREAM_RPC_URL"
+echo "upstream_rpc_url: $(redact_url "$UPSTREAM_RPC_URL")"
 echo "upstream_chain_id(raw): $CHAIN_ID_RAW"
 echo "daemon_chain_id: $CHAIN_ID"
 echo "daemon_bind: $DAEMON_BIND"
@@ -227,7 +261,7 @@ else
   DAEMON_ARGS+=(--no-allow-synthetic-execution-fallback)
 fi
 
-cargo run -p starknet-node --bin starknet-node --features production-adapters -- "${DAEMON_ARGS[@]}" >"$LOG_PATH" 2>&1 &
+cargo run --locked --release -p starknet-node --bin starknet-node --features production-adapters -- "${DAEMON_ARGS[@]}" >"$LOG_PATH" 2>&1 &
 DAEMON_PID=$!
 
 cleanup() {
@@ -258,6 +292,7 @@ if [[ "$(http_code "http://$DAEMON_BIND/healthz")" == "000" ]]; then
 fi
 
 start_epoch="$(date +%s)"
+start_iso="$(iso8601_utc_from_epoch "$start_epoch")"
 end_epoch="$((start_epoch + DURATION_MINUTES * 60))"
 
 samples=0
@@ -285,7 +320,12 @@ while [[ "$(date +%s)" -lt "$end_epoch" ]]; do
   now_iso="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   health_code="$(http_code "http://$DAEMON_BIND/healthz")"
   ready_code="$(http_code "http://$DAEMON_BIND/readyz")"
-  status_json="$(curl -sS "http://$DAEMON_BIND/status" -H "authorization: Bearer $DAEMON_TOKEN" || true)"
+  status_json="$(
+    curl -sS "http://$DAEMON_BIND/status" \
+      -H "authorization: Bearer $DAEMON_TOKEN" \
+      --connect-timeout 3 \
+      --max-time 5 || true
+  )"
 
   samples=$((samples + 1))
   last_health_code="$health_code"
@@ -376,9 +416,9 @@ if [[ "$max_consecutive_failures" -gt 3 ]]; then
 fi
 
 jq -cn \
-  --arg started_at "$(date -u -r "$start_epoch" '+%Y-%m-%dT%H:%M:%SZ')" \
+  --arg started_at "$start_iso" \
   --arg finished_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-  --arg upstream_rpc_url "$UPSTREAM_RPC_URL" \
+  --arg upstream_rpc_url "$(redact_url "$UPSTREAM_RPC_URL")" \
   --arg daemon_bind "$DAEMON_BIND" \
   --arg daemon_chain_id "$CHAIN_ID" \
   --argjson duration_minutes "$DURATION_MINUTES" \
@@ -393,7 +433,13 @@ jq -cn \
   --argjson max_flap_transitions_recent "$max_flaps_recent" \
   --argjson runtime_alive "$runtime_alive" \
   --argjson passed "$pass" \
-  --argjson reasons "$(printf '%s\n' "${reasons[@]:-}" | jq -R . | jq -s .)" \
+  --argjson reasons "$(
+    if [[ "${#reasons[@]}" -eq 0 ]]; then
+      printf '[]'
+    else
+      printf '%s\n' "${reasons[@]}" | jq -R . | jq -s .
+    fi
+  )" \
   --argjson last_status "$last_status_json" \
   '{started_at:$started_at,finished_at:$finished_at,upstream_rpc_url:$upstream_rpc_url,daemon_bind:$daemon_bind,daemon_chain_id:$daemon_chain_id,duration_minutes:$duration_minutes,poll_seconds:$poll_seconds,samples:$samples,health_failures:$health_failures,ready_failures:$ready_failures,status_failures:$status_failures,block_advance_events:$block_advance_events,max_sync_lag:$max_sync_lag,max_consecutive_failures:$max_consecutive_failures,max_flap_transitions_recent:$max_flap_transitions_recent,runtime_alive:($runtime_alive==1),passed:($passed==1),failure_reasons:$reasons,last_status:$last_status}' \
   >"$REPORT_PATH"
