@@ -73,7 +73,7 @@ struct DaemonConfig {
     disable_batch_requests: bool,
     strict_canonical_execution: bool,
     bootnodes: Vec<String>,
-    require_peers: bool,
+    min_peers: u64,
     p2p_heartbeat_ms: u64,
     health_max_consecutive_failures: u64,
     health_max_sync_lag_blocks: u64,
@@ -87,6 +87,7 @@ struct RpcAppState {
     rpc_auth_token: Option<String>,
     sync_progress: Arc<Mutex<SyncProgress>>,
     health_policy: HealthPolicy,
+    min_peer_count: u64,
     rpc_slots: Arc<Semaphore>,
     rpc_rate_limiter: Arc<Mutex<RpcRateLimiter>>,
     rpc_metrics: Arc<Mutex<RpcRuntimeMetrics>>,
@@ -99,6 +100,7 @@ struct StatusPayload {
     current_block: u64,
     highest_block: u64,
     peer_count: u64,
+    min_peers: u64,
     reorg_events: u64,
     consecutive_failures: u64,
     last_error: Option<String>,
@@ -228,12 +230,7 @@ impl BootnodeObservation {
 async fn main() -> Result<(), String> {
     let config = parse_daemon_config()?;
     let bootnode_endpoints = parse_bootnode_endpoints(&config.bootnodes)?;
-    if config.require_peers && bootnode_endpoints.is_empty() {
-        return Err(
-            "PASTIS_REQUIRE_PEERS=true requires at least one valid --bootnode/PASTIS_BOOTNODES entry"
-                .to_string(),
-        );
-    }
+    validate_peer_requirements(config.min_peers, bootnode_endpoints.len())?;
     let initial_peers = if bootnode_endpoints.is_empty() {
         0
     } else {
@@ -261,7 +258,7 @@ async fn main() -> Result<(), String> {
         network_stale_after: derive_network_stale_after(config.p2p_heartbeat_ms),
         strict_canonical_execution: config.strict_canonical_execution,
         peer_count_hint: initial_peers,
-        require_peers: config.require_peers,
+        require_peers: config.min_peers > 0,
         storage: None,
     };
 
@@ -285,8 +282,9 @@ async fn main() -> Result<(), String> {
         health_policy: HealthPolicy {
             max_consecutive_failures: config.health_max_consecutive_failures,
             max_sync_lag: config.health_max_sync_lag_blocks,
-            require_peers: config.require_peers,
+            require_peers: config.min_peers > 0,
         },
+        min_peer_count: config.min_peers,
         rpc_slots: Arc::new(Semaphore::new(config.rpc_max_concurrency)),
         rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(
             config.rpc_rate_limit_per_minute,
@@ -360,6 +358,7 @@ async fn main() -> Result<(), String> {
     println!("rpc_auth_enabled: {}", config.rpc_auth_token.is_some());
     println!("allow_public_rpc_bind: {}", config.allow_public_rpc_bind);
     println!("exit_on_unhealthy: {}", config.exit_on_unhealthy);
+    println!("min_peers: {}", config.min_peers);
     if let Some(path) = &config.local_journal_path {
         println!("local_journal_path: {path}");
     }
@@ -370,7 +369,7 @@ async fn main() -> Result<(), String> {
             config.storage_snapshot_interval_blocks
         );
     }
-    println!("require_peers: {}", config.require_peers);
+    println!("require_peers: {}", config.min_peers > 0);
 
     let mut rpc_shutdown_rx = shutdown_rx.clone();
     let mut rpc_handle = tokio::spawn(async move {
@@ -426,8 +425,9 @@ async fn main() -> Result<(), String> {
                     &HealthPolicy {
                         max_consecutive_failures: config.health_max_consecutive_failures,
                         max_sync_lag: config.health_max_sync_lag_blocks,
-                        require_peers: config.require_peers,
+                        require_peers: config.min_peers > 0,
                     },
+                    config.min_peers,
                     config.exit_on_unhealthy,
                 ) {
                     exit_error = Some(format!(
@@ -808,7 +808,7 @@ async fn healthz(State(state): State<RpcAppState>) -> impl IntoResponse {
         }
     };
 
-    match evaluate_health(&progress, &state.health_policy) {
+    match evaluate_health(&progress, &state.health_policy, state.min_peer_count) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(message) => (StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
     }
@@ -826,7 +826,7 @@ async fn readyz(State(state): State<RpcAppState>) -> impl IntoResponse {
         }
     };
 
-    match evaluate_readiness(&progress, &state.health_policy) {
+    match evaluate_readiness(&progress, &state.health_policy, state.min_peer_count) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(message) => (StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
     }
@@ -860,6 +860,7 @@ async fn status(
         current_block: progress.current_block,
         highest_block: progress.highest_block,
         peer_count: progress.peer_count,
+        min_peers: state.min_peer_count,
         reorg_events: progress.reorg_events,
         consecutive_failures: progress.consecutive_failures,
         last_error: progress.last_error,
@@ -985,6 +986,12 @@ async fn metrics(State(state): State<RpcAppState>, headers: HeaderMap) -> impl I
     let _ = writeln!(body, "pastis_sync_peer_count {}", progress.peer_count);
     let _ = writeln!(
         body,
+        "# HELP pastis_sync_min_peer_count Minimum healthy peer count configured for the daemon."
+    );
+    let _ = writeln!(body, "# TYPE pastis_sync_min_peer_count gauge");
+    let _ = writeln!(body, "pastis_sync_min_peer_count {}", state.min_peer_count);
+    let _ = writeln!(
+        body,
         "# HELP pastis_sync_consecutive_failures Current consecutive sync poll failures."
     );
     let _ = writeln!(body, "# TYPE pastis_sync_consecutive_failures gauge");
@@ -1030,6 +1037,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
     let mut cli_require_peers = false;
     let mut cli_exit_on_unhealthy = false;
     let mut cli_p2p_heartbeat_ms: Option<u64> = None;
+    let mut cli_min_peers: Option<u64> = None;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -1175,6 +1183,12 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
                     .ok_or_else(|| "--p2p-heartbeat-ms requires a value".to_string())?;
                 cli_p2p_heartbeat_ms = Some(parse_positive_u64(&raw, "--p2p-heartbeat-ms")?);
             }
+            "--min-peers" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--min-peers requires a value".to_string())?;
+                cli_min_peers = Some(parse_non_negative_u64(&raw, "--min-peers")?);
+            }
             "--help" | "-h" => {
                 return Err(help_text());
             }
@@ -1289,10 +1303,18 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         .unwrap_or(DEFAULT_HEALTH_MAX_CONSECUTIVE_FAILURES);
     let health_max_sync_lag_blocks = parse_env_u64("PASTIS_HEALTH_MAX_SYNC_LAG_BLOCKS")?
         .unwrap_or(DEFAULT_HEALTH_MAX_SYNC_LAG_BLOCKS);
-    let require_peers = if cli_require_peers {
-        true
+    let env_require_peers = parse_env_bool("PASTIS_REQUIRE_PEERS")?.unwrap_or(false);
+    let env_min_peers = parse_env_non_negative_u64("PASTIS_MIN_PEERS")?;
+    let min_peers = if let Some(value) = cli_min_peers {
+        value
+    } else if cli_require_peers {
+        1
+    } else if let Some(value) = env_min_peers {
+        value
+    } else if env_require_peers {
+        1
     } else {
-        parse_env_bool("PASTIS_REQUIRE_PEERS")?.unwrap_or(false)
+        0
     };
     let exit_on_unhealthy = if cli_exit_on_unhealthy {
         true
@@ -1339,7 +1361,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         disable_batch_requests,
         strict_canonical_execution,
         bootnodes,
-        require_peers,
+        min_peers,
         p2p_heartbeat_ms,
         health_max_consecutive_failures,
         health_max_sync_lag_blocks,
@@ -1350,6 +1372,13 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
 fn parse_env_u64(name: &str) -> Result<Option<u64>, String> {
     match env::var(name) {
         Ok(raw) => Ok(Some(parse_positive_u64(&raw, name)?)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn parse_env_non_negative_u64(name: &str) -> Result<Option<u64>, String> {
+    match env::var(name) {
+        Ok(raw) => Ok(Some(parse_non_negative_u64(&raw, name)?)),
         Err(_) => Ok(None),
     }
 }
@@ -1410,6 +1439,11 @@ fn parse_positive_u64(raw: &str, field: &str) -> Result<u64, String> {
 
 fn parse_non_negative_u32(raw: &str, field: &str) -> Result<u32, String> {
     raw.parse::<u32>()
+        .map_err(|error| format!("invalid {field} value `{raw}`: {error}"))
+}
+
+fn parse_non_negative_u64(raw: &str, field: &str) -> Result<u64, String> {
+    raw.parse::<u64>()
         .map_err(|error| format!("invalid {field} value `{raw}`: {error}"))
 }
 
@@ -1644,6 +1678,24 @@ fn validate_bootnode_inputs(bootnodes: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_peer_requirements(min_peers: u64, bootnode_count: usize) -> Result<(), String> {
+    if min_peers == 0 {
+        return Ok(());
+    }
+    if bootnode_count == 0 {
+        return Err(
+            "min peer requirement is enabled but no valid bootnodes were configured; set --bootnode/PASTIS_BOOTNODES or lower --min-peers/PASTIS_MIN_PEERS"
+                .to_string(),
+        );
+    }
+    if min_peers > bootnode_count as u64 {
+        return Err(format!(
+            "min peer requirement {min_peers} exceeds configured bootnode count {bootnode_count}"
+        ));
+    }
+    Ok(())
+}
+
 fn redact_rpc_url(raw: &str) -> String {
     match reqwest::Url::parse(raw) {
         Ok(url) => {
@@ -1669,9 +1721,23 @@ fn redact_rpc_urls(raw: &str) -> String {
         .unwrap_or_else(|_| redact_rpc_url(raw))
 }
 
-fn evaluate_health(progress: &SyncProgress, policy: &HealthPolicy) -> Result<(), String> {
-    if policy.require_peers && progress.peer_count == 0 {
-        return Err("unhealthy: peer_count=0 while peers are required".to_string());
+fn evaluate_health(
+    progress: &SyncProgress,
+    policy: &HealthPolicy,
+    min_peer_count: u64,
+) -> Result<(), String> {
+    let required_peers = if min_peer_count > 0 {
+        min_peer_count
+    } else if policy.require_peers {
+        1
+    } else {
+        0
+    };
+    if progress.peer_count < required_peers {
+        return Err(format!(
+            "unhealthy: peer_count={} below required minimum={required_peers}",
+            progress.peer_count
+        ));
     }
 
     if progress.consecutive_failures > policy.max_consecutive_failures {
@@ -1699,8 +1765,12 @@ fn evaluate_health(progress: &SyncProgress, policy: &HealthPolicy) -> Result<(),
     Ok(())
 }
 
-fn evaluate_readiness(progress: &SyncProgress, policy: &HealthPolicy) -> Result<(), String> {
-    evaluate_health(progress, policy)?;
+fn evaluate_readiness(
+    progress: &SyncProgress,
+    policy: &HealthPolicy,
+    min_peer_count: u64,
+) -> Result<(), String> {
+    evaluate_health(progress, policy, min_peer_count)?;
     if progress.current_block < progress.highest_block {
         return Err(format!(
             "not ready: sync in progress (current={}, highest={})",
@@ -1730,12 +1800,13 @@ fn classify_rpc_task_completion(
 fn unhealthy_exit_reason(
     progress: &SyncProgress,
     policy: &HealthPolicy,
+    min_peer_count: u64,
     exit_on_unhealthy: bool,
 ) -> Option<String> {
     if !exit_on_unhealthy {
         return None;
     }
-    evaluate_health(progress, policy).err()
+    evaluate_health(progress, policy, min_peer_count).err()
 }
 
 fn help_text() -> String {
@@ -1766,6 +1837,7 @@ options:\n\
   --no-strict-canonical-execution    Disable strict canonical execution (equivalent to --strict-canonical-execution=false)\n\
   --bootnode <multiaddr>             Configure bootnode (repeatable)\n\
   --require-peers                    Fail closed when no peers are configured/available\n\
+  --min-peers <n>                    Minimum healthy peer count requirement (0 disables; implies require-peers when n > 0)\n\
   --exit-on-unhealthy                Exit daemon when health checks fail\n\
   --p2p-heartbeat-ms <ms>            P2P heartbeat logging interval\n\
 environment:\n\
@@ -1791,6 +1863,7 @@ environment:\n\
   PASTIS_STRICT_CANONICAL_EXECUTION  Require canonical execution for committed blocks (true/false; used only when strict canonical CLI flags are absent; default=true with production-adapters)\n\
   PASTIS_BOOTNODES                   Comma-separated bootnodes\n\
   PASTIS_REQUIRE_PEERS               Require peers for sync loop health (true/false)\n\
+  PASTIS_MIN_PEERS                   Minimum healthy peer count (0 disables)\n\
   PASTIS_EXIT_ON_UNHEALTHY           Exit daemon when health checks fail (true/false)\n\
   PASTIS_P2P_HEARTBEAT_MS            P2P heartbeat interval\n\
   PASTIS_HEALTH_MAX_CONSECUTIVE_FAILURES   Health failure threshold for consecutive poll failures\n\
@@ -1837,7 +1910,7 @@ mod tests {
             max_sync_lag: 64,
             require_peers: false,
         };
-        assert!(evaluate_health(&progress, &policy).is_ok());
+        assert!(evaluate_health(&progress, &policy, 0).is_ok());
     }
 
     #[tokio::test]
@@ -1873,7 +1946,7 @@ mod tests {
             max_sync_lag: 64,
             require_peers: false,
         };
-        assert!(evaluate_readiness(&progress, &policy).is_ok());
+        assert!(evaluate_readiness(&progress, &policy, 0).is_ok());
     }
 
     #[test]
@@ -1886,7 +1959,7 @@ mod tests {
             max_sync_lag: 64,
             require_peers: false,
         };
-        let error = evaluate_readiness(&progress, &policy).expect_err("should not be ready");
+        let error = evaluate_readiness(&progress, &policy, 0).expect_err("should not be ready");
         assert!(error.contains("not ready"));
     }
 
@@ -1900,7 +1973,7 @@ mod tests {
             max_sync_lag: 64,
             require_peers: false,
         };
-        let error = evaluate_health(&progress, &policy).expect_err("should fail health check");
+        let error = evaluate_health(&progress, &policy, 0).expect_err("should fail health check");
         assert!(error.contains("consecutive_failures"));
     }
 
@@ -1914,7 +1987,7 @@ mod tests {
             max_sync_lag: 64,
             require_peers: false,
         };
-        let error = evaluate_health(&progress, &policy).expect_err("should fail health check");
+        let error = evaluate_health(&progress, &policy, 0).expect_err("should fail health check");
         assert!(error.contains("sync_lag"));
     }
 
@@ -1927,9 +2000,23 @@ mod tests {
             max_sync_lag: 64,
             require_peers: true,
         };
-        let error =
-            evaluate_health(&progress, &policy).expect_err("missing peers must fail health check");
+        let error = evaluate_health(&progress, &policy, 1)
+            .expect_err("missing peers must fail health check");
         assert!(error.contains("peer_count=0"));
+    }
+
+    #[test]
+    fn evaluate_health_fails_when_peer_count_is_below_minimum_threshold() {
+        let mut progress = base_progress();
+        progress.peer_count = 1;
+        let policy = HealthPolicy {
+            max_consecutive_failures: 3,
+            max_sync_lag: 64,
+            require_peers: false,
+        };
+        let error = evaluate_health(&progress, &policy, 2)
+            .expect_err("peer count below min threshold must fail health check");
+        assert!(error.contains("required minimum=2"));
     }
 
     #[test]
@@ -2474,6 +2561,27 @@ mod tests {
     }
 
     #[test]
+    fn validate_peer_requirements_accepts_disabled_or_satisfied_thresholds() {
+        validate_peer_requirements(0, 0).expect("min peers disabled should be valid");
+        validate_peer_requirements(1, 1).expect("exact threshold should be valid");
+        validate_peer_requirements(2, 3).expect("lower-than-bootnode threshold should be valid");
+    }
+
+    #[test]
+    fn validate_peer_requirements_rejects_threshold_without_bootnodes() {
+        let error = validate_peer_requirements(1, 0)
+            .expect_err("min peers with zero bootnodes must fail closed");
+        assert!(error.contains("no valid bootnodes"));
+    }
+
+    #[test]
+    fn validate_peer_requirements_rejects_impossible_threshold() {
+        let error =
+            validate_peer_requirements(3, 2).expect_err("min peers above bootnode count must fail");
+        assert!(error.contains("exceeds configured bootnode count"));
+    }
+
+    #[test]
     fn unhealthy_exit_reason_is_none_when_exit_disabled() {
         let mut progress = base_progress();
         progress.current_block = 1;
@@ -2483,7 +2591,7 @@ mod tests {
             max_sync_lag: 64,
             require_peers: false,
         };
-        assert!(unhealthy_exit_reason(&progress, &policy, false).is_none());
+        assert!(unhealthy_exit_reason(&progress, &policy, 0, false).is_none());
     }
 
     #[test]
@@ -2496,7 +2604,7 @@ mod tests {
             max_sync_lag: 64,
             require_peers: false,
         };
-        let reason = unhealthy_exit_reason(&progress, &policy, true)
+        let reason = unhealthy_exit_reason(&progress, &policy, 0, true)
             .expect("enabled unhealthy exit should surface reason");
         assert!(reason.contains("consecutive_failures"));
     }
@@ -2514,6 +2622,7 @@ mod tests {
                 max_sync_lag: 64,
                 require_peers: false,
             },
+            min_peer_count: 0,
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
             rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
@@ -2548,6 +2657,7 @@ mod tests {
                 max_sync_lag: 64,
                 require_peers: false,
             },
+            min_peer_count: 0,
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
             rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
@@ -2584,6 +2694,7 @@ mod tests {
                 max_sync_lag: 64,
                 require_peers: false,
             },
+            min_peer_count: 0,
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
             rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
@@ -2613,6 +2724,7 @@ mod tests {
                 max_sync_lag: 64,
                 require_peers: false,
             },
+            min_peer_count: 0,
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
             rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
@@ -2647,6 +2759,7 @@ mod tests {
                 max_sync_lag: 64,
                 require_peers: false,
             },
+            min_peer_count: 0,
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(1))),
             rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
@@ -2686,6 +2799,7 @@ mod tests {
                 max_sync_lag: 64,
                 require_peers: false,
             },
+            min_peer_count: 0,
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
             rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
@@ -2714,6 +2828,7 @@ mod tests {
         assert!(text.contains("pastis_rpc_responses_ok_total 1"));
         assert!(text.contains("pastis_rpc_responses_no_content_total 0"));
         assert!(text.contains("pastis_sync_current_block 10"));
+        assert!(text.contains("pastis_sync_min_peer_count 0"));
     }
 
     #[tokio::test]
@@ -2729,6 +2844,7 @@ mod tests {
                 max_sync_lag: 64,
                 require_peers: false,
             },
+            min_peer_count: 0,
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
             rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
@@ -2771,6 +2887,7 @@ mod tests {
                 max_sync_lag: 64,
                 require_peers: false,
             },
+            min_peer_count: 0,
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
             rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
@@ -2795,6 +2912,7 @@ mod tests {
                 max_sync_lag: 64,
                 require_peers: false,
             },
+            min_peer_count: 0,
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
             rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
@@ -2822,6 +2940,7 @@ mod tests {
                 max_sync_lag: 64,
                 require_peers: false,
             },
+            min_peer_count: 0,
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
             rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
@@ -2846,6 +2965,7 @@ mod tests {
                 max_sync_lag: 64,
                 require_peers: false,
             },
+            min_peer_count: 0,
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
             rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
@@ -2861,5 +2981,6 @@ mod tests {
             .expect("valid token should allow status access");
         assert_eq!(payload.0.chain_id, "SN_MAIN");
         assert_eq!(payload.0.current_block, 10);
+        assert_eq!(payload.0.min_peers, 0);
     }
 }
