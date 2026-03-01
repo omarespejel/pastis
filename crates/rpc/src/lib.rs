@@ -220,6 +220,7 @@ impl<'a> StarknetRpcServer<'a> {
             "starknet_blockNumber" => self.block_number(params),
             "starknet_blockHashAndNumber" => self.block_hash_and_number(params),
             "starknet_chainId" => self.chain_id(params),
+            "starknet_specVersion" => self.spec_version(params),
             "starknet_getBlockWithTxHashes" => self.get_block_with_tx_hashes(params),
             "starknet_getBlockWithTxs" => self.get_block_with_txs(params),
             "starknet_getBlockTransactionCount" => self.get_block_transaction_count(params),
@@ -244,6 +245,11 @@ impl<'a> StarknetRpcServer<'a> {
     fn chain_id(&self, params: &Value) -> Result<Value, RpcError> {
         ensure_no_params(params)?;
         Ok(json!(self.chain_id.as_str()))
+    }
+
+    fn spec_version(&self, params: &Value) -> Result<Value, RpcError> {
+        ensure_no_params(params)?;
+        Ok(json!("0.7.0"))
     }
 
     fn block_hash_and_number(&self, params: &Value) -> Result<Value, RpcError> {
@@ -786,6 +792,14 @@ mod tests {
         let raw = r#"{"jsonrpc":"2.0","id":"x","method":"starknet_chainId","params":[]}"#;
         let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
         assert_eq!(value["result"], json!("SN_MAIN"));
+    }
+
+    #[test]
+    fn spec_version_works() {
+        let server = seeded_server();
+        let raw = r#"{"jsonrpc":"2.0","id":"v","method":"starknet_specVersion","params":[]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["result"], json!("0.7.0"));
     }
 
     #[test]
