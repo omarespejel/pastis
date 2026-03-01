@@ -134,6 +134,8 @@ type RuntimeNode = StarknetNode<ThreadSafeStorage<InMemoryStorage>, DualExecutio
 struct LocalJournalEntry {
     block: StarknetBlock,
     state_diff: StarknetStateDiff,
+    #[serde(default)]
+    receipts: Vec<StarknetReceipt>,
 }
 
 #[derive(Debug, Clone)]
@@ -647,19 +649,22 @@ impl NodeRuntime {
             })?;
             let local_block_for_journal = local_block.clone();
 
-            if let Err(error) = self
+            let execution_output = match self
                 .node
                 .execution
                 .execute_block(&local_block, &mut self.execution_state)
             {
-                self.diagnostics.execution_failures =
-                    self.diagnostics.execution_failures.saturating_add(1);
-                let message = format!(
-                    "execution failed for local block {local_block_number} (external {external_block}): {error}"
-                );
-                self.record_failure(message.clone());
-                return Err(message);
-            }
+                Ok(output) => output,
+                Err(error) => {
+                    self.diagnostics.execution_failures =
+                        self.diagnostics.execution_failures.saturating_add(1);
+                    let message = format!(
+                        "execution failed for local block {local_block_number} (external {external_block}): {error}"
+                    );
+                    self.record_failure(message.clone());
+                    return Err(message);
+                }
+            };
 
             let mut staged_execution_state = self.execution_state.clone();
             if let Err(error) =
@@ -678,6 +683,7 @@ impl NodeRuntime {
                 let journal_entry = LocalJournalEntry {
                     block: local_block_for_journal,
                     state_diff: fetch.state_diff.clone(),
+                    receipts: execution_output.receipts.clone(),
                 };
                 if let Err(error) = journal.append_entry(&journal_entry) {
                     self.diagnostics.journal_failures =
@@ -689,11 +695,11 @@ impl NodeRuntime {
                     return Err(message);
                 }
             }
-            if let Err(error) = self
-                .node
-                .storage
-                .insert_block(local_block, fetch.state_diff.clone())
-            {
+            if let Err(error) = self.node.storage.insert_block_with_receipts(
+                local_block,
+                fetch.state_diff.clone(),
+                execution_output.receipts,
+            ) {
                 self.diagnostics.commit_failures =
                     self.diagnostics.commit_failures.saturating_add(1);
                 let message = format!(
@@ -1159,7 +1165,7 @@ fn restore_storage_from_journal(
             ));
         }
         node.storage
-            .insert_block(entry.block, entry.state_diff.clone())
+            .insert_block_with_receipts(entry.block, entry.state_diff.clone(), entry.receipts)
             .map_err(|error| {
                 format!(
                     "failed to restore local journal {} entry {}: {error}",
@@ -2597,6 +2603,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_once_persists_execution_receipts_in_storage() {
+        let sync_source = Arc::new(MockSyncSource::with_blocks(
+            "SN_MAIN",
+            1,
+            vec![sample_fetch(1, "0x0", "0x1")],
+        ));
+        let consensus = Arc::new(HealthyConsensus);
+        let network = Arc::new(MockNetwork {
+            healthy: true,
+            peers: 2,
+        });
+        let mut runtime =
+            NodeRuntime::new_with_backends(runtime_config(), sync_source, consensus, network)
+                .expect("runtime should initialize");
+
+        runtime.poll_once().await.expect("poll should succeed");
+
+        let tx_hash = TxHash::parse("0x111").expect("sample tx hash must parse");
+        let (block_number, tx_index, receipt) = runtime
+            .storage()
+            .get_transaction_receipt(&tx_hash)
+            .expect("receipt lookup should succeed")
+            .expect("receipt should exist");
+        assert_eq!(block_number, 1);
+        assert_eq!(tx_index, 0);
+        assert_eq!(receipt.tx_hash, tx_hash);
+        assert_eq!(receipt.gas_consumed, 1);
+        assert!(receipt.execution_status);
+    }
+
+    #[tokio::test]
     async fn runtime_restores_local_chain_from_journal_on_restart() {
         let dir = tempdir().expect("tempdir");
         let journal_path = dir.path().join("local-journal.jsonl");
@@ -2645,6 +2682,14 @@ mod tests {
                 .expect("restored storage read should work"),
             1
         );
+        let tx_hash = TxHash::parse("0x111").expect("sample tx hash must parse");
+        let (_, _, receipt) = restarted
+            .storage()
+            .get_transaction_receipt(&tx_hash)
+            .expect("receipt lookup should succeed")
+            .expect("restored receipt should exist");
+        assert_eq!(receipt.gas_consumed, 1);
+        assert!(receipt.execution_status);
         let progress = restarted
             .sync_progress_handle()
             .lock()
@@ -2688,6 +2733,7 @@ mod tests {
             .append_entry(&LocalJournalEntry {
                 block: extra_block,
                 state_diff: extra_fetch.state_diff,
+                receipts: Vec::new(),
             })
             .expect("append extra journal entry");
 
@@ -2733,6 +2779,7 @@ mod tests {
         let entry = LocalJournalEntry {
             block,
             state_diff: StarknetStateDiff::default(),
+            receipts: Vec::new(),
         };
         let error = journal
             .append_entry(&entry)
@@ -2754,6 +2801,7 @@ mod tests {
         let entry = LocalJournalEntry {
             block,
             state_diff: StarknetStateDiff::default(),
+            receipts: Vec::new(),
         };
         let error = journal
             .append_entry(&entry)

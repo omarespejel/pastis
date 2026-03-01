@@ -37,7 +37,7 @@ use starknet_node_types::StateReadError;
 use starknet_node_types::{BlockGasPrices, GasPricePerToken};
 use starknet_node_types::{
     BlockId, BlockNumber, ComponentHealth, HealthCheck, HealthStatus, InMemoryState, StarknetBlock,
-    StarknetStateDiff, StarknetTransaction, StateReader, TxHash,
+    StarknetReceipt, StarknetStateDiff, StarknetTransaction, StateReader, TxHash,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -83,6 +83,21 @@ pub enum StorageError {
     },
     #[error("storage backend index inconsistency: {0}")]
     IndexInconsistency(String),
+    #[error("block {block} has {tx_count} transactions but {receipt_count} receipts were provided")]
+    ReceiptCountMismatch {
+        block: BlockNumber,
+        tx_count: usize,
+        receipt_count: usize,
+    },
+    #[error(
+        "receipt hash mismatch at block {block} index {index}: expected {expected}, actual {actual}"
+    )]
+    ReceiptHashMismatch {
+        block: BlockNumber,
+        index: usize,
+        expected: TxHash,
+        actual: TxHash,
+    },
     #[cfg(feature = "apollo-adapter")]
     #[error("apollo storage error: {0}")]
     Apollo(String),
@@ -121,6 +136,15 @@ pub trait StorageBackend: Send + Sync + HealthCheck {
         block: StarknetBlock,
         state_diff: StarknetStateDiff,
     ) -> Result<(), StorageError>;
+    fn insert_block_with_receipts(
+        &mut self,
+        block: StarknetBlock,
+        state_diff: StarknetStateDiff,
+        receipts: Vec<StarknetReceipt>,
+    ) -> Result<(), StorageError> {
+        let _ = receipts;
+        self.insert_block(block, state_diff)
+    }
     fn get_block(&self, id: BlockId) -> Result<Option<StarknetBlock>, StorageError>;
     fn get_state_diff(
         &self,
@@ -145,6 +169,12 @@ pub trait StorageBackend: Send + Sync + HealthCheck {
                 return Ok(Some((number, index, tx.clone())));
             }
         }
+        Ok(None)
+    }
+    fn get_transaction_receipt(
+        &self,
+        _hash: &TxHash,
+    ) -> Result<Option<(BlockNumber, usize, StarknetReceipt)>, StorageError> {
         Ok(None)
     }
     fn current_state_root(&self) -> Result<String, StorageError>;
@@ -224,6 +254,19 @@ impl<S: StorageBackend> StorageBackend for ThreadSafeStorage<S> {
         guard.insert_block(block, state_diff)
     }
 
+    fn insert_block_with_receipts(
+        &mut self,
+        block: StarknetBlock,
+        state_diff: StarknetStateDiff,
+        receipts: Vec<StarknetReceipt>,
+    ) -> Result<(), StorageError> {
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| StorageError::UnsupportedOperation("thread-safe storage lock poisoned"))?;
+        guard.insert_block_with_receipts(block, state_diff, receipts)
+    }
+
     fn get_block(&self, id: BlockId) -> Result<Option<StarknetBlock>, StorageError> {
         let guard = self
             .inner
@@ -251,6 +294,17 @@ impl<S: StorageBackend> StorageBackend for ThreadSafeStorage<S> {
         guard.latest_block_number()
     }
 
+    fn get_transaction_receipt(
+        &self,
+        hash: &TxHash,
+    ) -> Result<Option<(BlockNumber, usize, StarknetReceipt)>, StorageError> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| StorageError::UnsupportedOperation("thread-safe storage lock poisoned"))?;
+        guard.get_transaction_receipt(hash)
+    }
+
     fn current_state_root(&self) -> Result<String, StorageError> {
         let guard = self
             .inner
@@ -276,6 +330,8 @@ pub struct InMemoryStorage {
     state_diffs: BTreeMap<BlockNumber, StarknetStateDiff>,
     states: BTreeMap<BlockNumber, InMemoryState>,
     tx_index: BTreeMap<TxHash, (BlockNumber, usize)>,
+    receipt_index: BTreeMap<TxHash, (BlockNumber, usize)>,
+    receipts: BTreeMap<BlockNumber, Vec<StarknetReceipt>>,
 }
 
 impl InMemoryStorage {
@@ -287,6 +343,8 @@ impl InMemoryStorage {
             state_diffs: BTreeMap::new(),
             states,
             tx_index: BTreeMap::new(),
+            receipt_index: BTreeMap::new(),
+            receipts: BTreeMap::new(),
         }
     }
 }
@@ -345,6 +403,15 @@ impl StorageBackend for InMemoryStorage {
         block: StarknetBlock,
         state_diff: StarknetStateDiff,
     ) -> Result<(), StorageError> {
+        self.insert_block_with_receipts(block, state_diff, Vec::new())
+    }
+
+    fn insert_block_with_receipts(
+        &mut self,
+        block: StarknetBlock,
+        state_diff: StarknetStateDiff,
+        receipts: Vec<StarknetReceipt>,
+    ) -> Result<(), StorageError> {
         block
             .validate()
             .map_err(|error| StorageError::InvalidBlock(error.to_string()))?;
@@ -386,13 +453,44 @@ impl StorageBackend for InMemoryStorage {
             }
         }
 
+        let effective_receipts = if receipts.is_empty() {
+            block
+                .transactions
+                .iter()
+                .map(default_receipt_for_tx)
+                .collect()
+        } else {
+            receipts
+        };
+        if effective_receipts.len() != block.transactions.len() {
+            return Err(StorageError::ReceiptCountMismatch {
+                block: block.number,
+                tx_count: block.transactions.len(),
+                receipt_count: effective_receipts.len(),
+            });
+        }
+        for (index, receipt) in effective_receipts.iter().enumerate() {
+            let expected = &block.transactions[index].hash;
+            if receipt.tx_hash != *expected {
+                return Err(StorageError::ReceiptHashMismatch {
+                    block: block.number,
+                    index,
+                    expected: expected.clone(),
+                    actual: receipt.tx_hash.clone(),
+                });
+            }
+        }
+
         let block_number = block.number;
         for (index, tx) in block.transactions.iter().enumerate() {
             self.tx_index.insert(tx.hash.clone(), (block_number, index));
+            self.receipt_index
+                .insert(tx.hash.clone(), (block_number, index));
         }
         self.blocks.insert(block_number, block);
         self.state_diffs.insert(expected, state_diff);
         self.states.insert(expected, next_state);
+        self.receipts.insert(block_number, effective_receipts);
         Ok(())
     }
 
@@ -445,6 +543,32 @@ impl StorageBackend for InMemoryStorage {
         Ok(Some((block_number, tx_index, tx.clone())))
     }
 
+    fn get_transaction_receipt(
+        &self,
+        hash: &TxHash,
+    ) -> Result<Option<(BlockNumber, usize, StarknetReceipt)>, StorageError> {
+        let Some((block_number, tx_index)) = self.receipt_index.get(hash).copied() else {
+            return Ok(None);
+        };
+        let receipts = self.receipts.get(&block_number).ok_or_else(|| {
+            StorageError::IndexInconsistency(format!(
+                "receipt index points to missing block {block_number} for hash {hash}"
+            ))
+        })?;
+        let receipt = receipts.get(tx_index).ok_or_else(|| {
+            StorageError::IndexInconsistency(format!(
+                "receipt index points to missing receipt index {tx_index} in block {block_number} for hash {hash}"
+            ))
+        })?;
+        if receipt.tx_hash != *hash {
+            return Err(StorageError::IndexInconsistency(format!(
+                "receipt index hash mismatch for block {block_number} index {tx_index}: indexed {hash}, found {}",
+                receipt.tx_hash
+            )));
+        }
+        Ok(Some((block_number, tx_index, receipt.clone())))
+    }
+
     fn current_state_root(&self) -> Result<String, StorageError> {
         // In-memory backend does not maintain Starknet's Patricia tries. Returning a sentinel
         // prevents accidental treatment of this value as a consensus state commitment.
@@ -453,6 +577,15 @@ impl StorageBackend for InMemoryStorage {
 
     fn state_root_semantics(&self) -> StateRootSemantics {
         StateRootSemantics::Approximate
+    }
+}
+
+fn default_receipt_for_tx(tx: &StarknetTransaction) -> StarknetReceipt {
+    StarknetReceipt {
+        tx_hash: tx.hash.clone(),
+        execution_status: true,
+        events: 0,
+        gas_consumed: 0,
     }
 }
 
@@ -693,15 +826,16 @@ fn map_thin_state_diff(diff: ApolloThinStateDiff) -> Result<StarknetStateDiff, S
     }
     for class_hash in diff.class_hash_to_compiled_class_hash.keys() {
         let class_hash_raw = format!("{:#x}", class_hash.0);
-        mapped.declared_classes.push(
-            parse_node_class_hash(&class_hash_raw, "class_hash")?,
-        );
+        mapped
+            .declared_classes
+            .push(parse_node_class_hash(&class_hash_raw, "class_hash")?);
     }
     for class_hash in &diff.deprecated_declared_classes {
         let class_hash_raw = format!("{:#x}", class_hash.0);
-        mapped.declared_classes.push(
-            parse_node_class_hash(&class_hash_raw, "deprecated_class_hash")?,
-        );
+        mapped.declared_classes.push(parse_node_class_hash(
+            &class_hash_raw,
+            "deprecated_class_hash",
+        )?);
     }
     Ok(mapped)
 }
@@ -1058,6 +1192,85 @@ mod tests {
         assert_eq!(found.0, 2);
         assert_eq!(found.1, 0);
         assert_eq!(found.2.hash, lookup_hash);
+    }
+
+    #[test]
+    fn indexed_receipt_lookup_returns_location_and_receipt() {
+        let mut storage = InMemoryStorage::new(InMemoryState::default());
+        storage
+            .insert_block(block(1), StarknetStateDiff::default())
+            .expect("insert block 1");
+        storage
+            .insert_block(block(2), StarknetStateDiff::default())
+            .expect("insert block 2");
+
+        let lookup_hash = starknet_node_types::TxHash::parse("0x2").expect("valid tx hash");
+        let found = storage
+            .get_transaction_receipt(&lookup_hash)
+            .expect("receipt lookup should succeed")
+            .expect("receipt should exist");
+        assert_eq!(found.0, 2);
+        assert_eq!(found.1, 0);
+        assert_eq!(found.2.tx_hash, lookup_hash);
+        assert!(found.2.execution_status);
+    }
+
+    #[test]
+    fn insert_block_with_receipts_rejects_count_mismatch() {
+        let mut storage = InMemoryStorage::new(InMemoryState::default());
+        let err = storage
+            .insert_block_with_receipts(
+                block(1),
+                StarknetStateDiff::default(),
+                vec![
+                    StarknetReceipt {
+                        tx_hash: starknet_node_types::TxHash::parse("0x1").expect("valid tx hash"),
+                        execution_status: true,
+                        events: 0,
+                        gas_consumed: 1,
+                    },
+                    StarknetReceipt {
+                        tx_hash: starknet_node_types::TxHash::parse("0x2").expect("valid tx hash"),
+                        execution_status: true,
+                        events: 0,
+                        gas_consumed: 1,
+                    },
+                ],
+            )
+            .expect_err("receipt count mismatch must fail closed");
+        assert!(matches!(
+            err,
+            StorageError::ReceiptCountMismatch {
+                block: 1,
+                tx_count: 1,
+                receipt_count: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn insert_block_with_receipts_rejects_hash_mismatch() {
+        let mut storage = InMemoryStorage::new(InMemoryState::default());
+        let err = storage
+            .insert_block_with_receipts(
+                block(1),
+                StarknetStateDiff::default(),
+                vec![StarknetReceipt {
+                    tx_hash: starknet_node_types::TxHash::parse("0xdead").expect("valid tx hash"),
+                    execution_status: true,
+                    events: 0,
+                    gas_consumed: 1,
+                }],
+            )
+            .expect_err("receipt hash mismatch must fail closed");
+        assert!(matches!(
+            err,
+            StorageError::ReceiptHashMismatch {
+                block: 1,
+                index: 0,
+                ..
+            }
+        ));
     }
 
     #[test]

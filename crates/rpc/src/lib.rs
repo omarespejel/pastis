@@ -230,6 +230,7 @@ impl<'a> StarknetRpcServer<'a> {
             "starknet_getStateUpdate" => self.get_state_update(params),
             "starknet_getTransactionByHash" => self.get_transaction_by_hash(params),
             "starknet_getTransactionStatus" => self.get_transaction_status(params),
+            "starknet_getTransactionReceipt" => self.get_transaction_receipt(params),
             "starknet_getNonce" => self.get_nonce(params),
             "starknet_getStorageAt" => self.get_storage_at(params),
             "starknet_syncing" => self.syncing(params),
@@ -338,9 +339,46 @@ impl<'a> StarknetRpcServer<'a> {
         self.storage
             .get_transaction_by_hash(&requested_hash)?
             .ok_or(RpcError::TxNotFound)?;
+        let execution_status = self
+            .storage
+            .get_transaction_receipt(&requested_hash)?
+            .map(|(_, _, receipt)| receipt_execution_status(receipt.execution_status))
+            .unwrap_or("SUCCEEDED");
         Ok(json!({
             "finality_status": "ACCEPTED_ON_L2",
-            "execution_status": "SUCCEEDED",
+            "execution_status": execution_status,
+        }))
+    }
+
+    fn get_transaction_receipt(&self, params: &Value) -> Result<Value, RpcError> {
+        let requested_hash = parse_tx_hash_param(params)?;
+        let (block_number, tx_index, receipt) =
+            if let Some(found) = self.storage.get_transaction_receipt(&requested_hash)? {
+                found
+            } else {
+                let (block_number, tx_index, tx) = self
+                    .storage
+                    .get_transaction_by_hash(&requested_hash)?
+                    .ok_or(RpcError::TxNotFound)?;
+                (
+                    block_number,
+                    tx_index,
+                    starknet_node_types::StarknetReceipt {
+                        tx_hash: tx.hash,
+                        execution_status: true,
+                        events: 0,
+                        gas_consumed: 0,
+                    },
+                )
+            };
+        Ok(json!({
+            "transaction_hash": receipt.tx_hash,
+            "block_number": block_number,
+            "transaction_index": tx_index as u64,
+            "finality_status": "ACCEPTED_ON_L2",
+            "execution_status": receipt_execution_status(receipt.execution_status),
+            "events": receipt.events,
+            "gas_consumed": receipt.gas_consumed,
         }))
     }
 
@@ -678,6 +716,14 @@ fn state_diff_to_json(diff: &StarknetStateDiff) -> Value {
     })
 }
 
+fn receipt_execution_status(execution_status: bool) -> &'static str {
+    if execution_status {
+        "SUCCEEDED"
+    } else {
+        "REVERTED"
+    }
+}
+
 fn map_error_to_response(id: Value, error: RpcError) -> JsonRpcResponse {
     match error {
         RpcError::InvalidRequest(message) => error_response(id, ERR_INVALID_REQUEST, message),
@@ -725,7 +771,7 @@ mod tests {
     use starknet_node_storage::InMemoryStorage;
     use starknet_node_types::{
         BlockGasPrices, ContractAddress, GasPricePerToken, InMemoryState, StarknetBlock,
-        StarknetFelt, StarknetStateDiff, StarknetTransaction,
+        StarknetFelt, StarknetReceipt, StarknetStateDiff, StarknetTransaction,
     };
 
     use super::*;
@@ -786,6 +832,45 @@ mod tests {
         diff_2.nonces.insert(contract_2, StarknetFelt::from(2_u64));
         storage
             .insert_block(sample_block(2), diff_2)
+            .expect("insert");
+        let leaked: &'static mut InMemoryStorage = Box::leak(Box::new(storage));
+        StarknetRpcServer::new(leaked, "SN_MAIN")
+    }
+
+    fn seeded_server_with_reverted_tx() -> StarknetRpcServer<'static> {
+        let mut storage = InMemoryStorage::new(InMemoryState::default());
+        let mut diff_1 = StarknetStateDiff::default();
+        let contract_1 = ContractAddress::parse("0x1").expect("valid contract");
+        diff_1
+            .storage_diffs
+            .entry(contract_1.clone())
+            .or_default()
+            .insert("0x10".to_string(), StarknetFelt::from(10_u64));
+        diff_1.nonces.insert(contract_1, StarknetFelt::from(1_u64));
+        storage
+            .insert_block(sample_block(1), diff_1)
+            .expect("insert");
+        let mut diff_2 = StarknetStateDiff::default();
+        let contract_2 = ContractAddress::parse("0x2").expect("valid contract");
+        diff_2
+            .storage_diffs
+            .entry(contract_2.clone())
+            .or_default()
+            .insert("0x20".to_string(), StarknetFelt::from(20_u64));
+        diff_2.nonces.insert(contract_2, StarknetFelt::from(2_u64));
+        let block_2 = sample_block(2);
+        let tx_hash = block_2.transactions[0].hash.clone();
+        storage
+            .insert_block_with_receipts(
+                block_2,
+                diff_2,
+                vec![StarknetReceipt {
+                    tx_hash,
+                    execution_status: false,
+                    events: 3,
+                    gas_consumed: 42,
+                }],
+            )
             .expect("insert");
         let leaked: &'static mut InMemoryStorage = Box::leak(Box::new(storage));
         StarknetRpcServer::new(leaked, "SN_MAIN")
@@ -895,6 +980,35 @@ mod tests {
     fn get_transaction_status_returns_not_found() {
         let server = seeded_server();
         let raw = r#"{"jsonrpc":"2.0","id":21,"method":"starknet_getTransactionStatus","params":["0xdead"]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["error"]["code"], json!(ERR_TX_NOT_FOUND));
+    }
+
+    #[test]
+    fn get_transaction_status_uses_receipt_execution_status() {
+        let server = seeded_server_with_reverted_tx();
+        let raw = r#"{"jsonrpc":"2.0","id":23,"method":"starknet_getTransactionStatus","params":["0x1f6"]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["result"]["finality_status"], json!("ACCEPTED_ON_L2"));
+        assert_eq!(value["result"]["execution_status"], json!("REVERTED"));
+    }
+
+    #[test]
+    fn get_transaction_receipt_works() {
+        let server = seeded_server();
+        let raw = r#"{"jsonrpc":"2.0","id":24,"method":"starknet_getTransactionReceipt","params":["0x1f6"]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["result"]["transaction_hash"], json!("0x1f6"));
+        assert_eq!(value["result"]["block_number"], json!(2));
+        assert_eq!(value["result"]["transaction_index"], json!(0));
+        assert_eq!(value["result"]["finality_status"], json!("ACCEPTED_ON_L2"));
+        assert_eq!(value["result"]["execution_status"], json!("SUCCEEDED"));
+    }
+
+    #[test]
+    fn get_transaction_receipt_returns_not_found() {
+        let server = seeded_server();
+        let raw = r#"{"jsonrpc":"2.0","id":25,"method":"starknet_getTransactionReceipt","params":["0xdead"]}"#;
         let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
         assert_eq!(value["error"]["code"], json!(ERR_TX_NOT_FOUND));
     }
