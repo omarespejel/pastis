@@ -153,7 +153,7 @@ async fn main() -> Result<(), String> {
     }
     println!("require_peers: {}", config.require_peers);
 
-    let rpc_handle = tokio::spawn(async move {
+    let mut rpc_handle = tokio::spawn(async move {
         axum::serve(listener, app)
             .await
             .map_err(|error| format!("rpc server failed: {error}"))
@@ -168,6 +168,9 @@ async fn main() -> Result<(), String> {
 
     loop {
         tokio::select! {
+            rpc_outcome = &mut rpc_handle => {
+                return classify_rpc_task_completion(rpc_outcome);
+            }
             _ = tokio::signal::ctrl_c() => {
                 println!("received shutdown signal");
                 break;
@@ -180,7 +183,9 @@ async fn main() -> Result<(), String> {
         }
     }
 
-    rpc_handle.abort();
+    if !rpc_handle.is_finished() {
+        rpc_handle.abort();
+    }
     match rpc_handle.await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => eprintln!("warning: rpc server exited with error: {error}"),
@@ -598,6 +603,16 @@ fn evaluate_health(progress: &SyncProgress, policy: &HealthPolicy) -> Result<(),
     Ok(())
 }
 
+fn classify_rpc_task_completion(
+    outcome: Result<Result<(), String>, tokio::task::JoinError>,
+) -> Result<(), String> {
+    match outcome {
+        Ok(Ok(())) => Err("rpc server exited unexpectedly".to_string()),
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(format!("rpc server task join error: {error}")),
+    }
+}
+
 fn help_text() -> String {
     format!(
         "usage: starknet-node --upstream-rpc-url <url> [options]\n\
@@ -694,6 +709,20 @@ mod tests {
         };
         let error = evaluate_health(&progress, &policy).expect_err("should fail health check");
         assert!(error.contains("sync_lag"));
+    }
+
+    #[test]
+    fn classify_rpc_task_completion_treats_clean_exit_as_fatal() {
+        let error = classify_rpc_task_completion(Ok(Ok(())))
+            .expect_err("clean RPC task exit should fail closed");
+        assert!(error.contains("exited unexpectedly"));
+    }
+
+    #[test]
+    fn classify_rpc_task_completion_propagates_server_error() {
+        let error = classify_rpc_task_completion(Ok(Err("rpc boom".to_string())))
+            .expect_err("rpc server error should be propagated");
+        assert_eq!(error, "rpc boom");
     }
 
     #[tokio::test]
