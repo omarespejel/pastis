@@ -1652,10 +1652,9 @@ fn parse_block_with_receipts(
             Some(status) if status.eq_ignore_ascii_case("SUCCEEDED") => true,
             Some(status) if status.eq_ignore_ascii_case("REVERTED") => false,
             Some(status) => {
-                warnings.push(format!(
-                    "unexpected receipt execution_status `{status}` at index {idx}; treating as success"
+                return Err(format!(
+                    "unsupported receipt execution_status `{status}` at index {idx} in getBlockWithReceipts"
                 ));
-                true
             }
             None => true,
         };
@@ -2629,6 +2628,25 @@ mod tests {
         let error = parse_block_with_receipts(&block, &mut warnings)
             .expect_err("mismatched receipt ordering must fail closed");
         assert!(error.contains("receipt hash/order mismatch"));
+    }
+
+    #[test]
+    fn parse_block_with_receipts_rejects_unknown_execution_status() {
+        let block = json!({
+            "block_number": 12,
+            "block_hash": "0xabc",
+            "parent_hash": "0x123",
+            "transactions": [{"transaction_hash":"0x1"}],
+            "receipts": [{
+                "transaction_hash":"0x1",
+                "execution_status":"UNKNOWN_STATUS"
+            }]
+        });
+
+        let mut warnings = Vec::new();
+        let error = parse_block_with_receipts(&block, &mut warnings)
+            .expect_err("unknown execution status must fail closed");
+        assert!(error.contains("unsupported receipt execution_status"));
     }
 
     #[test]
