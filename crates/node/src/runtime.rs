@@ -48,6 +48,7 @@ const MAX_RUNTIME_STORAGE_SNAPSHOT_TMP_ATTEMPTS: u32 = 32;
 const MAX_RECENT_ERRORS: usize = 128;
 const MAX_RPC_ERROR_CONTEXT_CHARS: usize = 1_024;
 const MAX_RUNTIME_ERROR_CHARS: usize = 2_048;
+const MAX_RPC_RETRY_BACKOFF_MS: u64 = 5_000;
 const UPSTREAM_REQUEST_ID: u64 = 1;
 const UPSTREAM_BATCH_REQUEST_ID_BASE: u64 = 10_000;
 const RUNTIME_STORAGE_SNAPSHOT_VERSION: u32 = 1;
@@ -57,6 +58,7 @@ const BATCH_MODE_SUPPORTED: u8 = 1;
 const BATCH_MODE_UNSUPPORTED: u8 = 2;
 const BATCH_MODE_FORCED_DISABLED: u8 = 3;
 static RUNTIME_STORAGE_SNAPSHOT_TMP_NONCE: AtomicU64 = AtomicU64::new(0);
+static RETRY_JITTER_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct RpcRetryConfig {
@@ -653,11 +655,13 @@ async fn fetch_block_with_retry_from_source(
                         retry.max_retries.saturating_add(1)
                     ));
                 }
-                let factor = 1_u128 << attempt.min(20);
-                let base_ms = retry.base_backoff.as_millis();
-                let backoff_ms = base_ms.saturating_mul(factor).min(5_000);
-                if backoff_ms > 0 {
-                    sleep(Duration::from_millis(backoff_ms as u64)).await;
+                let backoff = retry_backoff_with_jitter(
+                    retry.base_backoff,
+                    attempt,
+                    next_retry_jitter_seed(block_number ^ u64::from(attempt)),
+                );
+                if !backoff.is_zero() {
+                    sleep(backoff).await;
                 }
                 attempt = attempt.saturating_add(1);
             }
@@ -1255,13 +1259,11 @@ impl NodeRuntime {
     }
 
     fn retry_backoff(&self, attempt: u32) -> Duration {
-        if self.retry.base_backoff.is_zero() {
-            return Duration::ZERO;
-        }
-        let factor = 1_u128 << attempt.min(20);
-        let base_ms = self.retry.base_backoff.as_millis();
-        let backoff_ms = base_ms.saturating_mul(factor).min(5_000);
-        Duration::from_millis(backoff_ms as u64)
+        retry_backoff_with_jitter(
+            self.retry.base_backoff,
+            attempt,
+            next_retry_jitter_seed(u64::from(attempt)),
+        )
     }
 
     fn maybe_persist_storage_snapshot(&mut self, local_block_number: u64) -> Result<(), String> {
@@ -1949,6 +1951,41 @@ fn sanitize_error_message(raw: &str, max_chars: usize) -> String {
     out.extend(trimmed.chars().take(max_chars));
     out.push_str("...<truncated>");
     out
+}
+
+fn retry_backoff_with_jitter(base_backoff: Duration, attempt: u32, seed: u64) -> Duration {
+    if base_backoff.is_zero() {
+        return Duration::ZERO;
+    }
+    let factor = 1_u128 << attempt.min(20);
+    let capped_ms = base_backoff
+        .as_millis()
+        .saturating_mul(factor)
+        .min(u128::from(MAX_RPC_RETRY_BACKOFF_MS));
+    if capped_ms == 0 {
+        return Duration::ZERO;
+    }
+    let capped_ms_u64 = capped_ms as u64;
+    let spread = mix_u64(seed) % capped_ms_u64;
+    Duration::from_millis(spread.saturating_add(1))
+}
+
+fn next_retry_jitter_seed(salt: u64) -> u64 {
+    let nonce = RETRY_JITTER_NONCE.fetch_add(1, Ordering::Relaxed);
+    let now_ns = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
+        Err(_) => 0,
+    };
+    mix_u64(now_ns ^ nonce.rotate_left(17) ^ salt.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
+fn mix_u64(mut value: u64) -> u64 {
+    // SplitMix64 finalizer to spread entropy for jitter sampling.
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 fn redact_upstream_url(raw: String, rpc_url: &str) -> String {
@@ -3033,7 +3070,7 @@ fn decode_ascii_hex(hex: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
     use std::sync::Mutex;
     use std::thread;
     use std::time::Instant;
@@ -4147,6 +4184,43 @@ mod tests {
             "batch requests disabled by configuration"
         );
         assert!(!capability.mark_unsupported());
+    }
+
+    #[test]
+    fn retry_backoff_with_jitter_returns_zero_when_base_backoff_is_zero() {
+        assert_eq!(
+            retry_backoff_with_jitter(Duration::ZERO, 3, 42),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn retry_backoff_with_jitter_is_seed_deterministic_and_bounded() {
+        let base_backoff = Duration::from_millis(250);
+        let attempt = 3;
+        let seed = 0xDEAD_BEEF_u64;
+        let first = retry_backoff_with_jitter(base_backoff, attempt, seed);
+        let second = retry_backoff_with_jitter(base_backoff, attempt, seed);
+        assert_eq!(first, second);
+
+        let cap_ms = 250_u64.saturating_mul(1_u64 << 3);
+        assert!(first >= Duration::from_millis(1));
+        assert!(first <= Duration::from_millis(cap_ms));
+
+        let mut observed = HashSet::new();
+        for value in 0_u64..16 {
+            observed.insert(retry_backoff_with_jitter(base_backoff, attempt, value).as_millis());
+        }
+        assert!(observed.len() > 1);
+    }
+
+    #[test]
+    fn retry_backoff_with_jitter_caps_at_global_max() {
+        let base_backoff = Duration::from_millis(2_000);
+        let attempt = 10;
+        let backoff = retry_backoff_with_jitter(base_backoff, attempt, 7);
+        assert!(backoff >= Duration::from_millis(1));
+        assert!(backoff <= Duration::from_millis(MAX_RPC_RETRY_BACKOFF_MS));
     }
 
     #[test]
