@@ -260,7 +260,7 @@ async fn main() -> Result<(), String> {
         let peer_counter = bootnode_peer_count.clone();
         let sync_progress = app_state.sync_progress.clone();
         tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_millis(heartbeat_ms));
+            let mut ticker = new_daemon_interval(Duration::from_millis(heartbeat_ms));
             loop {
                 ticker.tick().await;
                 let reachable = probe_bootnodes(&endpoints, Duration::from_millis(1_500)).await;
@@ -331,7 +331,7 @@ async fn main() -> Result<(), String> {
         eprintln!("warning: initial sync poll failed: {error}");
     }
 
-    let mut ticker = interval(runtime.poll_interval());
+    let mut ticker = new_daemon_interval(runtime.poll_interval());
     ticker.tick().await;
 
     loop {
@@ -535,6 +535,12 @@ fn unix_now_seconds() -> u64 {
         Ok(duration) => duration.as_secs(),
         Err(_) => 0,
     }
+}
+
+fn new_daemon_interval(period: Duration) -> tokio::time::Interval {
+    let mut ticker = interval(period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker
 }
 
 async fn probe_bootnodes(endpoints: &[BootnodeEndpoint], timeout: Duration) -> usize {
@@ -1480,6 +1486,15 @@ mod tests {
             require_peers: false,
         };
         assert!(evaluate_health(&progress, &policy).is_ok());
+    }
+
+    #[tokio::test]
+    async fn daemon_interval_uses_delay_missed_tick_behavior() {
+        let ticker = new_daemon_interval(Duration::from_millis(100));
+        assert_eq!(
+            ticker.missed_tick_behavior(),
+            tokio::time::MissedTickBehavior::Delay
+        );
     }
 
     #[test]
