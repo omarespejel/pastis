@@ -15,8 +15,7 @@ use starknet_node_execution::{
 use starknet_node_types::{
     BlockContext, BlockGasPrices, BuiltinStats, ContractAddress, ExecutionOutput, GasPricePerToken,
     InMemoryState, MutableState, SimulationResult, StarknetBlock, StarknetReceipt,
-    StarknetStateDiff, StarknetTransaction, StateReader,
-    TxHash,
+    StarknetStateDiff, StarknetTransaction, StateReader, TxHash,
 };
 
 const DEFAULT_ITERATIONS: usize = 5_000;
@@ -178,11 +177,9 @@ fn sample_block(number: u64) -> StarknetBlock {
             },
         },
         protocol_version: Version::new(0, 14, 2),
-        transactions: vec![
-            StarknetTransaction::new(
-                TxHash::parse(format!("0x{number:x}")).expect("valid benchmark tx hash"),
-            ),
-        ],
+        transactions: vec![StarknetTransaction::new(
+            TxHash::parse(format!("0x{number:x}")).expect("valid benchmark tx hash"),
+        )],
     }
 }
 

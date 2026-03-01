@@ -198,6 +198,7 @@ async fn main() -> Result<(), String> {
         max_replay_per_poll: config.max_replay_per_poll,
         chain_id_revalidate_polls: config.chain_id_revalidate_polls,
         replay_checkpoint_path: config.replay_checkpoint_path.clone(),
+        delete_checkpoints_on_zero_tip: false,
         local_journal_path: config.local_journal_path.clone(),
         poll_interval: Duration::from_millis(config.poll_ms),
         rpc_timeout: Duration::from_secs(config.rpc_timeout_secs),
@@ -208,6 +209,7 @@ async fn main() -> Result<(), String> {
         // Runtime-level network backend is static today; daemon owns live bootnode probing.
         peer_count_hint: 0,
         require_peers: false,
+        storage: None,
     };
 
     let mut runtime = NodeRuntime::new(runtime_config)?;

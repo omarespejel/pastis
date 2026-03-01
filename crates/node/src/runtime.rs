@@ -65,18 +65,31 @@ pub struct RuntimeConfig {
     pub max_replay_per_poll: u64,
     pub chain_id_revalidate_polls: u64,
     pub replay_checkpoint_path: Option<String>,
+    pub delete_checkpoints_on_zero_tip: bool,
     pub poll_interval: Duration,
     pub rpc_timeout: Duration,
     pub retry: RpcRetryConfig,
     pub peer_count_hint: usize,
     pub require_peers: bool,
     pub local_journal_path: Option<String>,
+    pub storage: Option<ThreadSafeStorage<InMemoryStorage>>,
 }
 
 impl RuntimeConfig {
     fn validate(&self) -> Result<(), String> {
         if self.upstream_rpc_url.trim().is_empty() {
             return Err("upstream_rpc_url cannot be empty".to_string());
+        }
+        let parsed = reqwest::Url::parse(self.upstream_rpc_url.trim())
+            .map_err(|error| format!("upstream_rpc_url is invalid: {error}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(format!(
+                "upstream_rpc_url must use http or https, got `{}`",
+                parsed.scheme()
+            ));
+        }
+        if parsed.host_str().is_none() {
+            return Err("upstream_rpc_url must include a host".to_string());
         }
         if self.replay_window == 0 {
             return Err("replay_window must be > 0".to_string());
@@ -138,6 +151,8 @@ struct LocalJournalEntry {
     state_diff: StarknetStateDiff,
     #[serde(default)]
     receipts: Vec<StarknetReceipt>,
+    #[serde(default)]
+    block_hash: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -239,12 +254,13 @@ impl LocalChainJournal {
 
     fn append_entry(&self, entry: &LocalJournalEntry) -> Result<(), String> {
         self.ensure_not_symlink()?;
-        let encoded = serde_json::to_string(entry).map_err(|error| {
+        let mut encoded = serde_json::to_string(entry).map_err(|error| {
             format!(
                 "failed to encode local journal entry for {}: {error}",
                 self.path.display()
             )
         })?;
+        encoded.push('\n');
         if encoded.len() > MAX_LOCAL_JOURNAL_LINE_BYTES {
             return Err(format!(
                 "local journal {} entry size {} exceeds max allowed {} bytes",
@@ -263,10 +279,7 @@ impl LocalChainJournal {
                 ));
             }
         };
-        let required_growth = encoded
-            .len()
-            .checked_add(1)
-            .ok_or_else(|| format!("local journal {} entry size overflow", self.path.display()))?;
+        let required_growth = encoded.len();
         let projected_len = existing_len
             .checked_add(required_growth as u64)
             .ok_or_else(|| format!("local journal {} size overflow", self.path.display()))?;
@@ -300,12 +313,6 @@ impl LocalChainJournal {
         file.write_all(encoded.as_bytes()).map_err(|error| {
             format!(
                 "failed to write local journal entry to {}: {error}",
-                self.path.display()
-            )
-        })?;
-        file.write_all(b"\n").map_err(|error| {
-            format!(
-                "failed to write local journal newline to {}: {error}",
                 self.path.display()
             )
         })?;
@@ -481,7 +488,10 @@ impl NodeRuntime {
             config.replay_checkpoint_path.as_deref(),
         )
         .map_err(|error| format!("failed to initialize replay pipeline: {error}"))?;
-        let mut node = build_runtime_node(config.chain_id.clone());
+        let storage = config.storage.clone().unwrap_or_else(|| {
+            ThreadSafeStorage::new(InMemoryStorage::new(InMemoryState::default()))
+        });
+        let mut node = build_runtime_node(config.chain_id.clone(), storage);
         let mut execution_state = InMemoryState::default();
         let journal = config
             .local_journal_path
@@ -510,7 +520,7 @@ impl NodeRuntime {
         let expected_next_local = storage_tip.saturating_add(1);
 
         if replay.next_local_block() != expected_next_local {
-            if storage_tip == 0 {
+            if storage_tip == 0 && config.delete_checkpoints_on_zero_tip {
                 if let Some(path) = config.replay_checkpoint_path.as_deref() {
                     match std::fs::remove_file(path) {
                         Ok(()) => {}
@@ -534,7 +544,7 @@ impl NodeRuntime {
                 }
             } else {
                 return Err(format!(
-                    "replay checkpoint local cursor {} mismatches local storage tip {}; refusing to start",
+                    "replay checkpoint local cursor {} mismatches local storage tip {}; refusing to start (set delete_checkpoints_on_zero_tip=true to allow reset when storage tip is zero)",
                     replay.next_local_block(),
                     storage_tip
                 ));
@@ -589,7 +599,10 @@ impl NodeRuntime {
     }
 
     pub async fn poll_once(&mut self) -> Result<(), String> {
-        self.ensure_chain_id_validated().await?;
+        if let Err(error) = self.ensure_chain_id_validated().await {
+            self.record_failure(error.clone());
+            return Err(error);
+        }
 
         let peer_count = self.network.peer_count() as u64;
         self.update_sync_progress(|progress| {
@@ -602,7 +615,14 @@ impl NodeRuntime {
             return Err(message);
         }
 
-        let external_head_block = self.fetch_latest_block_number_with_retry().await?;
+        let external_head_block =
+            self.fetch_latest_block_number_with_retry()
+                .await
+                .map_err(|error| {
+                    let message = format!("failed to fetch latest external head: {error}");
+                    self.record_failure(message.clone());
+                    message
+                })?;
         self.update_sync_progress(|progress| {
             progress.highest_block = external_head_block;
         })?;
@@ -622,7 +642,15 @@ impl NodeRuntime {
         }
 
         for external_block in replay_plan {
-            let fetch = self.fetch_block_with_retry(external_block).await?;
+            let fetch = self
+                .fetch_block_with_retry(external_block)
+                .await
+                .map_err(|error| {
+                    let message =
+                        format!("failed to fetch external block {external_block}: {error}");
+                    self.record_failure(message.clone());
+                    message
+                })?;
             let consensus_input = ConsensusInput::from(&fetch.replay);
             let consensus_verdict = self.consensus.validate_block(&consensus_input).map_err(
                 |error| {
@@ -715,6 +743,7 @@ impl NodeRuntime {
                     block: local_block_for_journal,
                     state_diff: fetch.state_diff.clone(),
                     receipts: fetch.receipts.clone(),
+                    block_hash: Some(fetch.replay.block_hash.clone()),
                 };
                 if let Err(error) = journal.append_entry(&journal_entry) {
                     self.diagnostics.journal_failures =
@@ -726,10 +755,11 @@ impl NodeRuntime {
                     return Err(message);
                 }
             }
-            if let Err(error) = self.node.storage.insert_block_with_receipts(
+            if let Err(error) = self.node.storage.insert_block_with_metadata(
                 local_block,
                 fetch.state_diff.clone(),
                 fetch.receipts.clone(),
+                Some(fetch.replay.block_hash.clone()),
             ) {
                 self.diagnostics.commit_failures =
                     self.diagnostics.commit_failures.saturating_add(1);
@@ -825,12 +855,10 @@ impl NodeRuntime {
         let upstream_chain_id = self.fetch_chain_id_with_retry().await?;
         let local_chain_id = self.chain_id().to_string();
         if normalize_chain_id(&upstream_chain_id) != normalize_chain_id(&local_chain_id) {
-            let message = format!(
+            return Err(format!(
                 "chain id mismatch: local={} upstream={}",
                 local_chain_id, upstream_chain_id
-            );
-            self.record_failure(message.clone());
-            return Err(message);
+            ));
         }
         self.chain_id_validated = true;
         self.polls_since_chain_id_validation = 0;
@@ -952,8 +980,8 @@ impl UpstreamRpcClient {
         let mut warnings = Vec::new();
         let replay = parse_block_with_txs(&block_with_txs, &mut warnings)?;
         if replay.external_block_number != block_number {
-            warnings.push(format!(
-                "block number mismatch between request ({block_number}) and getBlockWithTxs ({})",
+            return Err(format!(
+                "block number mismatch: requested {block_number}, getBlockWithTxs returned {}",
                 replay.external_block_number
             ));
         }
@@ -967,8 +995,8 @@ impl UpstreamRpcClient {
             .ok_or_else(|| format!("invalid tx count payload: {tx_count_raw}"))?;
         let tx_count_from_replay = replay.transaction_hashes.len() as u64;
         if tx_count_from_rpc != tx_count_from_replay {
-            warnings.push(format!(
-                "tx count mismatch between getBlockTransactionCount ({tx_count_from_rpc}) and getBlockWithTxs ({tx_count_from_replay})"
+            return Err(format!(
+                "tx count mismatch for block {block_number}: getBlockTransactionCount={tx_count_from_rpc}, getBlockWithTxs={tx_count_from_replay}"
             ));
         }
         let state_root = parse_state_root_from_state_update(&state_update)?;
@@ -1193,8 +1221,10 @@ impl SyncSource for UpstreamRpcClient {
     }
 }
 
-fn build_runtime_node(chain_id: ChainId) -> RuntimeNode {
-    let storage = ThreadSafeStorage::new(InMemoryStorage::new(InMemoryState::default()));
+fn build_runtime_node(
+    chain_id: ChainId,
+    storage: ThreadSafeStorage<InMemoryStorage>,
+) -> RuntimeNode {
     StarknetNodeBuilder::new(NodeConfig { chain_id })
         .with_storage(storage)
         .with_execution(build_runtime_execution_backend())
@@ -1251,7 +1281,12 @@ fn restore_storage_from_journal(
             ));
         }
         node.storage
-            .insert_block_with_receipts(entry.block, entry.state_diff.clone(), entry.receipts)
+            .insert_block_with_metadata(
+                entry.block,
+                entry.state_diff.clone(),
+                entry.receipts,
+                entry.block_hash,
+            )
             .map_err(|error| {
                 format!(
                     "failed to restore local journal {} entry {}: {error}",
@@ -2427,13 +2462,49 @@ mod tests {
             max_replay_per_poll: 16,
             chain_id_revalidate_polls: DEFAULT_CHAIN_ID_REVALIDATE_POLLS,
             replay_checkpoint_path: None,
+            delete_checkpoints_on_zero_tip: false,
             poll_interval: Duration::from_millis(500),
             rpc_timeout: Duration::from_secs(3),
             retry: RpcRetryConfig::default(),
             peer_count_hint: 0,
             require_peers: false,
             local_journal_path: None,
+            storage: None,
         }
+    }
+
+    fn write_replay_checkpoint(
+        path: &std::path::Path,
+        next_local_block: u64,
+        replay_window: u64,
+        max_replay_per_poll: u64,
+    ) {
+        let (next_external_block, expected_parent_hash, recent_hashes) = if next_local_block > 1 {
+            let external_block = next_local_block.saturating_sub(1);
+            let parent_hash = format!("0x{external_block:x}");
+            (
+                Some(external_block.saturating_add(1)),
+                Some(parent_hash.clone()),
+                vec![crate::replay::ReplayHashWindowEntry {
+                    external_block_number: external_block,
+                    block_hash: parent_hash,
+                }],
+            )
+        } else {
+            (None, None, Vec::new())
+        };
+        let checkpoint = crate::replay::ReplayCheckpoint {
+            version: crate::replay::REPLAY_CHECKPOINT_VERSION,
+            replay_window,
+            max_replay_per_poll,
+            next_external_block,
+            expected_parent_hash,
+            next_local_block,
+            reorg_events: 0,
+            recent_hashes,
+        };
+        let encoded = serde_json::to_vec_pretty(&checkpoint).expect("checkpoint encode");
+        std::fs::write(path, encoded).expect("checkpoint write");
     }
 
     fn sample_fetch(
@@ -3072,6 +3143,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn runtime_rejects_stale_checkpoint_cursor_without_opt_in_reset() {
+        let dir = tempdir().expect("tempdir");
+        let checkpoint_path = dir.path().join("replay-checkpoint.json");
+        let config = RuntimeConfig {
+            replay_checkpoint_path: Some(checkpoint_path.display().to_string()),
+            ..runtime_config()
+        };
+        write_replay_checkpoint(
+            &checkpoint_path,
+            2,
+            config.replay_window,
+            config.max_replay_per_poll,
+        );
+
+        let err = match NodeRuntime::new_with_backends(
+            config,
+            Arc::new(MockSyncSource::with_blocks("SN_MAIN", 0, Vec::new())),
+            Arc::new(HealthyConsensus),
+            Arc::new(MockNetwork {
+                healthy: true,
+                peers: 1,
+            }),
+        ) {
+            Ok(_) => panic!("stale checkpoint reset must be opt-in"),
+            Err(err) => err,
+        };
+        assert!(err.contains("delete_checkpoints_on_zero_tip=true"));
+        assert!(checkpoint_path.exists());
+    }
+
+    #[test]
+    fn runtime_resets_stale_checkpoint_cursor_when_opted_in() {
+        let dir = tempdir().expect("tempdir");
+        let checkpoint_path = dir.path().join("replay-checkpoint.json");
+        let mut config = RuntimeConfig {
+            replay_checkpoint_path: Some(checkpoint_path.display().to_string()),
+            ..runtime_config()
+        };
+        config.delete_checkpoints_on_zero_tip = true;
+        write_replay_checkpoint(
+            &checkpoint_path,
+            2,
+            config.replay_window,
+            config.max_replay_per_poll,
+        );
+
+        let runtime = NodeRuntime::new_with_backends(
+            config,
+            Arc::new(MockSyncSource::with_blocks("SN_MAIN", 0, Vec::new())),
+            Arc::new(HealthyConsensus),
+            Arc::new(MockNetwork {
+                healthy: true,
+                peers: 1,
+            }),
+        )
+        .expect("opted-in stale checkpoint reset should succeed");
+        assert!(!checkpoint_path.exists());
+        assert_eq!(
+            runtime
+                .storage()
+                .latest_block_number()
+                .expect("storage read should succeed"),
+            0
+        );
+    }
+
     #[tokio::test]
     async fn record_failure_truncates_diagnostics_error_payload() {
         let sync_source = Arc::new(MockSyncSource::with_blocks("SN_MAIN", 0, Vec::new()));
@@ -3236,6 +3374,7 @@ mod tests {
                 block: extra_block,
                 state_diff: extra_fetch.state_diff,
                 receipts: Vec::new(),
+                block_hash: None,
             })
             .expect("append extra journal entry");
 
@@ -3282,6 +3421,7 @@ mod tests {
             block,
             state_diff: StarknetStateDiff::default(),
             receipts: Vec::new(),
+            block_hash: None,
         };
         let error = journal
             .append_entry(&entry)
@@ -3304,6 +3444,7 @@ mod tests {
             block,
             state_diff: StarknetStateDiff::default(),
             receipts: Vec::new(),
+            block_hash: None,
         };
         let error = journal
             .append_entry(&entry)
@@ -3344,6 +3485,7 @@ mod tests {
                 block,
                 state_diff: StarknetStateDiff::default(),
                 receipts: Vec::new(),
+                block_hash: None,
             })
             .expect_err("symlink-backed append must fail closed");
         assert!(error.contains("must not be a symlink"));

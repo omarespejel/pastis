@@ -275,8 +275,9 @@ impl<'a> StarknetRpcServer<'a> {
             .storage
             .get_block(BlockId::Number(latest))?
             .ok_or(RpcError::BlockNotFound)?;
+        let block_hash = self.canonical_block_hash(block.number)?;
         Ok(json!({
-            "block_hash": format!("0x{:x}", block.number),
+            "block_hash": block_hash,
             "block_number": block.number,
         }))
     }
@@ -287,7 +288,8 @@ impl<'a> StarknetRpcServer<'a> {
             .storage
             .get_block(block_id)?
             .ok_or(RpcError::BlockNotFound)?;
-        Ok(block_to_json(&block))
+        let block_hash = self.canonical_block_hash(block.number)?;
+        Ok(block_to_json(&block, &block_hash))
     }
 
     fn get_block_with_tx_hashes(&self, params: &Value) -> Result<Value, RpcError> {
@@ -296,7 +298,8 @@ impl<'a> StarknetRpcServer<'a> {
             .storage
             .get_block(block_id)?
             .ok_or(RpcError::BlockNotFound)?;
-        Ok(block_with_hashes_to_json(&block))
+        let block_hash = self.canonical_block_hash(block.number)?;
+        Ok(block_with_hashes_to_json(&block, &block_hash))
     }
 
     fn get_block_with_receipts(&self, params: &Value) -> Result<Value, RpcError> {
@@ -305,7 +308,8 @@ impl<'a> StarknetRpcServer<'a> {
             .storage
             .get_block(block_id)?
             .ok_or(RpcError::BlockNotFound)?;
-        let mut payload = block_to_json(&block);
+        let block_hash = self.canonical_block_hash(block.number)?;
+        let mut payload = block_to_json(&block, &block_hash);
         let mut receipts = Vec::with_capacity(block.transactions.len());
         for (tx_index, tx) in block.transactions.iter().enumerate() {
             let (receipt_block, receipt_index, receipt) = self
@@ -356,16 +360,24 @@ impl<'a> StarknetRpcServer<'a> {
             .storage
             .get_state_diff(block.number)?
             .ok_or(RpcError::BlockNotFound)?;
-        let old_root = if block.number <= 1 {
+        let old_root = if block.number == 0 {
             "0x0".to_string()
         } else {
-            self.storage
+            let parent = self
+                .storage
                 .get_block(BlockId::Number(block.number.saturating_sub(1)))?
-                .map(|parent| parent.state_root)
-                .unwrap_or_else(|| "0x0".to_string())
+                .ok_or_else(|| {
+                    RpcError::StateRead(format!(
+                        "missing parent block {} for block {} while building state update",
+                        block.number.saturating_sub(1),
+                        block.number
+                    ))
+                })?;
+            parent.state_root
         };
+        let block_hash = self.canonical_block_hash(block.number)?;
         Ok(json!({
-            "block_hash": format!("0x{:x}", block.number),
+            "block_hash": block_hash,
             "new_root": block.state_root,
             "old_root": old_root,
             "state_diff": state_diff_to_json(&state_diff),
@@ -498,6 +510,14 @@ impl<'a> StarknetRpcServer<'a> {
             )));
         }
         Ok((receipt_block, receipt_index, receipt))
+    }
+
+    fn canonical_block_hash(&self, block_number: u64) -> Result<String, RpcError> {
+        self.storage.get_block_hash(block_number)?.ok_or_else(|| {
+            RpcError::StateRead(format!(
+                "canonical block hash unavailable for block {block_number}"
+            ))
+        })
     }
 }
 
@@ -719,10 +739,10 @@ fn parse_tx_hash_param(params: &Value) -> Result<TxHash, RpcError> {
     })
 }
 
-fn block_to_json(block: &StarknetBlock) -> Value {
+fn block_to_json(block: &StarknetBlock, block_hash: &str) -> Value {
     json!({
         "status": "ACCEPTED_ON_L2",
-        "block_hash": format!("0x{:x}", block.number),
+        "block_hash": block_hash,
         "block_number": block.number,
         "new_root": block.state_root,
         "number": block.number,
@@ -744,10 +764,10 @@ fn block_to_json(block: &StarknetBlock) -> Value {
     })
 }
 
-fn block_with_hashes_to_json(block: &StarknetBlock) -> Value {
+fn block_with_hashes_to_json(block: &StarknetBlock, block_hash: &str) -> Value {
     json!({
         "status": "ACCEPTED_ON_L2",
-        "block_hash": format!("0x{:x}", block.number),
+        "block_hash": block_hash,
         "block_number": block.number,
         "new_root": block.state_root,
         "number": block.number,
@@ -925,6 +945,17 @@ mod tests {
                 .insert_block_with_receipts(block, state_diff, receipts)
         }
 
+        fn insert_block_with_metadata(
+            &mut self,
+            block: StarknetBlock,
+            state_diff: StarknetStateDiff,
+            receipts: Vec<StarknetReceipt>,
+            canonical_hash: Option<String>,
+        ) -> Result<(), StorageError> {
+            self.inner
+                .insert_block_with_metadata(block, state_diff, receipts, canonical_hash)
+        }
+
         fn get_block(&self, id: BlockId) -> Result<Option<StarknetBlock>, StorageError> {
             self.inner.get_block(id)
         }
@@ -938,6 +969,10 @@ mod tests {
 
         fn latest_block_number(&self) -> Result<u64, StorageError> {
             self.inner.latest_block_number()
+        }
+
+        fn get_block_hash(&self, block_number: u64) -> Result<Option<String>, StorageError> {
+            self.inner.get_block_hash(block_number)
         }
 
         fn get_transaction_by_hash(
@@ -1007,7 +1042,12 @@ mod tests {
             .insert("0x10".to_string(), StarknetFelt::from(10_u64));
         diff_1.nonces.insert(contract_1, StarknetFelt::from(1_u64));
         storage
-            .insert_block(sample_block(1), diff_1)
+            .insert_block_with_metadata(
+                sample_block(1),
+                diff_1,
+                Vec::new(),
+                Some("0x1".to_string()),
+            )
             .expect("insert");
         let mut diff_2 = StarknetStateDiff::default();
         let contract_2 = ContractAddress::parse("0x2").expect("valid contract");
@@ -1018,7 +1058,12 @@ mod tests {
             .insert("0x20".to_string(), StarknetFelt::from(20_u64));
         diff_2.nonces.insert(contract_2, StarknetFelt::from(2_u64));
         storage
-            .insert_block(sample_block(2), diff_2)
+            .insert_block_with_metadata(
+                sample_block(2),
+                diff_2,
+                Vec::new(),
+                Some("0x2".to_string()),
+            )
             .expect("insert");
         let leaked: &'static mut InMemoryStorage = Box::leak(Box::new(storage));
         StarknetRpcServer::new(leaked, "SN_MAIN")
@@ -1035,7 +1080,12 @@ mod tests {
             .insert("0x10".to_string(), StarknetFelt::from(10_u64));
         diff_1.nonces.insert(contract_1, StarknetFelt::from(1_u64));
         storage
-            .insert_block(sample_block(1), diff_1)
+            .insert_block_with_metadata(
+                sample_block(1),
+                diff_1,
+                Vec::new(),
+                Some("0x1".to_string()),
+            )
             .expect("insert");
         let mut diff_2 = StarknetStateDiff::default();
         let contract_2 = ContractAddress::parse("0x2").expect("valid contract");
@@ -1048,7 +1098,7 @@ mod tests {
         let block_2 = sample_block(2);
         let tx_hash = block_2.transactions[0].hash.clone();
         storage
-            .insert_block_with_receipts(
+            .insert_block_with_metadata(
                 block_2,
                 diff_2,
                 vec![StarknetReceipt {
@@ -1057,6 +1107,7 @@ mod tests {
                     events: 3,
                     gas_consumed: 42,
                 }],
+                Some("0x2".to_string()),
             )
             .expect("insert");
         let leaked: &'static mut InMemoryStorage = Box::leak(Box::new(storage));
@@ -1074,7 +1125,12 @@ mod tests {
             .insert("0x10".to_string(), StarknetFelt::from(10_u64));
         diff_1.nonces.insert(contract_1, StarknetFelt::from(1_u64));
         storage
-            .insert_block(sample_block(1), diff_1)
+            .insert_block_with_metadata(
+                sample_block(1),
+                diff_1,
+                Vec::new(),
+                Some("0x1".to_string()),
+            )
             .expect("insert");
         let mut diff_2 = StarknetStateDiff::default();
         let contract_2 = ContractAddress::parse("0x2").expect("valid contract");
@@ -1085,7 +1141,12 @@ mod tests {
             .insert("0x20".to_string(), StarknetFelt::from(20_u64));
         diff_2.nonces.insert(contract_2, StarknetFelt::from(2_u64));
         storage
-            .insert_block(sample_block(2), diff_2)
+            .insert_block_with_metadata(
+                sample_block(2),
+                diff_2,
+                Vec::new(),
+                Some("0x2".to_string()),
+            )
             .expect("insert");
 
         let leaked: &'static mut MissingReceiptStorage =

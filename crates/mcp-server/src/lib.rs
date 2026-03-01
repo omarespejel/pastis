@@ -277,7 +277,8 @@ mod tests {
         let btcfi = Mutex::new(BtcfiExEx::new(
             Vec::<StandardWrapperMonitor>::new(),
             StrkBtcMonitor::new(starknet_node_exex_btcfi::StrkBtcMonitorConfig {
-                shielded_pool_contract: ContractAddress::parse("0x222").expect("valid contract address"),
+                shielded_pool_contract: ContractAddress::parse("0x222")
+                    .expect("valid contract address"),
                 merkle_root_key: "0x10".to_string(),
                 commitment_count_key: "0x11".to_string(),
                 nullifier_count_key: "0x12".to_string(),

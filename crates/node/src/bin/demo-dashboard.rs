@@ -199,7 +199,8 @@ impl DemoRuntime {
         });
 
         let strkbtc = StrkBtcMonitor::new(StrkBtcMonitorConfig {
-            shielded_pool_contract: ContractAddress::parse(STRKBTC_SHIELDED_POOL).expect("valid contract address"),
+            shielded_pool_contract: ContractAddress::parse(STRKBTC_SHIELDED_POOL)
+                .expect("valid contract address"),
             merkle_root_key: STRKBTC_MERKLE_ROOT_KEY.to_string(),
             commitment_count_key: STRKBTC_COMMITMENT_COUNT_KEY.to_string(),
             nullifier_count_key: STRKBTC_NULLIFIER_COUNT_KEY.to_string(),
@@ -1334,7 +1335,10 @@ fn redact_rpc_url(raw: &str) -> String {
     match reqwest::Url::parse(raw) {
         Ok(url) => {
             let host = url.host_str().unwrap_or("unknown-host");
-            let port = url.port().map(|value| format!(":{value}")).unwrap_or_default();
+            let port = url
+                .port()
+                .map(|value| format!(":{value}"))
+                .unwrap_or_default();
             format!("{}://{}{port}", url.scheme(), host)
         }
         Err(_) => "<invalid-rpc-url>".to_string(),
@@ -1647,7 +1651,8 @@ fn ingest_block_from_fetch(local_number: u64, fetch: &RealFetch) -> Result<Stark
         parent_hash,
         state_root,
         timestamp: replay.timestamp,
-        sequencer_address: ContractAddress::parse(sequencer_address).expect("valid contract address"),
+        sequencer_address: ContractAddress::parse(sequencer_address)
+            .expect("valid contract address"),
         gas_prices: BlockGasPrices {
             l1_gas: GasPricePerToken {
                 price_in_fri: 1,
@@ -1851,7 +1856,8 @@ fn parse_real_btcfi_config_from_env() -> Result<Option<RealBtcfiConfig>, String>
     }
 
     let strkbtc = StrkBtcMonitorConfig {
-        shielded_pool_contract: ContractAddress::parse(strkbtc_pool).expect("valid contract address"),
+        shielded_pool_contract: ContractAddress::parse(strkbtc_pool)
+            .expect("valid contract address"),
         merkle_root_key: env::var("PASTIS_MONITOR_STRKBTC_MERKLE_ROOT_KEY")
             .unwrap_or_else(|_| STRKBTC_MERKLE_ROOT_KEY.to_string()),
         commitment_count_key: env::var("PASTIS_MONITOR_STRKBTC_COMMITMENT_COUNT_KEY")
@@ -2219,7 +2225,9 @@ fn parse_contract_address(raw: &str, warnings: &mut Vec<String>) -> Option<Contr
     canonicalize_hex_felt(raw, "contract address", warnings).and_then(|value| {
         ContractAddress::parse(value).map_or_else(
             |error| {
-                warnings.push(format!("invalid canonical contract address `{raw}`: {error}"));
+                warnings.push(format!(
+                    "invalid canonical contract address `{raw}`: {error}"
+                ));
                 None
             },
             Some,
@@ -3380,9 +3388,10 @@ mod tests {
             ContractAddress::parse("0x1").expect("valid contract address"),
             BTreeMap::from([("0x3".to_string(), StarknetFelt::from(3_u64))]),
         );
-        diff_a
-            .nonces
-            .insert(ContractAddress::parse("0x1").expect("valid contract address"), StarknetFelt::from(9_u64));
+        diff_a.nonces.insert(
+            ContractAddress::parse("0x1").expect("valid contract address"),
+            StarknetFelt::from(9_u64),
+        );
         diff_a
             .declared_classes
             .push(ClassHash::parse("0xa").expect("valid class hash"));
@@ -3399,9 +3408,10 @@ mod tests {
                 ("0x2".to_string(), StarknetFelt::from(2_u64)),
             ]),
         );
-        diff_b
-            .nonces
-            .insert(ContractAddress::parse("0x1").expect("valid contract address"), StarknetFelt::from(9_u64));
+        diff_b.nonces.insert(
+            ContractAddress::parse("0x1").expect("valid contract address"),
+            StarknetFelt::from(9_u64),
+        );
         diff_b
             .declared_classes
             .push(ClassHash::parse("0xa").expect("valid class hash"));
@@ -3494,7 +3504,9 @@ mod tests {
             Some(StarknetFelt::from(2_u64))
         );
         assert_eq!(
-            diff.nonces.get(&ContractAddress::parse("0x111").expect("valid contract address")).copied(),
+            diff.nonces
+                .get(&ContractAddress::parse("0x111").expect("valid contract address"))
+                .copied(),
             Some(StarknetFelt::from(9_u64))
         );
         assert_eq!(diff.declared_classes.len(), 2);
@@ -3527,7 +3539,9 @@ mod tests {
             Some(StarknetFelt::from(0x20_u64))
         );
         assert_eq!(
-            diff.nonces.get(&ContractAddress::parse("0x222").expect("valid contract address")).copied(),
+            diff.nonces
+                .get(&ContractAddress::parse("0x222").expect("valid contract address"))
+                .copied(),
             Some(StarknetFelt::from(5_u64))
         );
     }
