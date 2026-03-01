@@ -614,7 +614,16 @@ async fn status(
     }))
 }
 
-async fn metrics(State(state): State<RpcAppState>) -> impl IntoResponse {
+async fn metrics(State(state): State<RpcAppState>, headers: HeaderMap) -> impl IntoResponse {
+    if !is_rpc_request_authorized(&headers, state.rpc_auth_token.as_deref()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            "missing or invalid bearer token".to_string(),
+        )
+            .into_response();
+    }
+
     let metrics = match state.rpc_metrics.lock() {
         Ok(metrics) => metrics,
         Err(_) => {
@@ -1799,7 +1808,9 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let metrics_response = metrics(State(state)).await.into_response();
+        let metrics_response = metrics(State(state), HeaderMap::new())
+            .await
+            .into_response();
         assert_eq!(metrics_response.status(), StatusCode::OK);
         let body = to_bytes(metrics_response.into_body(), usize::MAX)
             .await
@@ -1840,7 +1851,9 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-        let metrics_response = metrics(State(state)).await.into_response();
+        let metrics_response = metrics(State(state), HeaderMap::new())
+            .await
+            .into_response();
         assert_eq!(metrics_response.status(), StatusCode::OK);
         let body = to_bytes(metrics_response.into_body(), usize::MAX)
             .await
@@ -1850,6 +1863,57 @@ mod tests {
         assert!(text.contains("pastis_rpc_requests_total 1"));
         assert!(text.contains("pastis_rpc_responses_ok_total 0"));
         assert!(text.contains("pastis_rpc_responses_no_content_total 1"));
+    }
+
+    #[tokio::test]
+    async fn metrics_rejects_missing_bearer_token_when_required() {
+        let storage = ThreadSafeStorage::new(InMemoryStorage::new(InMemoryState::default()));
+        let state = RpcAppState {
+            storage,
+            chain_id: "SN_MAIN".to_string(),
+            rpc_auth_token: Some("supersecret".to_string()),
+            sync_progress: Arc::new(Mutex::new(base_progress())),
+            health_policy: HealthPolicy {
+                max_consecutive_failures: 3,
+                max_sync_lag: 64,
+                require_peers: false,
+            },
+            rpc_slots: Arc::new(Semaphore::new(1)),
+            rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
+            rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
+        };
+
+        let response = metrics(State(state), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn metrics_accepts_valid_bearer_token_when_required() {
+        let storage = ThreadSafeStorage::new(InMemoryStorage::new(InMemoryState::default()));
+        let state = RpcAppState {
+            storage,
+            chain_id: "SN_MAIN".to_string(),
+            rpc_auth_token: Some("supersecret".to_string()),
+            sync_progress: Arc::new(Mutex::new(base_progress())),
+            health_policy: HealthPolicy {
+                max_consecutive_failures: 3,
+                max_sync_lag: 64,
+                require_peers: false,
+            },
+            rpc_slots: Arc::new(Semaphore::new(1)),
+            rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
+            rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer supersecret"),
+        );
+        let response = metrics(State(state), headers).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
