@@ -72,6 +72,7 @@ struct RpcAppState {
     health_policy: HealthPolicy,
     rpc_slots: Arc<Semaphore>,
     rpc_rate_limiter: Arc<Mutex<RpcRateLimiter>>,
+    rpc_metrics: Arc<Mutex<RpcRuntimeMetrics>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -160,6 +161,17 @@ impl RpcRateLimiter {
     }
 }
 
+#[derive(Debug, Default)]
+struct RpcRuntimeMetrics {
+    requests_total: u64,
+    responses_ok_total: u64,
+    responses_no_content_total: u64,
+    unauthorized_total: u64,
+    rate_limited_total: u64,
+    concurrency_rejected_total: u64,
+    internal_error_total: u64,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let config = parse_daemon_config()?;
@@ -215,12 +227,14 @@ async fn main() -> Result<(), String> {
         rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(
             config.rpc_rate_limit_per_minute,
         ))),
+        rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
     };
     let app = Router::new()
         .route("/", post(handle_rpc))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/status", get(status))
+        .route("/metrics", get(metrics))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .with_state(app_state);
 
@@ -322,7 +336,14 @@ async fn handle_rpc(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     raw: String,
 ) -> impl IntoResponse {
+    increment_rpc_metrics(&state, |metrics| {
+        metrics.requests_total = metrics.requests_total.saturating_add(1);
+    });
+
     if !is_rpc_request_authorized(&headers, state.rpc_auth_token.as_deref()) {
+        increment_rpc_metrics(&state, |metrics| {
+            metrics.unauthorized_total = metrics.unauthorized_total.saturating_add(1);
+        });
         return (
             StatusCode::UNAUTHORIZED,
             [(header::WWW_AUTHENTICATE, "Bearer")],
@@ -336,6 +357,9 @@ async fn handle_rpc(
         let mut limiter = match state.rpc_rate_limiter.lock() {
             Ok(limiter) => limiter,
             Err(_) => {
+                increment_rpc_metrics(&state, |metrics| {
+                    metrics.internal_error_total = metrics.internal_error_total.saturating_add(1);
+                });
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "rpc rate limiter lock poisoned".to_string(),
@@ -344,6 +368,9 @@ async fn handle_rpc(
             }
         };
         if let Err(message) = limiter.check_and_record(peer_addr.ip(), now_unix_seconds) {
+            increment_rpc_metrics(&state, |metrics| {
+                metrics.rate_limited_total = metrics.rate_limited_total.saturating_add(1);
+            });
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 [(header::RETRY_AFTER, "60")],
@@ -356,6 +383,10 @@ async fn handle_rpc(
     let _rpc_slot = match state.rpc_slots.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
+            increment_rpc_metrics(&state, |metrics| {
+                metrics.concurrency_rejected_total =
+                    metrics.concurrency_rejected_total.saturating_add(1);
+            });
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "rpc concurrency limit reached".to_string(),
@@ -371,6 +402,9 @@ async fn handle_rpc(
             highest_block_num: progress.highest_block,
         },
         Err(_) => {
+            increment_rpc_metrics(&state, |metrics| {
+                metrics.internal_error_total = metrics.internal_error_total.saturating_add(1);
+            });
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "sync progress lock poisoned".to_string(),
@@ -384,15 +418,28 @@ async fn handle_rpc(
         .handle_raw(&raw);
 
     if response.is_empty() {
+        increment_rpc_metrics(&state, |metrics| {
+            metrics.responses_no_content_total =
+                metrics.responses_no_content_total.saturating_add(1);
+        });
         return StatusCode::NO_CONTENT.into_response();
     }
 
+    increment_rpc_metrics(&state, |metrics| {
+        metrics.responses_ok_total = metrics.responses_ok_total.saturating_add(1);
+    });
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
         response,
     )
         .into_response()
+}
+
+fn increment_rpc_metrics(state: &RpcAppState, update: impl FnOnce(&mut RpcRuntimeMetrics)) {
+    if let Ok(mut metrics) = state.rpc_metrics.lock() {
+        update(&mut metrics);
+    }
 }
 
 fn is_rpc_request_authorized(headers: &HeaderMap, required_token: Option<&str>) -> bool {
@@ -503,6 +550,136 @@ async fn status(
         consecutive_failures: progress.consecutive_failures,
         last_error: progress.last_error,
     }))
+}
+
+async fn metrics(State(state): State<RpcAppState>) -> impl IntoResponse {
+    let metrics = match state.rpc_metrics.lock() {
+        Ok(metrics) => metrics,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "rpc metrics lock poisoned".to_string(),
+            )
+                .into_response();
+        }
+    };
+    let progress = match state.sync_progress.lock() {
+        Ok(progress) => progress,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sync progress lock poisoned".to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    let mut body = String::new();
+    use std::fmt::Write as _;
+    let _ = writeln!(
+        body,
+        "# HELP pastis_rpc_requests_total Total JSON-RPC requests accepted by the daemon."
+    );
+    let _ = writeln!(body, "# TYPE pastis_rpc_requests_total counter");
+    let _ = writeln!(body, "pastis_rpc_requests_total {}", metrics.requests_total);
+    let _ = writeln!(
+        body,
+        "# HELP pastis_rpc_responses_ok_total Total JSON-RPC responses returned with body."
+    );
+    let _ = writeln!(body, "# TYPE pastis_rpc_responses_ok_total counter");
+    let _ = writeln!(
+        body,
+        "pastis_rpc_responses_ok_total {}",
+        metrics.responses_ok_total
+    );
+    let _ = writeln!(
+        body,
+        "# HELP pastis_rpc_responses_no_content_total Total JSON-RPC notifications handled without response body."
+    );
+    let _ = writeln!(body, "# TYPE pastis_rpc_responses_no_content_total counter");
+    let _ = writeln!(
+        body,
+        "pastis_rpc_responses_no_content_total {}",
+        metrics.responses_no_content_total
+    );
+    let _ = writeln!(
+        body,
+        "# HELP pastis_rpc_unauthorized_total Total JSON-RPC requests rejected by auth."
+    );
+    let _ = writeln!(body, "# TYPE pastis_rpc_unauthorized_total counter");
+    let _ = writeln!(
+        body,
+        "pastis_rpc_unauthorized_total {}",
+        metrics.unauthorized_total
+    );
+    let _ = writeln!(
+        body,
+        "# HELP pastis_rpc_rate_limited_total Total JSON-RPC requests rejected by rate limiting."
+    );
+    let _ = writeln!(body, "# TYPE pastis_rpc_rate_limited_total counter");
+    let _ = writeln!(
+        body,
+        "pastis_rpc_rate_limited_total {}",
+        metrics.rate_limited_total
+    );
+    let _ = writeln!(
+        body,
+        "# HELP pastis_rpc_concurrency_rejected_total Total JSON-RPC requests rejected by concurrency controls."
+    );
+    let _ = writeln!(body, "# TYPE pastis_rpc_concurrency_rejected_total counter");
+    let _ = writeln!(
+        body,
+        "pastis_rpc_concurrency_rejected_total {}",
+        metrics.concurrency_rejected_total
+    );
+    let _ = writeln!(
+        body,
+        "# HELP pastis_rpc_internal_error_total Total JSON-RPC requests failed due to daemon internal errors."
+    );
+    let _ = writeln!(body, "# TYPE pastis_rpc_internal_error_total counter");
+    let _ = writeln!(
+        body,
+        "pastis_rpc_internal_error_total {}",
+        metrics.internal_error_total
+    );
+    let _ = writeln!(
+        body,
+        "# HELP pastis_sync_current_block Current synced block number."
+    );
+    let _ = writeln!(body, "# TYPE pastis_sync_current_block gauge");
+    let _ = writeln!(body, "pastis_sync_current_block {}", progress.current_block);
+    let _ = writeln!(
+        body,
+        "# HELP pastis_sync_highest_block Highest known block number."
+    );
+    let _ = writeln!(body, "# TYPE pastis_sync_highest_block gauge");
+    let _ = writeln!(body, "pastis_sync_highest_block {}", progress.highest_block);
+    let _ = writeln!(
+        body,
+        "# HELP pastis_sync_peer_count Current peer count observed by sync runtime."
+    );
+    let _ = writeln!(body, "# TYPE pastis_sync_peer_count gauge");
+    let _ = writeln!(body, "pastis_sync_peer_count {}", progress.peer_count);
+    let _ = writeln!(
+        body,
+        "# HELP pastis_sync_consecutive_failures Current consecutive sync poll failures."
+    );
+    let _ = writeln!(body, "# TYPE pastis_sync_consecutive_failures gauge");
+    let _ = writeln!(
+        body,
+        "pastis_sync_consecutive_failures {}",
+        progress.consecutive_failures
+    );
+
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
 }
 
 fn parse_daemon_config() -> Result<DaemonConfig, String> {
@@ -1237,6 +1414,7 @@ mod tests {
             },
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
+            rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
         };
 
         let _permit = state
@@ -1269,6 +1447,7 @@ mod tests {
             },
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
+            rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
         };
 
         let response = handle_rpc(
@@ -1302,6 +1481,7 @@ mod tests {
             },
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
+            rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
         };
 
         let response = handle_rpc(
@@ -1329,6 +1509,7 @@ mod tests {
             },
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
+            rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
         };
 
         let mut headers = HeaderMap::new();
@@ -1361,6 +1542,7 @@ mod tests {
             },
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(1))),
+            rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
         };
 
         let first = handle_rpc(
@@ -1385,6 +1567,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metrics_reports_rpc_counters_after_successful_request() {
+        let storage = ThreadSafeStorage::new(InMemoryStorage::new(InMemoryState::default()));
+        let state = RpcAppState {
+            storage,
+            chain_id: "SN_MAIN".to_string(),
+            rpc_auth_token: None,
+            sync_progress: Arc::new(Mutex::new(base_progress())),
+            health_policy: HealthPolicy {
+                max_consecutive_failures: 3,
+                max_sync_lag: 64,
+            },
+            rpc_slots: Arc::new(Semaphore::new(1)),
+            rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
+            rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
+        };
+
+        let response = handle_rpc(
+            State(state.clone()),
+            HeaderMap::new(),
+            peer(30_006),
+            r#"{"jsonrpc":"2.0","id":113,"method":"starknet_blockNumber","params":[]}"#.to_string(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let metrics_response = metrics(State(state)).await.into_response();
+        assert_eq!(metrics_response.status(), StatusCode::OK);
+        let body = to_bytes(metrics_response.into_body(), usize::MAX)
+            .await
+            .expect("metrics response body should be readable");
+        let text =
+            String::from_utf8(body.to_vec()).expect("metrics payload should be valid UTF-8 text");
+        assert!(text.contains("pastis_rpc_requests_total 1"));
+        assert!(text.contains("pastis_rpc_responses_ok_total 1"));
+        assert!(text.contains("pastis_rpc_responses_no_content_total 0"));
+        assert!(text.contains("pastis_sync_current_block 10"));
+    }
+
+    #[tokio::test]
+    async fn metrics_reports_notification_counter_for_no_content_responses() {
+        let storage = ThreadSafeStorage::new(InMemoryStorage::new(InMemoryState::default()));
+        let state = RpcAppState {
+            storage,
+            chain_id: "SN_MAIN".to_string(),
+            rpc_auth_token: None,
+            sync_progress: Arc::new(Mutex::new(base_progress())),
+            health_policy: HealthPolicy {
+                max_consecutive_failures: 3,
+                max_sync_lag: 64,
+            },
+            rpc_slots: Arc::new(Semaphore::new(1)),
+            rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
+            rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
+        };
+
+        let response = handle_rpc(
+            State(state.clone()),
+            HeaderMap::new(),
+            peer(30_007),
+            r#"{"jsonrpc":"2.0","method":"starknet_blockNumber","params":[]}"#.to_string(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let metrics_response = metrics(State(state)).await.into_response();
+        assert_eq!(metrics_response.status(), StatusCode::OK);
+        let body = to_bytes(metrics_response.into_body(), usize::MAX)
+            .await
+            .expect("metrics response body should be readable");
+        let text =
+            String::from_utf8(body.to_vec()).expect("metrics payload should be valid UTF-8 text");
+        assert!(text.contains("pastis_rpc_requests_total 1"));
+        assert!(text.contains("pastis_rpc_responses_ok_total 0"));
+        assert!(text.contains("pastis_rpc_responses_no_content_total 1"));
+    }
+
+    #[tokio::test]
     async fn status_rejects_missing_bearer_token_when_required() {
         let storage = ThreadSafeStorage::new(InMemoryStorage::new(InMemoryState::default()));
         let state = RpcAppState {
@@ -1398,6 +1659,7 @@ mod tests {
             },
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
+            rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
         };
 
         let response = status(State(state), HeaderMap::new())
@@ -1420,6 +1682,7 @@ mod tests {
             },
             rpc_slots: Arc::new(Semaphore::new(1)),
             rpc_rate_limiter: Arc::new(Mutex::new(RpcRateLimiter::new(0))),
+            rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
         };
 
         let mut headers = HeaderMap::new();
