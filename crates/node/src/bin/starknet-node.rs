@@ -203,6 +203,11 @@ async fn main() -> Result<(), String> {
                 .to_string(),
         );
     }
+    let initial_peers = if bootnode_endpoints.is_empty() {
+        0
+    } else {
+        probe_bootnodes(&bootnode_endpoints, Duration::from_millis(1_500)).await
+    };
 
     let runtime_config = RuntimeConfig {
         chain_id: config.chain_id.clone(),
@@ -222,13 +227,13 @@ async fn main() -> Result<(), String> {
             base_backoff: Duration::from_millis(config.rpc_retry_backoff_ms),
         },
         disable_batch_requests: config.disable_batch_requests,
-        // Runtime-level network backend is static today; daemon owns live bootnode probing.
-        peer_count_hint: 0,
-        require_peers: false,
+        peer_count_hint: initial_peers,
+        require_peers: config.require_peers,
         storage: None,
     };
 
     let mut runtime = NodeRuntime::new(runtime_config)?;
+    runtime.report_peer_count(initial_peers);
     let storage = runtime.storage();
     let sync_progress = runtime.sync_progress_handle();
     let chain_id = runtime.chain_id().to_string();
@@ -250,14 +255,9 @@ async fn main() -> Result<(), String> {
         rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
     };
 
-    let bootnode_peer_count = Arc::new(AtomicU64::new(0));
-    if !bootnode_endpoints.is_empty() {
-        let initial_peers =
-            probe_bootnodes(&bootnode_endpoints, Duration::from_millis(1_500)).await;
-        bootnode_peer_count.store(initial_peers as u64, Ordering::Relaxed);
-        if let Ok(mut progress) = app_state.sync_progress.lock() {
-            progress.peer_count = initial_peers as u64;
-        }
+    let bootnode_peer_count = Arc::new(AtomicU64::new(initial_peers as u64));
+    if let Ok(mut progress) = app_state.sync_progress.lock() {
+        progress.peer_count = initial_peers as u64;
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -366,6 +366,8 @@ async fn main() -> Result<(), String> {
                 break;
             }
             _ = ticker.tick() => {
+                let observed_peers = bootnode_peer_count.load(Ordering::Relaxed) as usize;
+                runtime.report_peer_count(observed_peers);
                 if let Err(error) = runtime.poll_once().await {
                     eprintln!("warning: sync poll failed: {error}");
                 }
@@ -374,7 +376,7 @@ async fn main() -> Result<(), String> {
                     let mut progress = progress_handle
                         .lock()
                         .map_err(|_| "sync progress lock poisoned".to_string())?;
-                    progress.peer_count = bootnode_peer_count.load(Ordering::Relaxed);
+                    progress.peer_count = observed_peers as u64;
                     progress.clone()
                 };
                 if let Some(reason) = unhealthy_exit_reason(

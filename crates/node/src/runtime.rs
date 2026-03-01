@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -31,8 +31,9 @@ use starknet_node_storage::{
 use starknet_node_types::ExecutableStarknetTransaction;
 use starknet_node_types::{
     BlockContext, BlockGasPrices, BuiltinStats, ClassHash, ContractAddress, ExecutionOutput,
-    GasPricePerToken, InMemoryState, MutableState, SimulationResult, StarknetBlock, StarknetFelt,
-    StarknetReceipt, StarknetStateDiff, StarknetTransaction, StateReader, TxHash,
+    GasPricePerToken, InMemoryState, MAX_TRANSACTIONS_PER_BLOCK, MutableState, SimulationResult,
+    StarknetBlock, StarknetFelt, StarknetReceipt, StarknetStateDiff, StarknetTransaction,
+    StateReader, TxHash,
 };
 
 pub const DEFAULT_SYNC_POLL_MS: u64 = 1_500;
@@ -60,6 +61,8 @@ const UPSTREAM_REQUEST_ID: u64 = 1;
 const UPSTREAM_BATCH_REQUEST_ID_BASE: u64 = 10_000;
 const RUNTIME_STORAGE_SNAPSHOT_VERSION: u32 = 1;
 pub const DEFAULT_STORAGE_SNAPSHOT_INTERVAL_BLOCKS: u64 = 128;
+const DEFAULT_CONSENSUS_MAX_FUTURE_SKEW_SECS: u64 = 120;
+const DEFAULT_NETWORK_STALE_AFTER_SECS: u64 = 120;
 const BATCH_MODE_AUTO: u8 = 0;
 const BATCH_MODE_SUPPORTED: u8 = 1;
 const BATCH_MODE_UNSUPPORTED: u8 = 2;
@@ -858,10 +861,93 @@ trait ConsensusBackend: Send + Sync {
     fn validate_block(&self, input: &ConsensusInput) -> Result<ConsensusVerdict, String>;
 }
 
-struct AllowAllConsensusBackend;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProductionConsensusPolicy {
+    max_future_skew_secs: u64,
+    reject_timestamp_regression: bool,
+}
 
-impl ConsensusBackend for AllowAllConsensusBackend {
-    fn validate_block(&self, _input: &ConsensusInput) -> Result<ConsensusVerdict, String> {
+impl Default for ProductionConsensusPolicy {
+    fn default() -> Self {
+        Self {
+            max_future_skew_secs: DEFAULT_CONSENSUS_MAX_FUTURE_SKEW_SECS,
+            reject_timestamp_regression: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedConsensusHead {
+    block_number: u64,
+    block_hash: String,
+    timestamp: u64,
+}
+
+struct ProductionConsensusBackend {
+    policy: ProductionConsensusPolicy,
+    last_head: Mutex<Option<ObservedConsensusHead>>,
+}
+
+impl ProductionConsensusBackend {
+    fn new(policy: ProductionConsensusPolicy) -> Self {
+        Self {
+            policy,
+            last_head: Mutex::new(None),
+        }
+    }
+}
+
+impl Default for ProductionConsensusBackend {
+    fn default() -> Self {
+        Self::new(ProductionConsensusPolicy::default())
+    }
+}
+
+impl ConsensusBackend for ProductionConsensusBackend {
+    fn validate_block(&self, input: &ConsensusInput) -> Result<ConsensusVerdict, String> {
+        if input.tx_count > MAX_TRANSACTIONS_PER_BLOCK {
+            return Ok(ConsensusVerdict::Reject);
+        }
+        if StarknetFelt::from_str(&input.block_hash).is_err()
+            || StarknetFelt::from_str(&input.parent_hash).is_err()
+        {
+            return Ok(ConsensusVerdict::Reject);
+        }
+        let now = unix_now_seconds();
+        if input.timestamp > now.saturating_add(self.policy.max_future_skew_secs) {
+            return Ok(ConsensusVerdict::Reject);
+        }
+
+        let mut last_head = self
+            .last_head
+            .lock()
+            .map_err(|_| "consensus state lock poisoned".to_string())?;
+
+        if let Some(previous) = last_head.as_ref() {
+            if input.external_block_number < previous.block_number {
+                return Ok(ConsensusVerdict::Reject);
+            }
+            if input.external_block_number == previous.block_number {
+                if input.block_hash == previous.block_hash && input.timestamp == previous.timestamp {
+                    return Ok(ConsensusVerdict::Accept);
+                }
+                return Ok(ConsensusVerdict::Reject);
+            }
+            if input.external_block_number == previous.block_number.saturating_add(1)
+                && input.parent_hash != previous.block_hash
+            {
+                return Ok(ConsensusVerdict::Reject);
+            }
+            if self.policy.reject_timestamp_regression && input.timestamp < previous.timestamp {
+                return Ok(ConsensusVerdict::Reject);
+            }
+        }
+
+        *last_head = Some(ObservedConsensusHead {
+            block_number: input.external_block_number,
+            block_hash: input.block_hash.clone(),
+            timestamp: input.timestamp,
+        });
         Ok(ConsensusVerdict::Accept)
     }
 }
@@ -869,30 +955,57 @@ impl ConsensusBackend for AllowAllConsensusBackend {
 trait NetworkBackend: Send + Sync {
     fn is_healthy(&self) -> bool;
     fn peer_count(&self) -> usize;
+    fn report_peer_count(&self, _peer_count: usize) {}
 }
 
-struct StaticNetworkBackend {
-    peer_count: usize,
-    healthy: bool,
+struct ProductionNetworkBackend {
+    peer_count: AtomicUsize,
+    require_peers: bool,
+    stale_after_secs: u64,
+    has_observation: AtomicBool,
+    last_observation_unix_seconds: AtomicU64,
 }
 
-impl StaticNetworkBackend {
-    fn from_config(peer_count: usize, require_peers: bool) -> Self {
-        let healthy = !require_peers || peer_count > 0;
+impl ProductionNetworkBackend {
+    fn from_config(peer_count: usize, require_peers: bool, stale_after_secs: u64) -> Self {
+        let now = unix_now_seconds();
+        let has_observation = !require_peers || peer_count > 0;
         Self {
-            peer_count,
-            healthy,
+            peer_count: AtomicUsize::new(peer_count),
+            require_peers,
+            stale_after_secs: stale_after_secs.max(1),
+            has_observation: AtomicBool::new(has_observation),
+            last_observation_unix_seconds: AtomicU64::new(now),
         }
     }
 }
 
-impl NetworkBackend for StaticNetworkBackend {
+impl NetworkBackend for ProductionNetworkBackend {
     fn is_healthy(&self) -> bool {
-        self.healthy
+        if !self.require_peers {
+            return true;
+        }
+        let peer_count = self.peer_count.load(Ordering::Relaxed);
+        if peer_count == 0 {
+            return false;
+        }
+        if !self.has_observation.load(Ordering::Relaxed) {
+            return false;
+        }
+        let last_observed = self.last_observation_unix_seconds.load(Ordering::Relaxed);
+        let now = unix_now_seconds();
+        now.saturating_sub(last_observed) <= self.stale_after_secs
     }
 
     fn peer_count(&self) -> usize {
-        self.peer_count
+        self.peer_count.load(Ordering::Relaxed)
+    }
+
+    fn report_peer_count(&self, peer_count: usize) {
+        self.peer_count.store(peer_count, Ordering::Relaxed);
+        self.last_observation_unix_seconds
+            .store(unix_now_seconds(), Ordering::Relaxed);
+        self.has_observation.store(true, Ordering::Relaxed);
     }
 }
 
@@ -941,10 +1054,11 @@ impl NodeRuntime {
             }
             Arc::new(FailoverSyncSource::new(sources)?)
         };
-        let consensus = Arc::new(AllowAllConsensusBackend);
-        let network = Arc::new(StaticNetworkBackend::from_config(
+        let consensus = Arc::new(ProductionConsensusBackend::default());
+        let network = Arc::new(ProductionNetworkBackend::from_config(
             config.peer_count_hint,
             config.require_peers,
+            DEFAULT_NETWORK_STALE_AFTER_SECS,
         ));
         Self::new_with_backends(config, sync_source, consensus, network)
     }
@@ -1047,6 +1161,7 @@ impl NodeRuntime {
             starting_block: storage_tip,
             current_block: storage_tip,
             highest_block: storage_tip,
+            peer_count: network.peer_count() as u64,
             ..SyncProgress::default()
         };
         progress.reorg_events = replay.reorg_events();
@@ -1094,6 +1209,13 @@ impl NodeRuntime {
 
     pub fn diagnostics(&self) -> RuntimeDiagnostics {
         self.diagnostics.clone()
+    }
+
+    pub fn report_peer_count(&self, peer_count: usize) {
+        self.network.report_peer_count(peer_count);
+        let _ = self.update_sync_progress(|progress| {
+            progress.peer_count = peer_count as u64;
+        });
     }
 
     pub async fn poll_once(&mut self) -> Result<(), String> {
@@ -2185,6 +2307,13 @@ fn retry_backoff_with_jitter(base_backoff: Duration, attempt: u32, seed: u64) ->
     let capped_ms_u64 = capped_ms as u64;
     let spread = mix_u64(seed) % capped_ms_u64;
     Duration::from_millis(spread.saturating_add(1))
+}
+
+fn unix_now_seconds() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(_) => 0,
+    }
 }
 
 fn next_retry_jitter_seed(salt: u64) -> u64 {
@@ -5060,6 +5189,105 @@ mod tests {
         assert_eq!(normalize_chain_id("0x00534E5F4D41494E"), "SN_MAIN");
     }
 
+    #[test]
+    fn production_consensus_accepts_sequential_blocks() {
+        let backend = ProductionConsensusBackend::new(ProductionConsensusPolicy {
+            max_future_skew_secs: u64::MAX,
+            reject_timestamp_regression: true,
+        });
+        let first = ConsensusInput {
+            external_block_number: 10,
+            block_hash: "0x10".to_string(),
+            parent_hash: "0x0f".to_string(),
+            timestamp: 1_000,
+            tx_count: 0,
+        };
+        let second = ConsensusInput {
+            external_block_number: 11,
+            block_hash: "0x11".to_string(),
+            parent_hash: "0x10".to_string(),
+            timestamp: 1_001,
+            tx_count: 3,
+        };
+        assert_eq!(
+            backend
+                .validate_block(&first)
+                .expect("first block should validate"),
+            ConsensusVerdict::Accept
+        );
+        assert_eq!(
+            backend
+                .validate_block(&second)
+                .expect("second block should validate"),
+            ConsensusVerdict::Accept
+        );
+    }
+
+    #[test]
+    fn production_consensus_rejects_parent_mismatch_and_regression() {
+        let backend = ProductionConsensusBackend::new(ProductionConsensusPolicy {
+            max_future_skew_secs: u64::MAX,
+            reject_timestamp_regression: true,
+        });
+        let base = ConsensusInput {
+            external_block_number: 50,
+            block_hash: "0x50".to_string(),
+            parent_hash: "0x4f".to_string(),
+            timestamp: 10_000,
+            tx_count: 1,
+        };
+        assert_eq!(
+            backend.validate_block(&base).expect("base block should validate"),
+            ConsensusVerdict::Accept
+        );
+
+        let bad_parent = ConsensusInput {
+            external_block_number: 51,
+            block_hash: "0x51".to_string(),
+            parent_hash: "0xdead".to_string(),
+            timestamp: 10_001,
+            tx_count: 1,
+        };
+        assert_eq!(
+            backend
+                .validate_block(&bad_parent)
+                .expect("bad parent should still return verdict"),
+            ConsensusVerdict::Reject
+        );
+
+        let stale = ConsensusInput {
+            external_block_number: 49,
+            block_hash: "0x49".to_string(),
+            parent_hash: "0x48".to_string(),
+            timestamp: 9_999,
+            tx_count: 1,
+        };
+        assert_eq!(
+            backend
+                .validate_block(&stale)
+                .expect("stale block should still return verdict"),
+            ConsensusVerdict::Reject
+        );
+    }
+
+    #[test]
+    fn production_network_requires_fresh_peer_observations() {
+        let backend = ProductionNetworkBackend::from_config(1, true, 1);
+        assert!(backend.is_healthy());
+
+        backend.last_observation_unix_seconds.store(
+            unix_now_seconds().saturating_sub(5),
+            Ordering::Relaxed,
+        );
+        assert!(!backend.is_healthy());
+
+        backend.report_peer_count(2);
+        assert!(backend.is_healthy());
+
+        backend.report_peer_count(0);
+        assert!(!backend.is_healthy());
+    }
+
     #[tokio::test]
     async fn poll_once_fails_closed_when_network_is_unhealthy() {
         let sync_source = Arc::new(MockSyncSource::with_blocks("SN_MAIN", 0, Vec::new()));
@@ -5077,6 +5305,26 @@ mod tests {
             .poll_once()
             .await
             .expect_err("unhealthy network must fail closed");
+        assert!(error.contains("network backend unhealthy"));
+        assert_eq!(runtime.diagnostics().network_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn poll_once_fails_closed_when_required_peer_observation_drops_to_zero() {
+        let sync_source = Arc::new(MockSyncSource::with_blocks("SN_MAIN", 0, Vec::new()));
+        let consensus = Arc::new(HealthyConsensus);
+        let network = Arc::new(ProductionNetworkBackend::from_config(1, true, 60));
+        let mut config = runtime_config();
+        config.require_peers = true;
+
+        let mut runtime = NodeRuntime::new_with_backends(config, sync_source, consensus, network)
+            .expect("runtime should initialize");
+        runtime.report_peer_count(0);
+
+        let error = runtime
+            .poll_once()
+            .await
+            .expect_err("peer loss must fail closed");
         assert!(error.contains("network backend unhealthy"));
         assert_eq!(runtime.diagnostics().network_failures, 1);
     }
