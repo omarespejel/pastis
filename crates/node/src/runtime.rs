@@ -265,6 +265,14 @@ struct RuntimeBlockReplay {
 }
 
 #[derive(Debug, Clone)]
+struct RuntimeBlockHashes {
+    external_block_number: u64,
+    block_hash: String,
+    parent_hash: String,
+    transaction_hashes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 struct RuntimeFetch {
     replay: RuntimeBlockReplay,
     state_diff: StarknetStateDiff,
@@ -826,9 +834,12 @@ impl UpstreamRpcClient {
     async fn fetch_block(&self, block_number: u64) -> Result<RuntimeFetch, String> {
         let block_selector = json!([{ "block_number": block_number }]);
 
-        let block_with_txs = self
-            .call("starknet_getBlockWithTxs", block_selector.clone())
-            .await?;
+        let (block_with_txs, tx_count_raw, block_with_hashes, state_update) = tokio::try_join!(
+            self.call("starknet_getBlockWithTxs", block_selector.clone()),
+            self.call("starknet_getBlockTransactionCount", block_selector.clone()),
+            self.call("starknet_getBlockWithTxHashes", block_selector.clone()),
+            self.call("starknet_getStateUpdate", block_selector),
+        )?;
 
         let mut warnings = Vec::new();
         let replay = parse_block_with_txs(&block_with_txs, &mut warnings)?;
@@ -839,9 +850,9 @@ impl UpstreamRpcClient {
             ));
         }
 
-        let tx_count_raw = self
-            .call("starknet_getBlockTransactionCount", block_selector.clone())
-            .await?;
+        let hashes_view = parse_block_with_tx_hashes(&block_with_hashes, &mut warnings)?;
+        compare_block_views(&replay, &hashes_view, &mut warnings);
+
         let tx_count_from_rpc = value_as_u64(&tx_count_raw)
             .ok_or_else(|| format!("invalid tx count payload: {tx_count_raw}"))?;
         let tx_count_from_replay = replay.transaction_hashes.len() as u64;
@@ -850,10 +861,6 @@ impl UpstreamRpcClient {
                 "tx count mismatch between getBlockTransactionCount ({tx_count_from_rpc}) and getBlockWithTxs ({tx_count_from_replay})"
             ));
         }
-
-        let state_update = self
-            .call("starknet_getStateUpdate", block_selector.clone())
-            .await?;
         let state_root = parse_state_root_from_state_update(&state_update)?;
         let (state_diff, mut state_diff_warnings) = state_update_to_diff(&state_update)?;
         warnings.append(&mut state_diff_warnings);
@@ -1265,6 +1272,123 @@ fn parse_block_with_txs(
         timestamp,
         transaction_hashes,
     })
+}
+
+fn parse_block_with_tx_hashes(
+    block_with_tx_hashes: &Value,
+    warnings: &mut Vec<String>,
+) -> Result<RuntimeBlockHashes, String> {
+    let external_block_number =
+        value_as_u64(block_with_tx_hashes.get("block_number").ok_or_else(|| {
+            format!("getBlockWithTxHashes missing block_number: {block_with_tx_hashes}")
+        })?)
+        .ok_or_else(|| {
+            format!("invalid getBlockWithTxHashes block_number: {block_with_tx_hashes}")
+        })?;
+
+    let block_hash_raw = block_with_tx_hashes
+        .get("block_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            format!("getBlockWithTxHashes missing block_hash: {block_with_tx_hashes}")
+        })?;
+    let block_hash = StarknetFelt::from_str(block_hash_raw)
+        .map(|felt| format!("{:#x}", felt))
+        .map_err(|error| {
+            format!("invalid getBlockWithTxHashes block_hash `{block_hash_raw}`: {error}")
+        })?;
+
+    let parent_hash_raw = block_with_tx_hashes
+        .get("parent_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            format!("getBlockWithTxHashes missing parent_hash: {block_with_tx_hashes}")
+        })?;
+    let parent_hash = StarknetFelt::from_str(parent_hash_raw)
+        .map(|felt| format!("{:#x}", felt))
+        .map_err(|error| {
+            format!("invalid getBlockWithTxHashes parent_hash `{parent_hash_raw}`: {error}")
+        })?;
+
+    let transactions = block_with_tx_hashes
+        .get("transactions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            format!("getBlockWithTxHashes missing transactions array: {block_with_tx_hashes}")
+        })?;
+
+    let mut transaction_hashes = Vec::with_capacity(transactions.len());
+    for (idx, tx) in transactions.iter().enumerate() {
+        let Some(tx_hash_raw) = tx.as_str() else {
+            return Err(format!(
+                "getBlockWithTxHashes transaction {idx} must be a hash string, got {tx}"
+            ));
+        };
+        let tx_hash = StarknetFelt::from_str(tx_hash_raw)
+            .map(|felt| format!("{:#x}", felt))
+            .map_err(|error| {
+                format!(
+                    "invalid getBlockWithTxHashes tx hash `{tx_hash_raw}` at index {idx}: {error}"
+                )
+            })?;
+        transaction_hashes.push(tx_hash);
+    }
+
+    if let Some(status_raw) = block_with_tx_hashes.get("status").and_then(Value::as_str) {
+        if status_raw.eq_ignore_ascii_case("PENDING") {
+            return Err(
+                "getBlockWithTxHashes returned status=PENDING; daemon only replays finalized blocks"
+                    .to_string(),
+            );
+        }
+        if !status_raw.eq_ignore_ascii_case("ACCEPTED_ON_L2")
+            && !status_raw.eq_ignore_ascii_case("ACCEPTED_ON_L1")
+            && !status_raw.eq_ignore_ascii_case("FINALIZED")
+        {
+            warnings.push(format!(
+                "unexpected tx-hashes block status `{status_raw}`; replay continues but should be verified"
+            ));
+        }
+    }
+
+    Ok(RuntimeBlockHashes {
+        external_block_number,
+        block_hash,
+        parent_hash,
+        transaction_hashes,
+    })
+}
+
+fn compare_block_views(
+    txs_view: &RuntimeBlockReplay,
+    hashes_view: &RuntimeBlockHashes,
+    warnings: &mut Vec<String>,
+) {
+    if hashes_view.external_block_number != txs_view.external_block_number {
+        warnings.push(format!(
+            "block number mismatch between getBlockWithTxs ({}) and getBlockWithTxHashes ({})",
+            txs_view.external_block_number, hashes_view.external_block_number
+        ));
+    }
+    if hashes_view.block_hash != txs_view.block_hash {
+        warnings.push(format!(
+            "block hash mismatch between getBlockWithTxs ({}) and getBlockWithTxHashes ({})",
+            txs_view.block_hash, hashes_view.block_hash
+        ));
+    }
+    if hashes_view.parent_hash != txs_view.parent_hash {
+        warnings.push(format!(
+            "parent hash mismatch between getBlockWithTxs ({}) and getBlockWithTxHashes ({})",
+            txs_view.parent_hash, hashes_view.parent_hash
+        ));
+    }
+    if hashes_view.transaction_hashes != txs_view.transaction_hashes {
+        warnings.push(format!(
+            "transaction hash list mismatch between getBlockWithTxs ({} txs) and getBlockWithTxHashes ({} txs)",
+            txs_view.transaction_hashes.len(),
+            hashes_view.transaction_hashes.len()
+        ));
+    }
 }
 
 fn state_update_to_diff(state_update: &Value) -> Result<(StarknetStateDiff, Vec<String>), String> {
@@ -1860,6 +1984,64 @@ mod tests {
         let error = parse_block_with_txs(&block, &mut warnings)
             .expect_err("missing sequencer_address must fail closed");
         assert!(error.contains("missing sequencer_address"));
+    }
+
+    #[test]
+    fn parse_block_with_tx_hashes_parses_hash_array() {
+        let block = json!({
+            "block_number": 12,
+            "block_hash": "0xabc",
+            "parent_hash": "0x123",
+            "transactions": ["0x1", "0x2"],
+            "status": "ACCEPTED_ON_L2"
+        });
+
+        let mut warnings = Vec::new();
+        let parsed = parse_block_with_tx_hashes(&block, &mut warnings).expect("must parse");
+        assert_eq!(parsed.external_block_number, 12);
+        assert_eq!(parsed.block_hash, "0xabc");
+        assert_eq!(parsed.parent_hash, "0x123");
+        assert_eq!(parsed.transaction_hashes, vec!["0x1", "0x2"]);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn parse_block_with_tx_hashes_requires_transactions_array() {
+        let block = json!({
+            "block_number": 12,
+            "block_hash": "0xabc",
+            "parent_hash": "0x123",
+            "status": "ACCEPTED_ON_L2"
+        });
+
+        let mut warnings = Vec::new();
+        let error = parse_block_with_tx_hashes(&block, &mut warnings)
+            .expect_err("missing transactions array must fail closed");
+        assert!(error.contains("missing transactions array"));
+    }
+
+    #[test]
+    fn compare_block_views_detects_mismatch() {
+        let txs_view = RuntimeBlockReplay {
+            external_block_number: 7,
+            block_hash: "0xaaa".to_string(),
+            parent_hash: "0xbbb".to_string(),
+            sequencer_address: "0x1".to_string(),
+            timestamp: 1_700_000_007,
+            transaction_hashes: vec!["0x1".to_string(), "0x2".to_string()],
+        };
+        let hashes_view = RuntimeBlockHashes {
+            external_block_number: 7,
+            block_hash: "0xccc".to_string(),
+            parent_hash: "0xbbb".to_string(),
+            transaction_hashes: vec!["0x1".to_string()],
+        };
+
+        let mut warnings = Vec::new();
+        compare_block_views(&txs_view, &hashes_view, &mut warnings);
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("block hash mismatch"));
+        assert!(warnings[1].contains("transaction hash list mismatch"));
     }
 
     #[test]
