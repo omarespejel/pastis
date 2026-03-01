@@ -345,10 +345,12 @@ async fn main() -> Result<(), String> {
 
     let mut exit_error: Option<String> = None;
     let mut rpc_outcome: Option<Result<Result<(), String>, tokio::task::JoinError>> = None;
+    let mut rpc_exited_before_shutdown = false;
 
     loop {
         tokio::select! {
             rpc_join = &mut rpc_handle => {
+                rpc_exited_before_shutdown = true;
                 rpc_outcome = Some(rpc_join);
                 break;
             }
@@ -437,7 +439,7 @@ async fn main() -> Result<(), String> {
     }
 
     if let Some(outcome) = rpc_outcome
-        && let Err(error) = classify_rpc_task_completion(outcome)
+        && let Err(error) = classify_rpc_task_completion(outcome, !rpc_exited_before_shutdown)
     {
         if exit_error.is_none() {
             exit_error = Some(error);
@@ -630,8 +632,14 @@ async fn run_bootnode_heartbeat(
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut ticker = new_daemon_interval(Duration::from_millis(heartbeat_ms));
+    // Consume the immediate first tick so the first probe runs after one full interval.
+    ticker.tick().await;
     loop {
         tokio::select! {
+            biased;
+            _ = wait_for_shutdown_signal(&mut shutdown_rx) => {
+                return;
+            }
             _ = ticker.tick() => {
                 let reachable = probe_bootnodes(&endpoints, Duration::from_millis(1_500)).await;
                 peer_counter.store(reachable as u64, Ordering::Relaxed);
@@ -639,9 +647,6 @@ async fn run_bootnode_heartbeat(
                     progress.peer_count = reachable as u64;
                 }
                 eprintln!("p2p heartbeat: {reachable}/{bootnode_count} bootnodes reachable");
-            }
-            _ = wait_for_shutdown_signal(&mut shutdown_rx) => {
-                return;
             }
         }
     }
@@ -1505,9 +1510,16 @@ fn evaluate_readiness(progress: &SyncProgress, policy: &HealthPolicy) -> Result<
 
 fn classify_rpc_task_completion(
     outcome: Result<Result<(), String>, tokio::task::JoinError>,
+    allow_clean_exit: bool,
 ) -> Result<(), String> {
     match outcome {
-        Ok(Ok(())) => Err("rpc server exited unexpectedly".to_string()),
+        Ok(Ok(())) => {
+            if allow_clean_exit {
+                Ok(())
+            } else {
+                Err("rpc server exited unexpectedly".to_string())
+            }
+        }
         Ok(Err(error)) => Err(error),
         Err(error) => Err(format!("rpc server task join error: {error}")),
     }
@@ -1787,14 +1799,20 @@ mod tests {
 
     #[test]
     fn classify_rpc_task_completion_treats_clean_exit_as_fatal() {
-        let error = classify_rpc_task_completion(Ok(Ok(())))
+        let error = classify_rpc_task_completion(Ok(Ok(())), false)
             .expect_err("clean RPC task exit should fail closed");
         assert!(error.contains("exited unexpectedly"));
     }
 
     #[test]
+    fn classify_rpc_task_completion_allows_clean_exit_when_expected() {
+        classify_rpc_task_completion(Ok(Ok(())), true)
+            .expect("clean RPC task exit should be allowed after shutdown");
+    }
+
+    #[test]
     fn classify_rpc_task_completion_propagates_server_error() {
-        let error = classify_rpc_task_completion(Ok(Err("rpc boom".to_string())))
+        let error = classify_rpc_task_completion(Ok(Err("rpc boom".to_string())), true)
             .expect_err("rpc server error should be propagated");
         assert_eq!(error, "rpc boom");
     }
@@ -1860,6 +1878,58 @@ mod tests {
             .send(true)
             .expect("shutdown signal send should succeed");
         tokio::time::timeout(Duration::from_millis(100), heartbeat)
+            .await
+            .expect("heartbeat should stop quickly")
+            .expect("heartbeat task should not panic");
+    }
+
+    #[tokio::test]
+    async fn bootnode_heartbeat_waits_one_interval_before_first_probe() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener bind should succeed");
+        let addr = listener.local_addr().expect("listener local addr");
+        let endpoints = vec![BootnodeEndpoint::Socket(addr)];
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let peer_counter = Arc::new(AtomicU64::new(0));
+        let sync_progress = Arc::new(Mutex::new(base_progress()));
+        let heartbeat = tokio::spawn(run_bootnode_heartbeat(
+            endpoints,
+            1,
+            250,
+            peer_counter.clone(),
+            sync_progress.clone(),
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            peer_counter.load(Ordering::Relaxed),
+            0,
+            "heartbeat should not probe before one full interval"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if peer_counter.load(Ordering::Relaxed) >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("heartbeat should probe after interval");
+
+        let progress = sync_progress
+            .lock()
+            .expect("sync progress lock should not be poisoned")
+            .clone();
+        assert_eq!(progress.peer_count, 1);
+
+        shutdown_tx
+            .send(true)
+            .expect("shutdown signal send should succeed");
+        tokio::time::timeout(Duration::from_millis(200), heartbeat)
             .await
             .expect("heartbeat should stop quickly")
             .expect("heartbeat task should not panic");
