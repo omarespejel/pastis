@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -52,6 +52,10 @@ const UPSTREAM_REQUEST_ID: u64 = 1;
 const UPSTREAM_BATCH_REQUEST_ID_BASE: u64 = 10_000;
 const RUNTIME_STORAGE_SNAPSHOT_VERSION: u32 = 1;
 pub const DEFAULT_STORAGE_SNAPSHOT_INTERVAL_BLOCKS: u64 = 128;
+const BATCH_MODE_AUTO: u8 = 0;
+const BATCH_MODE_SUPPORTED: u8 = 1;
+const BATCH_MODE_UNSUPPORTED: u8 = 2;
+const BATCH_MODE_FORCED_DISABLED: u8 = 3;
 static RUNTIME_STORAGE_SNAPSHOT_TMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -86,6 +90,7 @@ pub struct RuntimeConfig {
     pub local_journal_path: Option<String>,
     pub storage_snapshot_path: Option<String>,
     pub storage_snapshot_interval_blocks: u64,
+    pub disable_batch_requests: bool,
     pub storage: Option<ThreadSafeStorage<InMemoryStorage>>,
 }
 
@@ -756,6 +761,7 @@ impl NodeRuntime {
         let sync_source = Arc::new(UpstreamRpcClient::new(
             config.upstream_rpc_url.clone(),
             config.rpc_timeout,
+            config.disable_batch_requests,
         )?);
         let consensus = Arc::new(AllowAllConsensusBackend);
         let network = Arc::new(StaticNetworkBackend::from_config(
@@ -1327,6 +1333,7 @@ impl NodeRuntime {
 struct UpstreamRpcClient {
     http: reqwest::Client,
     rpc_url: String,
+    batch_capability: Arc<BatchCapability>,
 }
 
 #[derive(Debug, Clone)]
@@ -1341,13 +1348,87 @@ enum UpstreamBatchCallError {
     Failed(String),
 }
 
+#[derive(Debug)]
+struct BatchCapability {
+    mode: AtomicU8,
+}
+
+impl BatchCapability {
+    fn new(disable_batch_requests: bool) -> Self {
+        let mode = if disable_batch_requests {
+            BATCH_MODE_FORCED_DISABLED
+        } else {
+            BATCH_MODE_AUTO
+        };
+        Self {
+            mode: AtomicU8::new(mode),
+        }
+    }
+
+    fn should_attempt_batch(&self) -> bool {
+        matches!(
+            self.mode.load(Ordering::Relaxed),
+            BATCH_MODE_AUTO | BATCH_MODE_SUPPORTED
+        )
+    }
+
+    fn mark_supported(&self) {
+        let _ = self.mode.compare_exchange(
+            BATCH_MODE_AUTO,
+            BATCH_MODE_SUPPORTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn mark_unsupported(&self) -> bool {
+        loop {
+            let current = self.mode.load(Ordering::Acquire);
+            match current {
+                BATCH_MODE_UNSUPPORTED | BATCH_MODE_FORCED_DISABLED => return false,
+                BATCH_MODE_AUTO | BATCH_MODE_SUPPORTED => {
+                    if self
+                        .mode
+                        .compare_exchange(
+                            current,
+                            BATCH_MODE_UNSUPPORTED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    fn fallback_reason(&self) -> &'static str {
+        match self.mode.load(Ordering::Relaxed) {
+            BATCH_MODE_FORCED_DISABLED => "batch requests disabled by configuration",
+            BATCH_MODE_UNSUPPORTED => "upstream rejected batch requests previously",
+            _ => "batch requests unavailable",
+        }
+    }
+}
+
 impl UpstreamRpcClient {
-    fn new(rpc_url: String, timeout: Duration) -> Result<Self, String> {
+    fn new(
+        rpc_url: String,
+        timeout: Duration,
+        disable_batch_requests: bool,
+    ) -> Result<Self, String> {
         let http = reqwest::Client::builder()
             .timeout(timeout)
             .build()
             .map_err(|error| format!("failed to build HTTP client: {error}"))?;
-        Ok(Self { http, rpc_url })
+        Ok(Self {
+            http,
+            rpc_url,
+            batch_capability: Arc::new(BatchCapability::new(disable_batch_requests)),
+        })
     }
 
     async fn fetch_latest_block_number(&self) -> Result<u64, String> {
@@ -1468,38 +1549,32 @@ impl UpstreamRpcClient {
             },
         ];
 
-        let payloads = match self.call_batch(&calls).await {
-            Ok(payloads) => payloads,
-            Err(UpstreamBatchCallError::Unsupported(reason)) => {
-                tokio::try_join!(
-                    self.call("starknet_getBlockWithTxs", block_selector.clone()),
-                    self.call("starknet_getBlockTransactionCount", block_selector.clone()),
-                    self.call("starknet_getBlockWithTxHashes", block_selector.clone()),
-                    self.call("starknet_getBlockWithReceipts", block_selector.clone()),
-                    self.call("starknet_getStateUpdate", block_selector),
-                )
-                .map(|(
-                    block_with_txs,
-                    tx_count_raw,
-                    block_with_hashes,
-                    block_with_receipts,
-                    state_update,
-                )| {
-                    vec![
-                        block_with_txs,
-                        tx_count_raw,
-                        block_with_hashes,
-                        block_with_receipts,
-                        state_update,
-                    ]
-                })
-                .map_err(|error| {
-                    format!(
-                        "RPC batch fallback failed after incompatible batch response ({reason}): {error}"
+        let payloads = if self.batch_capability.should_attempt_batch() {
+            match self.call_batch(&calls).await {
+                Ok(payloads) => {
+                    self.batch_capability.mark_supported();
+                    payloads
+                }
+                Err(UpstreamBatchCallError::Unsupported(reason)) => {
+                    if self.batch_capability.mark_unsupported() {
+                        eprintln!(
+                            "warning: upstream RPC batch requests disabled after incompatible response: {reason}"
+                        );
+                    }
+                    self.fetch_block_payloads_without_batch(
+                        block_selector,
+                        format!("incompatible batch response ({reason})"),
                     )
-                })?
+                    .await?
+                }
+                Err(UpstreamBatchCallError::Failed(error)) => return Err(error),
             }
-            Err(UpstreamBatchCallError::Failed(error)) => return Err(error),
+        } else {
+            self.fetch_block_payloads_without_batch(
+                block_selector,
+                self.batch_capability.fallback_reason().to_string(),
+            )
+            .await?
         };
 
         let mut payload_iter = payloads.into_iter();
@@ -1528,6 +1603,38 @@ impl UpstreamRpcClient {
             block_with_receipts,
             state_update,
         ))
+    }
+
+    async fn fetch_block_payloads_without_batch(
+        &self,
+        block_selector: Value,
+        reason: String,
+    ) -> Result<Vec<Value>, String> {
+        tokio::try_join!(
+            self.call("starknet_getBlockWithTxs", block_selector.clone()),
+            self.call("starknet_getBlockTransactionCount", block_selector.clone()),
+            self.call("starknet_getBlockWithTxHashes", block_selector.clone()),
+            self.call("starknet_getBlockWithReceipts", block_selector.clone()),
+            self.call("starknet_getStateUpdate", block_selector),
+        )
+        .map(
+            |(
+                block_with_txs,
+                tx_count_raw,
+                block_with_hashes,
+                block_with_receipts,
+                state_update,
+            )| {
+                vec![
+                    block_with_txs,
+                    tx_count_raw,
+                    block_with_hashes,
+                    block_with_receipts,
+                    state_update,
+                ]
+            },
+        )
+        .map_err(|error| format!("RPC batch fallback failed after {reason}: {error}"))
     }
 
     async fn call_batch(
@@ -3279,6 +3386,7 @@ mod tests {
             local_journal_path: None,
             storage_snapshot_path: None,
             storage_snapshot_interval_blocks: DEFAULT_STORAGE_SNAPSHOT_INTERVAL_BLOCKS,
+            disable_batch_requests: false,
             storage: None,
         }
     }
@@ -3957,6 +4065,30 @@ mod tests {
                 panic!("unexpected hard-failure error variant: {message}");
             }
         }
+    }
+
+    #[test]
+    fn batch_capability_disables_batch_after_unsupported_detection() {
+        let capability = BatchCapability::new(false);
+        assert!(capability.should_attempt_batch());
+        assert!(capability.mark_unsupported());
+        assert!(!capability.should_attempt_batch());
+        assert_eq!(
+            capability.fallback_reason(),
+            "upstream rejected batch requests previously"
+        );
+        assert!(!capability.mark_unsupported());
+    }
+
+    #[test]
+    fn batch_capability_respects_forced_disable() {
+        let capability = BatchCapability::new(true);
+        assert!(!capability.should_attempt_batch());
+        assert_eq!(
+            capability.fallback_reason(),
+            "batch requests disabled by configuration"
+        );
+        assert!(!capability.mark_unsupported());
     }
 
     #[test]

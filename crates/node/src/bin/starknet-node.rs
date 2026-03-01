@@ -64,6 +64,7 @@ struct DaemonConfig {
     rpc_retry_backoff_ms: u64,
     rpc_max_concurrency: usize,
     rpc_rate_limit_per_minute: u32,
+    disable_batch_requests: bool,
     bootnodes: Vec<String>,
     require_peers: bool,
     p2p_heartbeat_ms: u64,
@@ -216,6 +217,7 @@ async fn main() -> Result<(), String> {
             max_retries: config.rpc_max_retries,
             base_backoff: Duration::from_millis(config.rpc_retry_backoff_ms),
         },
+        disable_batch_requests: config.disable_batch_requests,
         // Runtime-level network backend is static today; daemon owns live bootnode probing.
         peer_count_hint: 0,
         require_peers: false,
@@ -308,6 +310,7 @@ async fn main() -> Result<(), String> {
         "rpc_rate_limit_per_minute: {}",
         config.rpc_rate_limit_per_minute
     );
+    println!("disable_batch_requests: {}", config.disable_batch_requests);
     println!("rpc_auth_enabled: {}", config.rpc_auth_token.is_some());
     println!("allow_public_rpc_bind: {}", config.allow_public_rpc_bind);
     println!("exit_on_unhealthy: {}", config.exit_on_unhealthy);
@@ -959,6 +962,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
     let mut cli_rpc_retry_backoff_ms: Option<u64> = None;
     let mut cli_rpc_max_concurrency: Option<usize> = None;
     let mut cli_rpc_rate_limit_per_minute: Option<u32> = None;
+    let mut cli_disable_batch_requests = false;
     let mut cli_bootnodes: Vec<String> = Vec::new();
     let mut cli_require_peers = false;
     let mut cli_exit_on_unhealthy = false;
@@ -1081,6 +1085,9 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
                 cli_rpc_rate_limit_per_minute =
                     Some(parse_non_negative_u32(&raw, "--rpc-rate-limit-per-minute")?);
             }
+            "--disable-upstream-batch" => {
+                cli_disable_batch_requests = true;
+            }
             "--bootnode" => {
                 cli_bootnodes.push(
                     args.next()
@@ -1193,6 +1200,11 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
             .unwrap_or(DEFAULT_RPC_RATE_LIMIT_PER_MINUTE),
     };
     let rpc_rate_limit_per_minute = validate_rpc_rate_limit_per_minute(rpc_rate_limit_per_minute)?;
+    let disable_batch_requests = if cli_disable_batch_requests {
+        true
+    } else {
+        parse_env_bool("PASTIS_DISABLE_UPSTREAM_BATCH")?.unwrap_or(false)
+    };
     let p2p_heartbeat_ms = match cli_p2p_heartbeat_ms {
         Some(value) => value,
         None => parse_env_u64("PASTIS_P2P_HEARTBEAT_MS")?.unwrap_or(DEFAULT_P2P_HEARTBEAT_MS),
@@ -1253,6 +1265,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         rpc_retry_backoff_ms,
         rpc_max_concurrency,
         rpc_rate_limit_per_minute,
+        disable_batch_requests,
         bootnodes,
         require_peers,
         p2p_heartbeat_ms,
@@ -1558,6 +1571,7 @@ options:\n\
   --rpc-retry-backoff-ms <ms>        Retry backoff base\n\
   --rpc-max-concurrency <n>          Max concurrent local RPC requests (default: {DEFAULT_RPC_MAX_CONCURRENCY})\n\
   --rpc-rate-limit-per-minute <n>    Per-IP RPC request rate limit (0 disables; default: {DEFAULT_RPC_RATE_LIMIT_PER_MINUTE})\n\
+  --disable-upstream-batch           Disable outbound upstream JSON-RPC batch requests\n\
   --bootnode <multiaddr>             Configure bootnode (repeatable)\n\
   --require-peers                    Fail closed when no peers are configured/available\n\
   --exit-on-unhealthy                Exit daemon when health checks fail\n\
@@ -1581,6 +1595,7 @@ environment:\n\
   PASTIS_RPC_RETRY_BACKOFF_MS        Upstream RPC retry backoff ms\n\
   PASTIS_RPC_MAX_CONCURRENCY         Max concurrent local RPC requests\n\
   PASTIS_RPC_RATE_LIMIT_PER_MINUTE   Per-IP RPC request rate limit (0 disables)\n\
+  PASTIS_DISABLE_UPSTREAM_BATCH      Disable outbound upstream JSON-RPC batch requests (true/false)\n\
   PASTIS_BOOTNODES                   Comma-separated bootnodes\n\
   PASTIS_REQUIRE_PEERS               Require peers for sync loop health (true/false)\n\
   PASTIS_EXIT_ON_UNHEALTHY           Exit daemon when health checks fail (true/false)\n\
