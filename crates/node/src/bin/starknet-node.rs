@@ -1025,7 +1025,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
     let mut cli_rpc_max_concurrency: Option<usize> = None;
     let mut cli_rpc_rate_limit_per_minute: Option<u32> = None;
     let mut cli_disable_batch_requests = false;
-    let mut cli_strict_canonical_execution = false;
+    let mut cli_strict_canonical_execution: Option<bool> = None;
     let mut cli_bootnodes: Vec<String> = Vec::new();
     let mut cli_require_peers = false;
     let mut cli_exit_on_unhealthy = false;
@@ -1152,7 +1152,10 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
                 cli_disable_batch_requests = true;
             }
             "--strict-canonical-execution" => {
-                cli_strict_canonical_execution = true;
+                cli_strict_canonical_execution = Some(true);
+            }
+            "--no-strict-canonical-execution" => {
+                cli_strict_canonical_execution = Some(false);
             }
             "--bootnode" => {
                 cli_bootnodes.push(
@@ -1176,6 +1179,13 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
                 return Err(help_text());
             }
             unknown => {
+                if let Some(raw_value) = unknown.strip_prefix("--strict-canonical-execution=") {
+                    cli_strict_canonical_execution = Some(parse_bool_literal(
+                        raw_value,
+                        "--strict-canonical-execution",
+                    )?);
+                    continue;
+                }
                 return Err(format!("unknown flag `{unknown}`\n\n{}", help_text()));
             }
         }
@@ -1261,12 +1271,11 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
     } else {
         parse_env_bool("PASTIS_DISABLE_UPSTREAM_BATCH")?.unwrap_or(false)
     };
-    let strict_canonical_execution = if cli_strict_canonical_execution {
-        true
-    } else {
-        parse_env_bool("PASTIS_STRICT_CANONICAL_EXECUTION")?
-            .unwrap_or(default_strict_canonical_execution())
-    };
+    let strict_canonical_execution = resolve_strict_canonical_execution(
+        cli_strict_canonical_execution,
+        parse_env_bool("PASTIS_STRICT_CANONICAL_EXECUTION")?,
+        default_strict_canonical_execution(),
+    );
     let p2p_heartbeat_ms = match cli_p2p_heartbeat_ms {
         Some(value) => value,
         None => parse_env_u64("PASTIS_P2P_HEARTBEAT_MS")?.unwrap_or(DEFAULT_P2P_HEARTBEAT_MS),
@@ -1361,18 +1370,28 @@ fn parse_env_usize(name: &str) -> Result<Option<usize>, String> {
 
 fn parse_env_bool(name: &str) -> Result<Option<bool>, String> {
     match env::var(name) {
-        Ok(raw) => {
-            let normalized = raw.trim().to_ascii_lowercase();
-            match normalized.as_str() {
-                "1" | "true" | "yes" | "on" => Ok(Some(true)),
-                "0" | "false" | "no" | "off" => Ok(Some(false)),
-                _ => Err(format!(
-                    "invalid {name} value `{raw}`: expected one of true/false/1/0/yes/no/on/off"
-                )),
-            }
-        }
+        Ok(raw) => Ok(Some(parse_bool_literal(&raw, name)?)),
         Err(_) => Ok(None),
     }
+}
+
+fn parse_bool_literal(raw: &str, field: &str) -> Result<bool, String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!(
+            "invalid {field} value `{raw}`: expected one of true/false/1/0/yes/no/on/off"
+        )),
+    }
+}
+
+fn resolve_strict_canonical_execution(
+    cli_override: Option<bool>,
+    env_override: Option<bool>,
+    default: bool,
+) -> bool {
+    cli_override.or(env_override).unwrap_or(default)
 }
 
 fn default_strict_canonical_execution() -> bool {
@@ -1742,7 +1761,9 @@ options:\n\
   --rpc-max-concurrency <n>          Max concurrent local RPC requests (default: {DEFAULT_RPC_MAX_CONCURRENCY})\n\
   --rpc-rate-limit-per-minute <n>    Per-IP RPC request rate limit (0 disables; default: {DEFAULT_RPC_RATE_LIMIT_PER_MINUTE})\n\
   --disable-upstream-batch           Disable outbound upstream JSON-RPC batch requests\n\
-  --strict-canonical-execution       Fail closed unless canonical execution is available for committed blocks (default: enabled with production-adapters builds)\n\
+  --strict-canonical-execution[=bool]\n\
+                                     Require canonical execution for committed blocks (CLI overrides env; default=true with production-adapters)\n\
+  --no-strict-canonical-execution    Disable strict canonical execution (equivalent to --strict-canonical-execution=false)\n\
   --bootnode <multiaddr>             Configure bootnode (repeatable)\n\
   --require-peers                    Fail closed when no peers are configured/available\n\
   --exit-on-unhealthy                Exit daemon when health checks fail\n\
@@ -1767,7 +1788,7 @@ environment:\n\
   PASTIS_RPC_MAX_CONCURRENCY         Max concurrent local RPC requests\n\
   PASTIS_RPC_RATE_LIMIT_PER_MINUTE   Per-IP RPC request rate limit (0 disables)\n\
   PASTIS_DISABLE_UPSTREAM_BATCH      Disable outbound upstream JSON-RPC batch requests (true/false)\n\
-  PASTIS_STRICT_CANONICAL_EXECUTION  Require canonical execution for committed blocks (true/false; default=true with production-adapters)\n\
+  PASTIS_STRICT_CANONICAL_EXECUTION  Require canonical execution for committed blocks (true/false; used only when strict canonical CLI flags are absent; default=true with production-adapters)\n\
   PASTIS_BOOTNODES                   Comma-separated bootnodes\n\
   PASTIS_REQUIRE_PEERS               Require peers for sync loop health (true/false)\n\
   PASTIS_EXIT_ON_UNHEALTHY           Exit daemon when health checks fail (true/false)\n\
@@ -2034,6 +2055,51 @@ mod tests {
     #[test]
     fn strict_canonical_defaults_disabled_without_production_adapters() {
         assert!(!default_strict_canonical_execution());
+    }
+
+    #[test]
+    fn parse_bool_literal_accepts_common_true_values() {
+        for value in ["true", "TRUE", "1", "yes", "on"] {
+            assert!(
+                parse_bool_literal(value, "test-field").expect("true variant should parse"),
+                "value `{value}` should parse as true"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_bool_literal_accepts_common_false_values() {
+        for value in ["false", "FALSE", "0", "no", "off"] {
+            assert!(
+                !parse_bool_literal(value, "test-field").expect("false variant should parse"),
+                "value `{value}` should parse as false"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_bool_literal_rejects_invalid_values() {
+        let error =
+            parse_bool_literal("maybe", "test-field").expect_err("invalid literal should fail");
+        assert!(error.contains("expected one of true/false"));
+    }
+
+    #[test]
+    fn resolve_strict_canonical_execution_prefers_cli_over_environment_and_default() {
+        let resolved = resolve_strict_canonical_execution(Some(false), Some(true), true);
+        assert!(!resolved);
+    }
+
+    #[test]
+    fn resolve_strict_canonical_execution_prefers_environment_over_default() {
+        let resolved = resolve_strict_canonical_execution(None, Some(false), true);
+        assert!(!resolved);
+    }
+
+    #[test]
+    fn resolve_strict_canonical_execution_uses_default_when_no_overrides_set() {
+        assert!(resolve_strict_canonical_execution(None, None, true));
+        assert!(!resolve_strict_canonical_execution(None, None, false));
     }
 
     #[tokio::test]

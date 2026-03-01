@@ -130,6 +130,13 @@ impl RuntimeConfig {
         if self.network_stale_after.is_zero() {
             return Err("network_stale_after must be > 0".to_string());
         }
+        #[cfg(not(feature = "production-adapters"))]
+        if self.strict_canonical_execution {
+            return Err(
+                "strict_canonical_execution=true requires `production-adapters` feature"
+                    .to_string(),
+            );
+        }
         if let Some(path) = self.local_journal_path.as_deref()
             && path.trim().is_empty()
         {
@@ -4275,6 +4282,17 @@ mod tests {
             strict_canonical_execution: false,
             storage: None,
         }
+    }
+
+    #[cfg(not(feature = "production-adapters"))]
+    #[test]
+    fn runtime_config_rejects_strict_canonical_without_production_adapters() {
+        let mut config = runtime_config();
+        config.strict_canonical_execution = true;
+        let error = config
+            .validate()
+            .expect_err("strict canonical mode must fail closed without production adapters");
+        assert!(error.contains("requires `production-adapters` feature"));
     }
 
     #[test]
