@@ -71,6 +71,7 @@ struct DaemonConfig {
     rpc_max_concurrency: usize,
     rpc_rate_limit_per_minute: u32,
     disable_batch_requests: bool,
+    strict_canonical_execution: bool,
     bootnodes: Vec<String>,
     require_peers: bool,
     p2p_heartbeat_ms: u64,
@@ -258,6 +259,7 @@ async fn main() -> Result<(), String> {
         },
         disable_batch_requests: config.disable_batch_requests,
         network_stale_after: derive_network_stale_after(config.p2p_heartbeat_ms),
+        strict_canonical_execution: config.strict_canonical_execution,
         peer_count_hint: initial_peers,
         require_peers: config.require_peers,
         storage: None,
@@ -351,6 +353,10 @@ async fn main() -> Result<(), String> {
         config.rpc_rate_limit_per_minute
     );
     println!("disable_batch_requests: {}", config.disable_batch_requests);
+    println!(
+        "strict_canonical_execution: {}",
+        config.strict_canonical_execution
+    );
     println!("rpc_auth_enabled: {}", config.rpc_auth_token.is_some());
     println!("allow_public_rpc_bind: {}", config.allow_public_rpc_bind);
     println!("exit_on_unhealthy: {}", config.exit_on_unhealthy);
@@ -1019,6 +1025,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
     let mut cli_rpc_max_concurrency: Option<usize> = None;
     let mut cli_rpc_rate_limit_per_minute: Option<u32> = None;
     let mut cli_disable_batch_requests = false;
+    let mut cli_strict_canonical_execution = false;
     let mut cli_bootnodes: Vec<String> = Vec::new();
     let mut cli_require_peers = false;
     let mut cli_exit_on_unhealthy = false;
@@ -1144,6 +1151,9 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
             "--disable-upstream-batch" => {
                 cli_disable_batch_requests = true;
             }
+            "--strict-canonical-execution" => {
+                cli_strict_canonical_execution = true;
+            }
             "--bootnode" => {
                 cli_bootnodes.push(
                     args.next()
@@ -1251,6 +1261,11 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
     } else {
         parse_env_bool("PASTIS_DISABLE_UPSTREAM_BATCH")?.unwrap_or(false)
     };
+    let strict_canonical_execution = if cli_strict_canonical_execution {
+        true
+    } else {
+        parse_env_bool("PASTIS_STRICT_CANONICAL_EXECUTION")?.unwrap_or(false)
+    };
     let p2p_heartbeat_ms = match cli_p2p_heartbeat_ms {
         Some(value) => value,
         None => parse_env_u64("PASTIS_P2P_HEARTBEAT_MS")?.unwrap_or(DEFAULT_P2P_HEARTBEAT_MS),
@@ -1312,6 +1327,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         rpc_max_concurrency,
         rpc_rate_limit_per_minute,
         disable_batch_requests,
+        strict_canonical_execution,
         bootnodes,
         require_peers,
         p2p_heartbeat_ms,
@@ -1721,6 +1737,7 @@ options:\n\
   --rpc-max-concurrency <n>          Max concurrent local RPC requests (default: {DEFAULT_RPC_MAX_CONCURRENCY})\n\
   --rpc-rate-limit-per-minute <n>    Per-IP RPC request rate limit (0 disables; default: {DEFAULT_RPC_RATE_LIMIT_PER_MINUTE})\n\
   --disable-upstream-batch           Disable outbound upstream JSON-RPC batch requests\n\
+  --strict-canonical-execution       Fail closed unless canonical execution is available for committed blocks\n\
   --bootnode <multiaddr>             Configure bootnode (repeatable)\n\
   --require-peers                    Fail closed when no peers are configured/available\n\
   --exit-on-unhealthy                Exit daemon when health checks fail\n\
@@ -1745,6 +1762,7 @@ environment:\n\
   PASTIS_RPC_MAX_CONCURRENCY         Max concurrent local RPC requests\n\
   PASTIS_RPC_RATE_LIMIT_PER_MINUTE   Per-IP RPC request rate limit (0 disables)\n\
   PASTIS_DISABLE_UPSTREAM_BATCH      Disable outbound upstream JSON-RPC batch requests (true/false)\n\
+  PASTIS_STRICT_CANONICAL_EXECUTION  Require canonical execution for committed blocks (true/false)\n\
   PASTIS_BOOTNODES                   Comma-separated bootnodes\n\
   PASTIS_REQUIRE_PEERS               Require peers for sync loop health (true/false)\n\
   PASTIS_EXIT_ON_UNHEALTHY           Exit daemon when health checks fail (true/false)\n\
