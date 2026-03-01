@@ -1701,7 +1701,11 @@ fn parse_block_with_receipts(
                     "unsupported receipt execution_status `{status}` at index {idx} in getBlockWithReceipts"
                 ));
             }
-            None => true,
+            None => {
+                return Err(format!(
+                    "missing receipt execution_status at index {idx} in getBlockWithReceipts"
+                ));
+            }
         };
 
         let events = match receipt_raw.get("events") {
@@ -2692,6 +2696,24 @@ mod tests {
         let error = parse_block_with_receipts(&block, &mut warnings)
             .expect_err("unknown execution status must fail closed");
         assert!(error.contains("unsupported receipt execution_status"));
+    }
+
+    #[test]
+    fn parse_block_with_receipts_rejects_missing_execution_status() {
+        let block = json!({
+            "block_number": 12,
+            "block_hash": "0xabc",
+            "parent_hash": "0x123",
+            "transactions": [{"transaction_hash":"0x1"}],
+            "receipts": [{
+                "transaction_hash":"0x1"
+            }]
+        });
+
+        let mut warnings = Vec::new();
+        let error = parse_block_with_receipts(&block, &mut warnings)
+            .expect_err("missing execution status must fail closed");
+        assert!(error.contains("missing receipt execution_status"));
     }
 
     #[test]
