@@ -3,12 +3,16 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use argon2::{Algorithm, Argon2, Params, Version};
 use pbkdf2::pbkdf2_hmac_array;
 use rand::{RngCore, rngs::OsRng};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 const API_KEY_ARGON2_MEMORY_KIB: u32 = 19 * 1024;
 const API_KEY_ARGON2_ITERATIONS: u32 = 2;
 const API_KEY_ARGON2_PARALLELISM: u32 = 1;
 const API_KEY_LEGACY_PBKDF2_ITERATIONS: u32 = 150_000;
+#[cfg(not(test))]
+const AUTH_CACHE_MAX_ENTRIES: usize = 1_024;
+#[cfg(test)]
+const AUTH_CACHE_MAX_ENTRIES: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiKeyKdf {
@@ -166,6 +170,8 @@ pub struct McpAccessController {
     policies: BTreeMap<String, AgentPolicy>,
     requests: BTreeMap<String, VecDeque<u64>>,
     latest_request_time: BTreeMap<String, u64>,
+    auth_cache: BTreeMap<[u8; 32], String>,
+    auth_cache_order: VecDeque<[u8; 32]>,
 }
 
 impl McpAccessController {
@@ -185,6 +191,8 @@ impl McpAccessController {
             policies: policy_map,
             requests: BTreeMap::new(),
             latest_request_time: BTreeMap::new(),
+            auth_cache: BTreeMap::new(),
+            auth_cache_order: VecDeque::new(),
         }
     }
 
@@ -207,10 +215,22 @@ impl McpAccessController {
             policies: policy_map,
             requests: BTreeMap::new(),
             latest_request_time: BTreeMap::new(),
+            auth_cache: BTreeMap::new(),
+            auth_cache_order: VecDeque::new(),
         })
     }
 
-    fn resolve_agent_id_for_api_key(&self, api_key: &str) -> Result<String, AccessError> {
+    fn resolve_agent_id_for_api_key(&mut self, api_key: &str) -> Result<String, AccessError> {
+        let fingerprint = sha256_digest(api_key.as_bytes());
+        if let Some(agent_id) = self.auth_cache.get(&fingerprint) {
+            if self.policies.contains_key(agent_id) {
+                return Ok(agent_id.clone());
+            }
+            self.auth_cache.remove(&fingerprint);
+            self.auth_cache_order
+                .retain(|cached| *cached != fingerprint);
+        }
+
         let mut matching_agents: Vec<String> = self
             .policies
             .iter()
@@ -225,9 +245,26 @@ impl McpAccessController {
         matching_agents.sort();
         match matching_agents.len() {
             0 => Err(AccessError::InvalidApiKey),
-            1 => Ok(matching_agents.remove(0)),
+            1 => {
+                let resolved = matching_agents.remove(0);
+                self.cache_authorized_api_key(fingerprint, resolved.clone());
+                Ok(resolved)
+            }
             _ => Err(AccessError::AmbiguousApiKey { matching_agents }),
         }
+    }
+
+    fn cache_authorized_api_key(&mut self, fingerprint: [u8; 32], agent_id: String) {
+        if self.auth_cache.contains_key(&fingerprint) {
+            return;
+        }
+        if self.auth_cache.len() >= AUTH_CACHE_MAX_ENTRIES
+            && let Some(oldest) = self.auth_cache_order.pop_front()
+        {
+            self.auth_cache.remove(&oldest);
+        }
+        self.auth_cache.insert(fingerprint, agent_id);
+        self.auth_cache_order.push_back(fingerprint);
     }
 
     pub fn authorize(
@@ -280,6 +317,11 @@ impl McpAccessController {
             .insert(agent_id.clone(), now_unix_seconds);
         Ok(agent_id)
     }
+
+    #[cfg(test)]
+    fn auth_cache_len_for_tests(&self) -> usize {
+        self.auth_cache.len()
+    }
 }
 
 fn hash_api_key_argon2id(api_key: &str, salt: &[u8; 16]) -> Result<[u8; 32], String> {
@@ -300,6 +342,13 @@ fn hash_api_key_argon2id(api_key: &str, salt: &[u8; 16]) -> Result<[u8; 32], Str
 
 fn hash_api_key_legacy_pbkdf2(api_key: &str, salt: &[u8; 16]) -> [u8; 32] {
     pbkdf2_hmac_array::<Sha256, 32>(api_key.as_bytes(), salt, API_KEY_LEGACY_PBKDF2_ITERATIONS)
+}
+
+fn sha256_digest(bytes: &[u8]) -> [u8; 32] {
+    let digest = Sha256::digest(bytes);
+    let mut out = [0_u8; 32];
+    out.copy_from_slice(&digest);
+    out
 }
 
 fn constant_time_eq_32(left: &[u8; 32], right: &[u8; 32]) -> bool {
@@ -495,6 +544,17 @@ mod tests {
         )
     }
 
+    fn legacy_read_only_policy(api_key: &str, salt_byte: u8, limit: u32) -> AgentPolicy {
+        let salt = [salt_byte; 16];
+        AgentPolicy {
+            api_key_salt: salt,
+            api_key_hash: hash_api_key_legacy_pbkdf2(api_key, &salt),
+            api_key_kdf: ApiKeyKdf::LegacyPbkdf2Sha256,
+            permissions: BTreeSet::from([ToolPermission::QueryState]),
+            max_requests_per_minute: limit,
+        }
+    }
+
     #[test]
     fn rejects_excessive_anomaly_query_limit() {
         let tool = McpTool::GetAnomalies {
@@ -676,5 +736,40 @@ mod tests {
     fn agent_policy_defaults_to_argon2id() {
         let policy = read_only_policy(2);
         assert_eq!(policy.api_key_kdf, ApiKeyKdf::Argon2id);
+    }
+
+    #[test]
+    fn caches_authorized_api_keys_after_first_resolution() {
+        let mut access = McpAccessController::new([(
+            "agent-a".to_string(),
+            legacy_read_only_policy("k1", 1, 3),
+        )]);
+        assert_eq!(access.auth_cache_len_for_tests(), 0);
+
+        access
+            .authorize("k1", &McpTool::QueryState, 1_000)
+            .expect("first request should authorize");
+        assert_eq!(access.auth_cache_len_for_tests(), 1);
+
+        access
+            .authorize("k1", &McpTool::QueryState, 1_001)
+            .expect("second request should reuse cache");
+        assert_eq!(access.auth_cache_len_for_tests(), 1);
+    }
+
+    #[test]
+    fn auth_cache_is_bounded() {
+        let mut access = McpAccessController::new([(
+            "agent-a".to_string(),
+            legacy_read_only_policy("k1", 1, 10),
+        )]);
+        let entries = AUTH_CACHE_MAX_ENTRIES + 2;
+        for idx in 0..entries {
+            let mut fingerprint = [0_u8; 32];
+            fingerprint[0] = idx as u8;
+            access.cache_authorized_api_key(fingerprint, format!("agent-{idx}"));
+        }
+
+        assert_eq!(access.auth_cache_len_for_tests(), AUTH_CACHE_MAX_ENTRIES);
     }
 }
