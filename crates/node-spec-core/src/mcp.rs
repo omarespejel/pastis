@@ -24,9 +24,19 @@ pub enum ApiKeyKdf {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpTool {
     QueryState,
+    QueryStorage {
+        contract_address: String,
+        storage_keys: Vec<String>,
+        block_number: Option<u64>,
+        include_nonce: bool,
+    },
     GetNodeStatus,
-    GetAnomalies { limit: u64 },
-    BatchQuery { queries: Vec<McpTool> },
+    GetAnomalies {
+        limit: u64,
+    },
+    BatchQuery {
+        queries: Vec<McpTool>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -40,6 +50,9 @@ impl McpTool {
     fn collect_required_permissions(&self, permissions: &mut BTreeSet<ToolPermission>) {
         match self {
             McpTool::QueryState => {
+                permissions.insert(ToolPermission::QueryState);
+            }
+            McpTool::QueryStorage { .. } => {
                 permissions.insert(ToolPermission::QueryState);
             }
             McpTool::GetNodeStatus => {
@@ -77,9 +90,18 @@ pub enum ValidationError {
     },
     #[error("anomaly query limit {limit} exceeds max {max_limit}")]
     AnomalyLimitExceeded { limit: u64, max_limit: u64 },
+    #[error("query storage key count {count} exceeds max keys {max_keys} for a single query")]
+    StorageQueryTooManyKeys { count: usize, max_keys: usize },
+    #[error("query storage must request at least one storage key or include nonce")]
+    StorageQueryEmptySelection,
+    #[error("invalid hex identifier for {field}: {value}")]
+    InvalidHexIdentifier { field: &'static str, value: String },
 }
 
 const MAX_GET_ANOMALIES_LIMIT: u64 = 10_000;
+const MAX_QUERY_STORAGE_KEYS: usize = 512;
+const MAX_QUERY_IDENTIFIER_HEX_LEN: usize = 64;
+const MAX_IDENTIFIER_ERROR_VALUE_LEN: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPolicy {
@@ -456,8 +478,56 @@ fn validate_tool_inner(
             }
             Ok(1)
         }
+        McpTool::QueryStorage {
+            contract_address,
+            storage_keys,
+            include_nonce,
+            ..
+        } => {
+            if storage_keys.len() > MAX_QUERY_STORAGE_KEYS {
+                return Err(ValidationError::StorageQueryTooManyKeys {
+                    count: storage_keys.len(),
+                    max_keys: MAX_QUERY_STORAGE_KEYS,
+                });
+            }
+            if storage_keys.is_empty() && !*include_nonce {
+                return Err(ValidationError::StorageQueryEmptySelection);
+            }
+            validate_hex_identifier("contract_address", contract_address)?;
+            for key in storage_keys {
+                validate_hex_identifier("storage_key", key)?;
+            }
+            Ok(1)
+        }
         McpTool::QueryState | McpTool::GetNodeStatus => Ok(1),
     }
+}
+
+fn validate_hex_identifier(field: &'static str, value: &str) -> Result<(), ValidationError> {
+    let trimmed = value.trim();
+    let raw = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    let valid = !raw.is_empty()
+        && raw.len() <= MAX_QUERY_IDENTIFIER_HEX_LEN
+        && raw.chars().all(|ch| ch.is_ascii_hexdigit());
+    if valid {
+        return Ok(());
+    }
+    Err(ValidationError::InvalidHexIdentifier {
+        field,
+        value: truncate_for_error(value),
+    })
+}
+
+fn truncate_for_error(value: &str) -> String {
+    let total = value.chars().count();
+    if total <= MAX_IDENTIFIER_ERROR_VALUE_LEN {
+        return value.to_string();
+    }
+    let prefix: String = value.chars().take(MAX_IDENTIFIER_ERROR_VALUE_LEN).collect();
+    format!("{prefix}...(truncated, {total} chars total)")
 }
 
 #[cfg(test)]
@@ -469,6 +539,12 @@ mod tests {
         let tool = McpTool::BatchQuery {
             queries: vec![
                 McpTool::QueryState,
+                McpTool::QueryStorage {
+                    contract_address: "0x1".to_string(),
+                    storage_keys: vec!["0x2".to_string()],
+                    block_number: Some(1),
+                    include_nonce: false,
+                },
                 McpTool::GetNodeStatus,
                 McpTool::GetAnomalies { limit: 10 },
             ],
@@ -625,6 +701,104 @@ mod tests {
     }
 
     #[test]
+    fn rejects_query_storage_without_requested_keys_or_nonce() {
+        let tool = McpTool::QueryStorage {
+            contract_address: "0x1".to_string(),
+            storage_keys: Vec::new(),
+            block_number: None,
+            include_nonce: false,
+        };
+
+        let err = validate_tool(
+            &tool,
+            ValidationLimits {
+                max_batch_size: 10,
+                max_depth: 2,
+                max_total_tools: 10,
+            },
+        )
+        .expect_err("must reject empty query selection");
+
+        assert_eq!(err, ValidationError::StorageQueryEmptySelection);
+    }
+
+    #[test]
+    fn rejects_query_storage_with_too_many_keys() {
+        let tool = McpTool::QueryStorage {
+            contract_address: "0x1".to_string(),
+            storage_keys: vec!["0x2".to_string(); MAX_QUERY_STORAGE_KEYS + 1],
+            block_number: None,
+            include_nonce: false,
+        };
+
+        let err = validate_tool(
+            &tool,
+            ValidationLimits {
+                max_batch_size: 10,
+                max_depth: 2,
+                max_total_tools: 10,
+            },
+        )
+        .expect_err("must reject oversized storage key vector");
+
+        assert_eq!(
+            err,
+            ValidationError::StorageQueryTooManyKeys {
+                count: MAX_QUERY_STORAGE_KEYS + 1,
+                max_keys: MAX_QUERY_STORAGE_KEYS,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_query_storage_with_invalid_hex_identifiers() {
+        let tool = McpTool::QueryStorage {
+            contract_address: "not-a-felt".to_string(),
+            storage_keys: vec!["0x2".to_string()],
+            block_number: None,
+            include_nonce: true,
+        };
+
+        let err = validate_tool(
+            &tool,
+            ValidationLimits {
+                max_batch_size: 10,
+                max_depth: 2,
+                max_total_tools: 10,
+            },
+        )
+        .expect_err("must reject malformed contract identifier");
+
+        assert_eq!(
+            err,
+            ValidationError::InvalidHexIdentifier {
+                field: "contract_address",
+                value: "not-a-felt".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn allows_valid_query_storage_identifier_shapes() {
+        let tool = McpTool::QueryStorage {
+            contract_address: "0xABC".to_string(),
+            storage_keys: vec!["10".to_string(), "0X20".to_string()],
+            block_number: Some(42),
+            include_nonce: true,
+        };
+
+        validate_tool(
+            &tool,
+            ValidationLimits {
+                max_batch_size: 10,
+                max_depth: 2,
+                max_total_tools: 10,
+            },
+        )
+        .expect("valid storage query should pass shape checks");
+    }
+
+    #[test]
     fn rejects_duplicate_policy_salts_in_controller_config() {
         let first = read_only_policy(1);
         let duplicate = AgentPolicy {
@@ -721,6 +895,21 @@ mod tests {
                 permission: ToolPermission::GetNodeStatus,
             }
         );
+    }
+
+    #[test]
+    fn query_storage_uses_query_state_permission() {
+        let mut access = McpAccessController::new([("agent-a".to_string(), read_only_policy(2))]);
+        let tool = McpTool::QueryStorage {
+            contract_address: "0x1".to_string(),
+            storage_keys: vec!["0x2".to_string()],
+            block_number: None,
+            include_nonce: false,
+        };
+        let resolved = access
+            .authorize("secret", &tool, 1_000)
+            .expect("query-storage should authorize under QueryState permission");
+        assert_eq!(resolved, "agent-a");
     }
 
     #[test]

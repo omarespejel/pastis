@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use node_spec_core::mcp::{
@@ -8,7 +9,7 @@ use node_spec_core::mcp::{
 pub use starknet_node_exex_btcfi::BtcfiAnomaly;
 use starknet_node_exex_btcfi::BtcfiExEx;
 use starknet_node_storage::{StateRootSemantics, StorageBackend, StorageError};
-use starknet_node_types::{BlockNumber, ComponentHealth};
+use starknet_node_types::{BlockNumber, ComponentHealth, ContractAddress, StarknetFelt};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpRequest {
@@ -24,6 +25,14 @@ pub struct QueryStateResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryStorageResponse {
+    pub block_number: BlockNumber,
+    pub contract_address: ContractAddress,
+    pub storage_values: BTreeMap<String, Option<StarknetFelt>>,
+    pub nonce: Option<StarknetFelt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeStatusResponse {
     pub storage: ComponentHealth,
     pub latest_block_number: BlockNumber,
@@ -33,6 +42,7 @@ pub struct NodeStatusResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpResponse {
     QueryState(QueryStateResponse),
+    QueryStorage(QueryStorageResponse),
     GetNodeStatus(NodeStatusResponse),
     GetAnomalies { anomalies: Vec<BtcfiAnomaly> },
     BatchQuery { responses: Vec<McpResponse> },
@@ -52,6 +62,8 @@ pub enum McpServerError {
     Validation(#[from] ValidationError),
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error("state read failed: {0}")]
+    StateRead(String),
     #[error("anomaly source is unavailable for this node")]
     AnomalySourceUnavailable,
     #[error("anomaly source failed: {0}")]
@@ -123,6 +135,44 @@ impl<'a> McpServer<'a> {
                     state_root,
                 }))
             }
+            McpTool::QueryStorage {
+                contract_address,
+                storage_keys,
+                block_number,
+                include_nonce,
+            } => {
+                let contract = ContractAddress::parse(contract_address.clone()).map_err(|_| {
+                    McpServerError::Validation(ValidationError::InvalidHexIdentifier {
+                        field: "contract_address",
+                        value: contract_address.clone(),
+                    })
+                })?;
+                let block_number = match block_number {
+                    Some(number) => *number,
+                    None => self.storage.latest_block_number()?,
+                };
+                let reader = self.storage.get_state_reader(block_number)?;
+                let mut storage_values = BTreeMap::new();
+                for key in storage_keys {
+                    let value = reader
+                        .get_storage(&contract, key)
+                        .map_err(|error| McpServerError::StateRead(error.to_string()))?;
+                    storage_values.insert(key.clone(), value);
+                }
+                let nonce = if *include_nonce {
+                    reader
+                        .nonce_of(&contract)
+                        .map_err(|error| McpServerError::StateRead(error.to_string()))?
+                } else {
+                    None
+                };
+                Ok(McpResponse::QueryStorage(QueryStorageResponse {
+                    block_number,
+                    contract_address: contract,
+                    storage_values,
+                    nonce,
+                }))
+            }
             McpTool::GetNodeStatus => {
                 let latest_block_number = self.storage.latest_block_number()?;
                 let status = self.storage.detailed_status();
@@ -165,7 +215,7 @@ mod tests {
     use starknet_node_storage::InMemoryStorage;
     use starknet_node_types::{
         BlockGasPrices, ContractAddress, GasPricePerToken, InMemoryState, StarknetBlock,
-        StarknetStateDiff,
+        StarknetFelt, StarknetStateDiff,
     };
 
     use super::*;
@@ -208,6 +258,28 @@ mod tests {
         }
     }
 
+    fn sample_state_diff_with_single_slot(
+        contract: &str,
+        key: &str,
+        value: &str,
+        nonce: &str,
+    ) -> StarknetStateDiff {
+        let contract = ContractAddress::parse(contract).expect("valid contract");
+        let mut diff = StarknetStateDiff::default();
+        diff.storage_diffs
+            .entry(contract.clone())
+            .or_default()
+            .insert(
+                key.to_string(),
+                StarknetFelt::from_hex(value).expect("valid felt"),
+            );
+        diff.nonces.insert(
+            contract,
+            StarknetFelt::from_hex(nonce).expect("valid nonce felt"),
+        );
+        diff
+    }
+
     fn server_with_storage<'a>(
         storage: &'a dyn StorageBackend,
         policies: impl IntoIterator<Item = (String, AgentPolicy)>,
@@ -243,6 +315,113 @@ mod tests {
                 state_root: "0x0".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn query_storage_returns_values_and_nonce_for_requested_block() {
+        let mut storage = InMemoryStorage::new(InMemoryState::default());
+        storage
+            .insert_block(
+                sample_block(1),
+                sample_state_diff_with_single_slot("0xabc", "0x10", "0x55", "0x1"),
+            )
+            .expect("insert block 1");
+        storage
+            .insert_block(
+                sample_block(2),
+                sample_state_diff_with_single_slot("0xabc", "0x10", "0x66", "0x2"),
+            )
+            .expect("insert block 2");
+
+        let server = server_with_storage(
+            &storage,
+            [(
+                "agent-a".to_string(),
+                read_policy(BTreeSet::from([ToolPermission::QueryState]), 5),
+            )],
+        );
+        let response = server
+            .handle_request(McpRequest {
+                api_key: "api-key".to_string(),
+                tool: McpTool::QueryStorage {
+                    contract_address: "0xabc".to_string(),
+                    storage_keys: vec!["0x10".to_string(), "0x20".to_string()],
+                    block_number: Some(2),
+                    include_nonce: true,
+                },
+                now_unix_seconds: 1_000,
+            })
+            .expect("query storage succeeds");
+
+        assert_eq!(response.agent_id, "agent-a");
+        match response.response {
+            McpResponse::QueryStorage(storage) => {
+                assert_eq!(storage.block_number, 2);
+                assert_eq!(
+                    storage.contract_address,
+                    ContractAddress::parse("0xabc").expect("valid contract")
+                );
+                assert_eq!(
+                    storage.storage_values.get("0x10"),
+                    Some(&Some(StarknetFelt::from_hex("0x66").expect("valid felt")))
+                );
+                assert_eq!(storage.storage_values.get("0x20"), Some(&None));
+                assert_eq!(
+                    storage.nonce,
+                    Some(StarknetFelt::from_hex("0x2").expect("valid nonce"))
+                );
+            }
+            other => panic!("expected QueryStorage response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_storage_defaults_to_latest_block_when_block_number_is_omitted() {
+        let mut storage = InMemoryStorage::new(InMemoryState::default());
+        storage
+            .insert_block(
+                sample_block(1),
+                sample_state_diff_with_single_slot("0xabc", "0x10", "0x55", "0x1"),
+            )
+            .expect("insert block 1");
+        storage
+            .insert_block(
+                sample_block(2),
+                sample_state_diff_with_single_slot("0xabc", "0x10", "0x66", "0x2"),
+            )
+            .expect("insert block 2");
+
+        let server = server_with_storage(
+            &storage,
+            [(
+                "agent-a".to_string(),
+                read_policy(BTreeSet::from([ToolPermission::QueryState]), 5),
+            )],
+        );
+        let response = server
+            .handle_request(McpRequest {
+                api_key: "api-key".to_string(),
+                tool: McpTool::QueryStorage {
+                    contract_address: "0xabc".to_string(),
+                    storage_keys: vec!["0x10".to_string()],
+                    block_number: None,
+                    include_nonce: false,
+                },
+                now_unix_seconds: 1_000,
+            })
+            .expect("query storage succeeds");
+
+        match response.response {
+            McpResponse::QueryStorage(storage) => {
+                assert_eq!(storage.block_number, 2);
+                assert_eq!(
+                    storage.storage_values.get("0x10"),
+                    Some(&Some(StarknetFelt::from_hex("0x66").expect("valid felt")))
+                );
+                assert_eq!(storage.nonce, None);
+            }
+            other => panic!("expected QueryStorage response, got {other:?}"),
+        }
     }
 
     #[test]
