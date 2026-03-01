@@ -685,9 +685,6 @@ impl NodeRuntime {
     }
 
     async fn ensure_chain_id_validated(&mut self) -> Result<(), String> {
-        if self.chain_id_validated {
-            return Ok(());
-        }
         let upstream_chain_id = self.fetch_chain_id_with_retry().await?;
         let local_chain_id = self.chain_id().to_string();
         if normalize_chain_id(&upstream_chain_id) != normalize_chain_id(&local_chain_id) {
@@ -1574,6 +1571,51 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct SequenceChainIdSyncSource {
+        chain_ids: Arc<Mutex<VecDeque<String>>>,
+    }
+
+    impl SequenceChainIdSyncSource {
+        fn new(chain_ids: impl IntoIterator<Item = String>) -> Self {
+            Self {
+                chain_ids: Arc::new(Mutex::new(chain_ids.into_iter().collect())),
+            }
+        }
+    }
+
+    impl SyncSource for SequenceChainIdSyncSource {
+        fn fetch_latest_block_number(&self) -> SyncSourceFuture<'_, u64> {
+            Box::pin(async move { Ok(0) })
+        }
+
+        fn fetch_chain_id(&self) -> SyncSourceFuture<'_, String> {
+            let chain_ids = Arc::clone(&self.chain_ids);
+            Box::pin(async move {
+                let mut guard = chain_ids
+                    .lock()
+                    .map_err(|_| "chain id sequence lock poisoned".to_string())?;
+                if guard.len() > 1 {
+                    return guard
+                        .pop_front()
+                        .ok_or_else(|| "empty chain id sequence".to_string());
+                }
+                guard
+                    .front()
+                    .cloned()
+                    .ok_or_else(|| "empty chain id sequence".to_string())
+            })
+        }
+
+        fn fetch_block(&self, block_number: u64) -> SyncSourceFuture<'_, RuntimeFetch> {
+            Box::pin(async move {
+                Err(format!(
+                    "fetch_block({block_number}) should not be called in this test"
+                ))
+            })
+        }
+    }
+
     impl SyncSource for FlakyChainIdSyncSource {
         fn fetch_latest_block_number(&self) -> SyncSourceFuture<'_, u64> {
             Box::pin(async move { Ok(0) })
@@ -1957,5 +1999,38 @@ mod tests {
         assert_eq!(sync_source.chain_id_attempts(), 2);
         assert_eq!(runtime.diagnostics().failure_count, 0);
         assert!(runtime.chain_id_validated);
+    }
+
+    #[tokio::test]
+    async fn chain_id_validation_revalidates_after_initial_success() {
+        let sync_source = Arc::new(SequenceChainIdSyncSource::new([
+            "SN_MAIN".to_string(),
+            "SN_SEPOLIA".to_string(),
+        ]));
+        let consensus = Arc::new(HealthyConsensus);
+        let network = Arc::new(MockNetwork {
+            healthy: true,
+            peers: 2,
+        });
+
+        let mut config = runtime_config();
+        config.retry = RpcRetryConfig {
+            max_retries: 0,
+            base_backoff: Duration::ZERO,
+        };
+
+        let mut runtime =
+            NodeRuntime::new_with_backends(config, sync_source, consensus, network)
+                .expect("runtime should initialize");
+        runtime
+            .ensure_chain_id_validated()
+            .await
+            .expect("initial validation should succeed");
+
+        let error = runtime
+            .ensure_chain_id_validated()
+            .await
+            .expect_err("second validation must detect upstream chain id switch");
+        assert!(error.contains("chain id mismatch"));
     }
 }
