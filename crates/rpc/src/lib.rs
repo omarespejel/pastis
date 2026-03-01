@@ -479,6 +479,13 @@ impl<'a> StarknetRpcServer<'a> {
                 }
                 Ok(number)
             }
+            BlockId::Hash(hash) => {
+                let block = self
+                    .storage
+                    .get_block(BlockId::Hash(hash))?
+                    .ok_or(RpcError::BlockNotFound)?;
+                Ok(block.number)
+            }
         }
     }
 
@@ -565,18 +572,22 @@ fn parse_block_id_value(block_id_value: &Value) -> Result<BlockId, RpcError> {
             if let Some(number) = obj.get("block_number").and_then(Value::as_u64) {
                 return Ok(BlockId::Number(number));
             }
+            if let Some(hash_value) = obj.get("block_hash") {
+                let hash = parse_felt_hex(hash_value, "block_hash")?;
+                return Ok(BlockId::Hash(hash));
+            }
             if let Some(tag) = obj.get("block_tag").and_then(Value::as_str)
                 && (tag == "latest" || tag == "pending")
             {
                 return Ok(BlockId::Latest);
             }
             Err(RpcError::InvalidParams(
-                "block_id object must include block_number or block_tag='latest'|'pending'"
+                "block_id object must include block_number, block_hash, or block_tag='latest'|'pending'"
                     .to_string(),
             ))
         }
         _ => Err(RpcError::InvalidParams(
-            "block_id must be 'latest'|'pending' or an object with block_number/block_tag"
+            "block_id must be 'latest'|'pending' or an object with block_number/block_hash/block_tag"
                 .to_string(),
         )),
     }
@@ -702,7 +713,12 @@ fn parse_felt_hex(value: &Value, field: &str) -> Result<String, RpcError> {
     let raw = value
         .as_str()
         .ok_or_else(|| RpcError::InvalidParams(format!("{field} must be a string")))?;
-    StarknetFelt::from_str(raw)
+    let normalized = if let Some(stripped) = raw.strip_prefix("0X") {
+        format!("0x{stripped}")
+    } else {
+        raw.to_string()
+    };
+    StarknetFelt::from_str(&normalized)
         .map(|felt| format!("{:#x}", felt))
         .map_err(|error| RpcError::InvalidParams(format!("invalid {field} '{raw}': {error}")))
 }
@@ -1209,6 +1225,24 @@ mod tests {
     }
 
     #[test]
+    fn get_block_with_txs_block_hash_works() {
+        let server = seeded_server();
+        let raw = r#"{"jsonrpc":"2.0","id":81,"method":"starknet_getBlockWithTxs","params":[{"block_hash":"0x2"}]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["result"]["number"], json!(2));
+        assert_eq!(value["result"]["block_hash"], json!("0x2"));
+    }
+
+    #[test]
+    fn get_block_with_txs_block_hash_is_canonicalized() {
+        let server = seeded_server();
+        let raw = r#"{"jsonrpc":"2.0","id":82,"method":"starknet_getBlockWithTxs","params":[{"block_hash":"0X00002"}]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["result"]["number"], json!(2));
+        assert_eq!(value["result"]["block_hash"], json!("0x2"));
+    }
+
+    #[test]
     fn get_block_with_receipts_works() {
         let server = seeded_server();
         let raw = r#"{"jsonrpc":"2.0","id":26,"method":"starknet_getBlockWithReceipts","params":[{"block_number":2}]}"#;
@@ -1275,6 +1309,15 @@ mod tests {
             value["result"]["state_diff"]["storage_diffs"][0]["address"],
             json!("0x2")
         );
+    }
+
+    #[test]
+    fn get_state_update_block_hash_works() {
+        let server = seeded_server();
+        let raw = r#"{"jsonrpc":"2.0","id":83,"method":"starknet_getStateUpdate","params":[{"block_hash":"0x2"}]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["result"]["block_hash"], json!("0x2"));
+        assert_eq!(value["result"]["new_root"], json!("0x66"));
     }
 
     #[test]

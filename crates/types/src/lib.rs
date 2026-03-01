@@ -511,6 +511,7 @@ impl StarknetBlock {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockId {
     Number(BlockNumber),
+    Hash(BlockHash),
     Latest,
 }
 

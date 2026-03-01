@@ -18,6 +18,8 @@ use apollo_storage::{
     StorageWriter as ApolloStorageWriter, open_storage as open_apollo_storage,
 };
 #[cfg(feature = "apollo-adapter")]
+use starknet_api::block::BlockHash as ApolloBlockHash;
+#[cfg(feature = "apollo-adapter")]
 use starknet_api::block::BlockNumber as ApolloBlockNumber;
 #[cfg(feature = "apollo-adapter")]
 use starknet_api::core::{ContractAddress as ApolloContractAddress, Nonce as ApolloNonce};
@@ -76,6 +78,14 @@ pub enum StorageError {
     )]
     DuplicateTransactionHash {
         hash: TxHash,
+        existing_block: BlockNumber,
+        new_block: BlockNumber,
+    },
+    #[error(
+        "block hash {hash} already exists in block {existing_block}; cannot insert duplicate in block {new_block}"
+    )]
+    DuplicateBlockHash {
+        hash: String,
         existing_block: BlockNumber,
         new_block: BlockNumber,
     },
@@ -372,6 +382,7 @@ pub struct InMemoryStorage {
     state_diffs: BTreeMap<BlockNumber, StarknetStateDiff>,
     states: BTreeMap<BlockNumber, InMemoryState>,
     tx_index: BTreeMap<TxHash, (BlockNumber, usize)>,
+    block_number_by_hash: BTreeMap<String, BlockNumber>,
     receipt_index: BTreeMap<TxHash, (BlockNumber, usize)>,
     receipts: BTreeMap<BlockNumber, Vec<StarknetReceipt>>,
 }
@@ -419,6 +430,7 @@ impl InMemoryStorage {
             state_diffs: BTreeMap::new(),
             states,
             tx_index: BTreeMap::new(),
+            block_number_by_hash: BTreeMap::new(),
             receipt_index: BTreeMap::new(),
             receipts: BTreeMap::new(),
         }
@@ -451,6 +463,7 @@ impl InMemoryStorage {
             state_diffs: snapshot.state_diffs,
             states,
             tx_index: BTreeMap::new(),
+            block_number_by_hash: BTreeMap::new(),
             receipt_index: BTreeMap::new(),
             receipts: snapshot.receipts,
         };
@@ -510,6 +523,9 @@ impl InMemoryStorage {
                 )));
             }
         }
+        for hash in self.block_hashes.values() {
+            let _ = canonicalize_block_hash(hash)?;
+        }
         for number in self.states.keys() {
             if *number > latest {
                 return Err(StorageError::IndexInconsistency(format!(
@@ -522,6 +538,7 @@ impl InMemoryStorage {
 
     fn rebuild_indexes_from_blocks(&mut self) -> Result<(), StorageError> {
         self.tx_index.clear();
+        self.block_number_by_hash.clear();
         self.receipt_index.clear();
         for (block_number, block) in &self.blocks {
             if block.number != *block_number {
@@ -573,6 +590,23 @@ impl InMemoryStorage {
                     .insert(receipt.tx_hash.clone(), (*block_number, index));
             }
         }
+        let mut normalized_hashes = BTreeMap::new();
+        for (block_number, hash) in &self.block_hashes {
+            let canonical = canonicalize_block_hash(hash)?;
+            if let Some(existing_block) = self
+                .block_number_by_hash
+                .insert(canonical.clone(), *block_number)
+                && existing_block != *block_number
+            {
+                return Err(StorageError::DuplicateBlockHash {
+                    hash: canonical,
+                    existing_block,
+                    new_block: *block_number,
+                });
+            }
+            normalized_hashes.insert(*block_number, canonical);
+        }
+        self.block_hashes = normalized_hashes;
         Ok(())
     }
 }
@@ -701,21 +735,7 @@ impl StorageBackend for InMemoryStorage {
         }
         let normalized_block_hash = canonical_hash
             .as_deref()
-            .map(|raw| {
-                let trimmed = raw.trim();
-                let normalized = if let Some(stripped) = trimmed.strip_prefix("0X") {
-                    format!("0x{stripped}")
-                } else {
-                    trimmed.to_string()
-                };
-                StarknetFelt::from_str(&normalized)
-                    .map(|felt| format!("{:#x}", felt))
-                    .map_err(|error| StorageError::InvalidFeltEncoding {
-                        field: "block_hash",
-                        value: raw.to_string(),
-                        error: error.to_string(),
-                    })
-            })
+            .map(canonicalize_block_hash)
             .transpose()?;
 
         let effective_receipts = if receipts.is_empty() {
@@ -752,9 +772,19 @@ impl StorageBackend for InMemoryStorage {
             self.receipt_index
                 .insert(tx.hash.clone(), (block_number, index));
         }
+        if let Some(hash) = normalized_block_hash.as_ref()
+            && let Some(existing_block) = self.block_number_by_hash.get(hash)
+        {
+            return Err(StorageError::DuplicateBlockHash {
+                hash: hash.clone(),
+                existing_block: *existing_block,
+                new_block: block_number,
+            });
+        }
         self.blocks.insert(block_number, block);
         if let Some(hash) = normalized_block_hash {
-            self.block_hashes.insert(block_number, hash);
+            self.block_hashes.insert(block_number, hash.clone());
+            self.block_number_by_hash.insert(hash, block_number);
         }
         self.state_diffs.insert(expected, state_diff);
         self.states.insert(expected, next_state);
@@ -765,6 +795,19 @@ impl StorageBackend for InMemoryStorage {
     fn get_block(&self, id: BlockId) -> Result<Option<StarknetBlock>, StorageError> {
         let block = match id {
             BlockId::Number(number) => self.blocks.get(&number).cloned(),
+            BlockId::Hash(hash) => {
+                let canonical_hash = canonicalize_block_hash(&hash)?;
+                let Some(block_number) = self.block_number_by_hash.get(&canonical_hash).copied()
+                else {
+                    return Ok(None);
+                };
+                let block = self.blocks.get(&block_number).cloned().ok_or_else(|| {
+                    StorageError::IndexInconsistency(format!(
+                        "block hash index points to missing block {block_number} for hash {canonical_hash}"
+                    ))
+                })?;
+                Some(block)
+            }
             BlockId::Latest => self
                 .blocks
                 .iter()
@@ -859,6 +902,22 @@ fn default_receipt_for_tx(tx: &StarknetTransaction) -> StarknetReceipt {
         events: 0,
         gas_consumed: 0,
     }
+}
+
+fn canonicalize_block_hash(raw: &str) -> Result<String, StorageError> {
+    let trimmed = raw.trim();
+    let normalized = if let Some(stripped) = trimmed.strip_prefix("0X") {
+        format!("0x{stripped}")
+    } else {
+        trimmed.to_string()
+    };
+    StarknetFelt::from_str(&normalized)
+        .map(|felt| format!("{:#x}", felt))
+        .map_err(|error| StorageError::InvalidFeltEncoding {
+            field: "block_hash",
+            value: raw.to_string(),
+            error: error.to_string(),
+        })
 }
 
 pub struct CheckpointSyncVerifier;
@@ -1218,6 +1277,24 @@ impl StorageBackend for ApolloStorageAdapter {
             .map_err(|error| StorageError::Apollo(error.to_string()))?;
         let number = match id {
             BlockId::Number(number) => ApolloBlockNumber(number),
+            BlockId::Hash(block_hash) => {
+                let canonical_hash = canonicalize_block_hash(&block_hash)?;
+                let hash_felt = ApolloFelt::from_hex(&canonical_hash).map_err(|error| {
+                    StorageError::InvalidFeltEncoding {
+                        field: "block_hash",
+                        value: block_hash.clone(),
+                        error: error.to_string(),
+                    }
+                })?;
+                let lookup = ApolloBlockHash(hash_felt);
+                let Some(number) = txn
+                    .get_block_number_by_hash(&lookup)
+                    .map_err(|error| StorageError::Apollo(error.to_string()))?
+                else {
+                    return Ok(None);
+                };
+                number
+            }
             BlockId::Latest => {
                 let marker = txn
                     .get_header_marker()
@@ -1475,6 +1552,7 @@ mod tests {
         fn get_block(&self, id: BlockId) -> Result<Option<StarknetBlock>, StorageError> {
             let block = match id {
                 BlockId::Number(0) | BlockId::Latest => Some(self.genesis_block.clone()),
+                BlockId::Hash(_) => None,
                 _ => None,
             };
             Ok(block)
@@ -1707,6 +1785,53 @@ mod tests {
                 .expect("hash lookup should succeed"),
             Some("0xabc".to_string())
         );
+    }
+
+    #[test]
+    fn get_block_supports_lookup_by_canonical_block_hash() {
+        let mut storage = InMemoryStorage::new(InMemoryState::default());
+        storage
+            .insert_block_with_metadata(
+                block(1),
+                StarknetStateDiff::default(),
+                Vec::new(),
+                Some("0X000abc".to_string()),
+            )
+            .expect("insert with canonical hash");
+        let looked_up = storage
+            .get_block(BlockId::Hash("0x0AbC".to_string()))
+            .expect("lookup should succeed")
+            .expect("block should exist");
+        assert_eq!(looked_up.number, 1);
+    }
+
+    #[test]
+    fn insert_block_with_metadata_rejects_duplicate_block_hash() {
+        let mut storage = InMemoryStorage::new(InMemoryState::default());
+        storage
+            .insert_block_with_metadata(
+                block(1),
+                StarknetStateDiff::default(),
+                Vec::new(),
+                Some("0xabc".to_string()),
+            )
+            .expect("insert first block hash");
+        let err = storage
+            .insert_block_with_metadata(
+                block(2),
+                StarknetStateDiff::default(),
+                Vec::new(),
+                Some("0X000AbC".to_string()),
+            )
+            .expect_err("duplicate canonical hash must fail");
+        assert!(matches!(
+            err,
+            StorageError::DuplicateBlockHash {
+                existing_block: 1,
+                new_block: 2,
+                ..
+            }
+        ));
     }
 
     #[test]
