@@ -16,7 +16,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 use tokio::time::interval;
 
 use starknet_node::ChainId;
@@ -40,6 +40,7 @@ const MAX_RPC_RATE_LIMIT_PER_MINUTE: u32 = 100_000;
 const MAX_BOOTNODE_PROBE_CONCURRENCY: usize = 32;
 const DEFAULT_HEALTH_MAX_CONSECUTIVE_FAILURES: u64 = 3;
 const DEFAULT_HEALTH_MAX_SYNC_LAG_BLOCKS: u64 = 64;
+const DAEMON_GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
 const MAX_RPC_AUTH_TOKEN_BYTES: usize = 4 * 1024;
 const MAX_TRACKED_RPC_CLIENTS: usize = 10_000;
 
@@ -253,25 +254,29 @@ async fn main() -> Result<(), String> {
         }
     }
 
-    if !bootnode_endpoints.is_empty() {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let mut heartbeat_handle = if !bootnode_endpoints.is_empty() {
         let endpoints = bootnode_endpoints.clone();
         let bootnode_count = endpoints.len();
         let heartbeat_ms = config.p2p_heartbeat_ms.max(1_000);
         let peer_counter = bootnode_peer_count.clone();
         let sync_progress = app_state.sync_progress.clone();
-        tokio::spawn(async move {
-            let mut ticker = new_daemon_interval(Duration::from_millis(heartbeat_ms));
-            loop {
-                ticker.tick().await;
-                let reachable = probe_bootnodes(&endpoints, Duration::from_millis(1_500)).await;
-                peer_counter.store(reachable as u64, Ordering::Relaxed);
-                if let Ok(mut progress) = sync_progress.lock() {
-                    progress.peer_count = reachable as u64;
-                }
-                eprintln!("p2p heartbeat: {reachable}/{bootnode_count} bootnodes reachable");
-            }
-        });
-    }
+        let heartbeat_shutdown_rx = shutdown_rx.clone();
+        Some(tokio::spawn(async move {
+            run_bootnode_heartbeat(
+                endpoints,
+                bootnode_count,
+                heartbeat_ms,
+                peer_counter,
+                sync_progress,
+                heartbeat_shutdown_rx,
+            )
+            .await;
+        }))
+    } else {
+        None
+    };
 
     let app = Router::new()
         .route("/", post(handle_rpc))
@@ -318,11 +323,15 @@ async fn main() -> Result<(), String> {
     }
     println!("require_peers: {}", config.require_peers);
 
+    let mut rpc_shutdown_rx = shutdown_rx.clone();
     let mut rpc_handle = tokio::spawn(async move {
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(async move {
+            wait_for_shutdown_signal(&mut rpc_shutdown_rx).await;
+        })
         .await
         .map_err(|error| format!("rpc server failed: {error}"))
     });
@@ -334,10 +343,14 @@ async fn main() -> Result<(), String> {
     let mut ticker = new_daemon_interval(runtime.poll_interval());
     ticker.tick().await;
 
+    let mut exit_error: Option<String> = None;
+    let mut rpc_outcome: Option<Result<Result<(), String>, tokio::task::JoinError>> = None;
+
     loop {
         tokio::select! {
-            rpc_outcome = &mut rpc_handle => {
-                return classify_rpc_task_completion(rpc_outcome);
+            rpc_join = &mut rpc_handle => {
+                rpc_outcome = Some(rpc_join);
+                break;
             }
             _ = tokio::signal::ctrl_c() => {
                 println!("received shutdown signal");
@@ -364,24 +377,78 @@ async fn main() -> Result<(), String> {
                     },
                     config.exit_on_unhealthy,
                 ) {
-                    return Err(format!(
+                    exit_error = Some(format!(
                         "fatal health condition while sync loop is active: {reason}"
                     ));
+                    break;
                 }
             }
         }
     }
 
-    if !rpc_handle.is_finished() {
-        rpc_handle.abort();
-    }
-    match rpc_handle.await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => eprintln!("warning: rpc server exited with error: {error}"),
-        Err(error) if error.is_cancelled() => {}
-        Err(error) => eprintln!("warning: rpc server task join error: {error}"),
+    let _ = shutdown_tx.send(true);
+
+    if rpc_outcome.is_none() {
+        match join_task_with_timeout(
+            &mut rpc_handle,
+            Duration::from_secs(DAEMON_GRACEFUL_SHUTDOWN_TIMEOUT_SECS),
+            "rpc server",
+        )
+        .await
+        {
+            Ok(outcome) => {
+                rpc_outcome = Some(outcome);
+            }
+            Err(error) => {
+                if exit_error.is_none() {
+                    exit_error = Some(error);
+                } else {
+                    eprintln!("warning: {error}");
+                }
+            }
+        }
     }
 
+    if let Some(mut heartbeat_handle) = heartbeat_handle.take() {
+        match join_task_with_timeout(
+            &mut heartbeat_handle,
+            Duration::from_secs(DAEMON_GRACEFUL_SHUTDOWN_TIMEOUT_SECS),
+            "bootnode heartbeat",
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let warning = format!("bootnode heartbeat task join error: {error}");
+                if exit_error.is_none() {
+                    exit_error = Some(warning.clone());
+                } else {
+                    eprintln!("warning: {warning}");
+                }
+            }
+            Err(error) => {
+                if exit_error.is_none() {
+                    exit_error = Some(error);
+                } else {
+                    eprintln!("warning: {error}");
+                }
+            }
+        }
+    }
+
+    if let Some(outcome) = rpc_outcome
+        && let Err(error) = classify_rpc_task_completion(outcome)
+    {
+        if exit_error.is_none() {
+            exit_error = Some(error);
+        } else {
+            eprintln!("warning: {error}");
+        }
+    }
+
+    if let Some(error) = exit_error {
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -541,6 +608,71 @@ fn new_daemon_interval(period: Duration) -> tokio::time::Interval {
     let mut ticker = interval(period);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker
+}
+
+async fn wait_for_shutdown_signal(shutdown_rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *shutdown_rx.borrow() {
+            return;
+        }
+        if shutdown_rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn run_bootnode_heartbeat(
+    endpoints: Vec<BootnodeEndpoint>,
+    bootnode_count: usize,
+    heartbeat_ms: u64,
+    peer_counter: Arc<AtomicU64>,
+    sync_progress: Arc<Mutex<SyncProgress>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut ticker = new_daemon_interval(Duration::from_millis(heartbeat_ms));
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let reachable = probe_bootnodes(&endpoints, Duration::from_millis(1_500)).await;
+                peer_counter.store(reachable as u64, Ordering::Relaxed);
+                if let Ok(mut progress) = sync_progress.lock() {
+                    progress.peer_count = reachable as u64;
+                }
+                eprintln!("p2p heartbeat: {reachable}/{bootnode_count} bootnodes reachable");
+            }
+            _ = wait_for_shutdown_signal(&mut shutdown_rx) => {
+                return;
+            }
+        }
+    }
+}
+
+async fn join_task_with_timeout<T>(
+    handle: &mut tokio::task::JoinHandle<T>,
+    timeout: Duration,
+    task_name: &str,
+) -> Result<Result<T, tokio::task::JoinError>, String> {
+    match tokio::time::timeout(timeout, &mut *handle).await {
+        Ok(outcome) => Ok(outcome),
+        Err(_) => {
+            handle.abort();
+            let aborted_outcome = handle.await;
+            Err(match aborted_outcome {
+                Ok(_) => format!(
+                    "{task_name} exceeded graceful shutdown timeout of {:?}; abort requested after completion",
+                    timeout
+                ),
+                Err(join_error) if join_error.is_cancelled() => format!(
+                    "{task_name} exceeded graceful shutdown timeout of {:?} and was aborted",
+                    timeout
+                ),
+                Err(join_error) => format!(
+                    "{task_name} exceeded graceful shutdown timeout of {:?}; abort join error: {join_error}",
+                    timeout
+                ),
+            })
+        }
+    }
 }
 
 async fn probe_bootnodes(endpoints: &[BootnodeEndpoint], timeout: Duration) -> usize {
@@ -1665,6 +1797,72 @@ mod tests {
         let error = classify_rpc_task_completion(Ok(Err("rpc boom".to_string())))
             .expect_err("rpc server error should be propagated");
         assert_eq!(error, "rpc boom");
+    }
+
+    #[tokio::test]
+    async fn join_task_with_timeout_returns_task_output() {
+        let mut handle = tokio::spawn(async { 7_u64 });
+        let outcome =
+            join_task_with_timeout(&mut handle, Duration::from_millis(100), "unit-test-task")
+                .await
+                .expect("join with timeout should succeed");
+        let value = outcome.expect("task should complete successfully");
+        assert_eq!(value, 7);
+    }
+
+    #[tokio::test]
+    async fn join_task_with_timeout_reports_timeout_and_aborts() {
+        let mut handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            9_u64
+        });
+        let error = join_task_with_timeout(
+            &mut handle,
+            Duration::from_millis(5),
+            "unit-test-timeout-task",
+        )
+        .await
+        .expect_err("timeout should fail closed");
+        assert!(error.contains("exceeded graceful shutdown timeout"));
+        assert!(handle.is_finished());
+    }
+
+    #[tokio::test]
+    async fn wait_for_shutdown_signal_returns_after_send() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let waiter = tokio::spawn(async move {
+            wait_for_shutdown_signal(&mut shutdown_rx).await;
+        });
+        shutdown_tx
+            .send(true)
+            .expect("shutdown signal send should succeed");
+        tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("waiter should complete quickly")
+            .expect("waiter task should not panic");
+    }
+
+    #[tokio::test]
+    async fn bootnode_heartbeat_stops_when_shutdown_requested() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let peer_counter = Arc::new(AtomicU64::new(0));
+        let sync_progress = Arc::new(Mutex::new(base_progress()));
+        let heartbeat = tokio::spawn(run_bootnode_heartbeat(
+            Vec::new(),
+            0,
+            1_000,
+            peer_counter,
+            sync_progress,
+            shutdown_rx,
+        ));
+
+        shutdown_tx
+            .send(true)
+            .expect("shutdown signal send should succeed");
+        tokio::time::timeout(Duration::from_millis(100), heartbeat)
+            .await
+            .expect("heartbeat should stop quickly")
+            .expect("heartbeat task should not panic");
     }
 
     #[test]
