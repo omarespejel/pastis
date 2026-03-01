@@ -13,6 +13,7 @@ const API_KEY_LEGACY_PBKDF2_ITERATIONS: u32 = 150_000;
 const AUTH_CACHE_MAX_ENTRIES: usize = 1_024;
 #[cfg(test)]
 const AUTH_CACHE_MAX_ENTRIES: usize = 8;
+const MAX_API_KEY_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiKeyKdf {
@@ -172,6 +173,8 @@ pub struct McpAccessController {
     latest_request_time: BTreeMap<String, u64>,
     auth_cache: BTreeMap<[u8; 32], String>,
     auth_cache_order: VecDeque<[u8; 32]>,
+    denied_cache: BTreeSet<[u8; 32]>,
+    denied_cache_order: VecDeque<[u8; 32]>,
 }
 
 impl McpAccessController {
@@ -193,6 +196,8 @@ impl McpAccessController {
             latest_request_time: BTreeMap::new(),
             auth_cache: BTreeMap::new(),
             auth_cache_order: VecDeque::new(),
+            denied_cache: BTreeSet::new(),
+            denied_cache_order: VecDeque::new(),
         }
     }
 
@@ -217,11 +222,19 @@ impl McpAccessController {
             latest_request_time: BTreeMap::new(),
             auth_cache: BTreeMap::new(),
             auth_cache_order: VecDeque::new(),
+            denied_cache: BTreeSet::new(),
+            denied_cache_order: VecDeque::new(),
         })
     }
 
     fn resolve_agent_id_for_api_key(&mut self, api_key: &str) -> Result<String, AccessError> {
+        if api_key.len() > MAX_API_KEY_BYTES {
+            return Err(AccessError::InvalidApiKey);
+        }
         let fingerprint = sha256_digest(api_key.as_bytes());
+        if self.denied_cache.contains(&fingerprint) {
+            return Err(AccessError::InvalidApiKey);
+        }
         if let Some(agent_id) = self.auth_cache.get(&fingerprint) {
             if self.policies.contains_key(agent_id) {
                 return Ok(agent_id.clone());
@@ -258,6 +271,9 @@ impl McpAccessController {
         if self.auth_cache.contains_key(&fingerprint) {
             return;
         }
+        self.denied_cache.remove(&fingerprint);
+        self.denied_cache_order
+            .retain(|cached| *cached != fingerprint);
         if self.auth_cache.len() >= AUTH_CACHE_MAX_ENTRIES
             && let Some(oldest) = self.auth_cache_order.pop_front()
         {
@@ -267,13 +283,36 @@ impl McpAccessController {
         self.auth_cache_order.push_back(fingerprint);
     }
 
+    fn cache_denied_api_key(&mut self, fingerprint: [u8; 32]) {
+        if self.denied_cache.contains(&fingerprint) {
+            return;
+        }
+        if self.denied_cache.len() >= AUTH_CACHE_MAX_ENTRIES
+            && let Some(oldest) = self.denied_cache_order.pop_front()
+        {
+            self.denied_cache.remove(&oldest);
+        }
+        self.denied_cache.insert(fingerprint);
+        self.denied_cache_order.push_back(fingerprint);
+    }
+
     pub fn authorize(
         &mut self,
         api_key: &str,
         tool: &McpTool,
         now_unix_seconds: u64,
     ) -> Result<String, AccessError> {
-        let agent_id = self.resolve_agent_id_for_api_key(api_key)?;
+        let agent_id = match self.resolve_agent_id_for_api_key(api_key) {
+            Ok(agent_id) => agent_id,
+            Err(AccessError::InvalidApiKey) => {
+                if api_key.len() <= MAX_API_KEY_BYTES {
+                    let fingerprint = sha256_digest(api_key.as_bytes());
+                    self.cache_denied_api_key(fingerprint);
+                }
+                return Err(AccessError::InvalidApiKey);
+            }
+            Err(error) => return Err(error),
+        };
         let policy = self
             .policies
             .get(&agent_id)
@@ -321,6 +360,11 @@ impl McpAccessController {
     #[cfg(test)]
     fn auth_cache_len_for_tests(&self) -> usize {
         self.auth_cache.len()
+    }
+
+    #[cfg(test)]
+    fn denied_cache_len_for_tests(&self) -> usize {
+        self.denied_cache.len()
     }
 }
 
@@ -771,5 +815,37 @@ mod tests {
         }
 
         assert_eq!(access.auth_cache_len_for_tests(), AUTH_CACHE_MAX_ENTRIES);
+    }
+
+    #[test]
+    fn caches_invalid_api_keys_and_bounds_cache_size() {
+        let mut access = McpAccessController::new([(
+            "agent-a".to_string(),
+            legacy_read_only_policy("k1", 1, 10),
+        )]);
+
+        for idx in 0..(AUTH_CACHE_MAX_ENTRIES + 4) {
+            let api_key = format!("invalid-{idx}");
+            let err = access
+                .authorize(&api_key, &McpTool::QueryState, 1_000 + idx as u64)
+                .expect_err("invalid key should be rejected");
+            assert_eq!(err, AccessError::InvalidApiKey);
+        }
+
+        assert_eq!(access.denied_cache_len_for_tests(), AUTH_CACHE_MAX_ENTRIES);
+    }
+
+    #[test]
+    fn rejects_oversized_api_keys_without_caching_them() {
+        let mut access = McpAccessController::new([(
+            "agent-a".to_string(),
+            legacy_read_only_policy("k1", 1, 10),
+        )]);
+        let oversized = "k".repeat(MAX_API_KEY_BYTES + 1);
+        let err = access
+            .authorize(&oversized, &McpTool::QueryState, 1_000)
+            .expect_err("oversized key should be rejected");
+        assert_eq!(err, AccessError::InvalidApiKey);
+        assert_eq!(access.denied_cache_len_for_tests(), 0);
     }
 }
