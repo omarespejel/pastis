@@ -688,7 +688,7 @@ impl NodeRuntime {
         if self.chain_id_validated {
             return Ok(());
         }
-        let upstream_chain_id = self.sync_source.fetch_chain_id().await?;
+        let upstream_chain_id = self.fetch_chain_id_with_retry().await?;
         let local_chain_id = self.chain_id().to_string();
         if normalize_chain_id(&upstream_chain_id) != normalize_chain_id(&local_chain_id) {
             let message = format!(
@@ -700,6 +700,28 @@ impl NodeRuntime {
         }
         self.chain_id_validated = true;
         Ok(())
+    }
+
+    async fn fetch_chain_id_with_retry(&self) -> Result<String, String> {
+        let mut attempt = 0_u32;
+        loop {
+            match self.sync_source.fetch_chain_id().await {
+                Ok(chain_id) => return Ok(chain_id),
+                Err(error) => {
+                    if attempt >= self.retry.max_retries {
+                        return Err(format!(
+                            "chain id RPC failed after {} attempts: {error}",
+                            self.retry.max_retries.saturating_add(1)
+                        ));
+                    }
+                    let backoff = self.retry_backoff(attempt);
+                    if !backoff.is_zero() {
+                        sleep(backoff).await;
+                    }
+                    attempt = attempt.saturating_add(1);
+                }
+            }
+        }
     }
 
     fn retry_backoff(&self, attempt: u32) -> Duration {
@@ -1528,6 +1550,66 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct FlakyChainIdSyncSource {
+        chain_id: String,
+        chain_id_failures_remaining: Arc<Mutex<u32>>,
+        chain_id_attempts: Arc<Mutex<u32>>,
+    }
+
+    impl FlakyChainIdSyncSource {
+        fn new(chain_id: &str, failures: u32) -> Self {
+            Self {
+                chain_id: chain_id.to_string(),
+                chain_id_failures_remaining: Arc::new(Mutex::new(failures)),
+                chain_id_attempts: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn chain_id_attempts(&self) -> u32 {
+            *self
+                .chain_id_attempts
+                .lock()
+                .expect("chain_id_attempts lock should not be poisoned")
+        }
+    }
+
+    impl SyncSource for FlakyChainIdSyncSource {
+        fn fetch_latest_block_number(&self) -> SyncSourceFuture<'_, u64> {
+            Box::pin(async move { Ok(0) })
+        }
+
+        fn fetch_chain_id(&self) -> SyncSourceFuture<'_, String> {
+            let remaining = Arc::clone(&self.chain_id_failures_remaining);
+            let attempts = Arc::clone(&self.chain_id_attempts);
+            let chain_id = self.chain_id.clone();
+            Box::pin(async move {
+                let mut attempts_guard = attempts
+                    .lock()
+                    .map_err(|_| "chain id attempts lock poisoned".to_string())?;
+                *attempts_guard = attempts_guard.saturating_add(1);
+                drop(attempts_guard);
+
+                let mut remaining_guard = remaining
+                    .lock()
+                    .map_err(|_| "chain id remaining lock poisoned".to_string())?;
+                if *remaining_guard > 0 {
+                    *remaining_guard = remaining_guard.saturating_sub(1);
+                    return Err("transient chain id rpc failure".to_string());
+                }
+                Ok(chain_id)
+            })
+        }
+
+        fn fetch_block(&self, block_number: u64) -> SyncSourceFuture<'_, RuntimeFetch> {
+            Box::pin(async move {
+                Err(format!(
+                    "fetch_block({block_number}) should not be called in this test"
+                ))
+            })
+        }
+    }
+
     impl SyncSource for MockSyncSource {
         fn fetch_latest_block_number(&self) -> SyncSourceFuture<'_, u64> {
             let head = self.head;
@@ -1847,5 +1929,33 @@ mod tests {
                 .expect("restored storage read should work"),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn chain_id_validation_retries_transient_upstream_errors() {
+        let sync_source = Arc::new(FlakyChainIdSyncSource::new("SN_MAIN", 1));
+        let consensus = Arc::new(HealthyConsensus);
+        let network = Arc::new(MockNetwork {
+            healthy: true,
+            peers: 2,
+        });
+
+        let mut config = runtime_config();
+        config.retry = RpcRetryConfig {
+            max_retries: 2,
+            base_backoff: Duration::ZERO,
+        };
+
+        let mut runtime =
+            NodeRuntime::new_with_backends(config, sync_source.clone(), consensus, network)
+                .expect("runtime should initialize");
+        runtime
+            .ensure_chain_id_validated()
+            .await
+            .expect("transient chain-id failure should recover with retry");
+
+        assert_eq!(sync_source.chain_id_attempts(), 2);
+        assert_eq!(runtime.diagnostics().failure_count, 0);
+        assert!(runtime.chain_id_validated);
     }
 }
