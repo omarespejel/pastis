@@ -14,9 +14,9 @@ use tokio::time::interval;
 
 use starknet_node::ChainId;
 use starknet_node::runtime::{
-    DEFAULT_MAX_REPLAY_PER_POLL, DEFAULT_REPLAY_WINDOW, DEFAULT_RPC_MAX_RETRIES,
-    DEFAULT_RPC_RETRY_BACKOFF_MS, DEFAULT_RPC_TIMEOUT_SECS, DEFAULT_SYNC_POLL_MS, NodeRuntime,
-    RpcRetryConfig, RuntimeConfig, SyncProgress,
+    DEFAULT_CHAIN_ID_REVALIDATE_POLLS, DEFAULT_MAX_REPLAY_PER_POLL, DEFAULT_REPLAY_WINDOW,
+    DEFAULT_RPC_MAX_RETRIES, DEFAULT_RPC_RETRY_BACKOFF_MS, DEFAULT_RPC_TIMEOUT_SECS,
+    DEFAULT_SYNC_POLL_MS, NodeRuntime, RpcRetryConfig, RuntimeConfig, SyncProgress,
 };
 use starknet_node_rpc::{StarknetRpcServer, SyncStatus};
 use starknet_node_storage::{InMemoryStorage, ThreadSafeStorage};
@@ -37,6 +37,7 @@ struct DaemonConfig {
     poll_ms: u64,
     replay_window: u64,
     max_replay_per_poll: u64,
+    chain_id_revalidate_polls: u64,
     replay_checkpoint_path: Option<String>,
     local_journal_path: Option<String>,
     rpc_timeout_secs: u64,
@@ -87,6 +88,7 @@ async fn main() -> Result<(), String> {
         upstream_rpc_url: config.upstream_rpc_url.clone(),
         replay_window: config.replay_window,
         max_replay_per_poll: config.max_replay_per_poll,
+        chain_id_revalidate_polls: config.chain_id_revalidate_polls,
         replay_checkpoint_path: config.replay_checkpoint_path.clone(),
         local_journal_path: config.local_journal_path.clone(),
         poll_interval: Duration::from_millis(config.poll_ms),
@@ -148,6 +150,10 @@ async fn main() -> Result<(), String> {
     );
     println!("rpc_bind: {}", config.rpc_bind);
     println!("poll_ms: {}", config.poll_ms);
+    println!(
+        "chain_id_revalidate_polls: {}",
+        config.chain_id_revalidate_polls
+    );
     println!("rpc_max_concurrency: {}", config.rpc_max_concurrency);
     println!("exit_on_unhealthy: {}", config.exit_on_unhealthy);
     if let Some(path) = &config.local_journal_path {
@@ -309,6 +315,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
     let mut cli_poll_ms: Option<u64> = None;
     let mut cli_replay_window: Option<u64> = None;
     let mut cli_max_replay_per_poll: Option<u64> = None;
+    let mut cli_chain_id_revalidate_polls: Option<u64> = None;
     let mut cli_replay_checkpoint_path: Option<String> = None;
     let mut cli_local_journal_path: Option<String> = None;
     let mut cli_rpc_timeout_secs: Option<u64> = None;
@@ -361,6 +368,13 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
                     .ok_or_else(|| "--max-replay-per-poll requires a value".to_string())?;
                 cli_max_replay_per_poll = Some(parse_positive_u64(&raw, "--max-replay-per-poll")?);
             }
+            "--chain-id-revalidate-polls" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--chain-id-revalidate-polls requires a value".to_string())?;
+                cli_chain_id_revalidate_polls =
+                    Some(parse_positive_u64(&raw, "--chain-id-revalidate-polls")?);
+            }
             "--replay-checkpoint" => {
                 cli_replay_checkpoint_path = Some(
                     args.next()
@@ -396,7 +410,8 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
                 let raw = args
                     .next()
                     .ok_or_else(|| "--rpc-max-concurrency requires a value".to_string())?;
-                cli_rpc_max_concurrency = Some(parse_positive_usize(&raw, "--rpc-max-concurrency")?);
+                cli_rpc_max_concurrency =
+                    Some(parse_positive_usize(&raw, "--rpc-max-concurrency")?);
             }
             "--bootnode" => {
                 cli_bootnodes.push(
@@ -463,6 +478,11 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         Some(value) => value,
         None => parse_env_u64("PASTIS_MAX_REPLAY_PER_POLL")?.unwrap_or(DEFAULT_MAX_REPLAY_PER_POLL),
     };
+    let chain_id_revalidate_polls = match cli_chain_id_revalidate_polls {
+        Some(value) => value,
+        None => parse_env_u64("PASTIS_CHAIN_ID_REVALIDATE_POLLS")?
+            .unwrap_or(DEFAULT_CHAIN_ID_REVALIDATE_POLLS),
+    };
     let rpc_timeout_secs = match cli_rpc_timeout_secs {
         Some(value) => value,
         None => parse_env_u64("PASTIS_RPC_TIMEOUT_SECS")?.unwrap_or(DEFAULT_RPC_TIMEOUT_SECS),
@@ -511,6 +531,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         poll_ms,
         replay_window,
         max_replay_per_poll,
+        chain_id_revalidate_polls,
         replay_checkpoint_path: cli_replay_checkpoint_path
             .or_else(|| env::var("PASTIS_REPLAY_CHECKPOINT_PATH").ok())
             .or_else(|| Some(DEFAULT_REPLAY_CHECKPOINT_PATH.to_string())),
@@ -662,6 +683,7 @@ options:\n\
   --poll-ms <ms>                     Sync poll interval in milliseconds\n\
   --replay-window <blocks>           Replay window size\n\
   --max-replay-per-poll <blocks>     Max blocks to process per poll\n\
+  --chain-id-revalidate-polls <n>    Polls between upstream chain-id checks (default: {DEFAULT_CHAIN_ID_REVALIDATE_POLLS})\n\
   --replay-checkpoint <path>         Replay checkpoint file path\n\
   --local-journal <path>             Local block/state journal path\n\
   --rpc-timeout-secs <secs>          Upstream RPC timeout\n\
@@ -679,6 +701,7 @@ environment:\n\
   PASTIS_NODE_POLL_MS                Sync poll interval\n\
   PASTIS_REPLAY_WINDOW               Replay window\n\
   PASTIS_MAX_REPLAY_PER_POLL         Max replay per poll\n\
+  PASTIS_CHAIN_ID_REVALIDATE_POLLS   Polls between upstream chain-id checks\n\
   PASTIS_REPLAY_CHECKPOINT_PATH      Replay checkpoint path\n\
   PASTIS_LOCAL_JOURNAL_PATH          Local block/state journal path\n\
   PASTIS_RPC_TIMEOUT_SECS            Upstream RPC timeout seconds\n\
@@ -814,8 +837,7 @@ mod tests {
             .expect("should reserve the only slot");
         let response = handle_rpc(
             State(state),
-            r#"{"jsonrpc":"2.0","id":1,"method":"starknet_blockNumber","params":[]}"#
-                .to_string(),
+            r#"{"jsonrpc":"2.0","id":1,"method":"starknet_blockNumber","params":[]}"#.to_string(),
         )
         .await
         .into_response();
@@ -838,8 +860,7 @@ mod tests {
 
         let response = handle_rpc(
             State(state),
-            r#"{"jsonrpc":"2.0","id":7,"method":"starknet_blockNumber","params":[]}"#
-                .to_string(),
+            r#"{"jsonrpc":"2.0","id":7,"method":"starknet_blockNumber","params":[]}"#.to_string(),
         )
         .await
         .into_response();

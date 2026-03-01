@@ -229,6 +229,7 @@ impl<'a> StarknetRpcServer<'a> {
             }
             "starknet_getStateUpdate" => self.get_state_update(params),
             "starknet_getTransactionByHash" => self.get_transaction_by_hash(params),
+            "starknet_getTransactionStatus" => self.get_transaction_status(params),
             "starknet_getNonce" => self.get_nonce(params),
             "starknet_getStorageAt" => self.get_storage_at(params),
             "starknet_syncing" => self.syncing(params),
@@ -329,6 +330,17 @@ impl<'a> StarknetRpcServer<'a> {
             "block_number": block_number,
             "transaction_index": tx_index as u64,
             "type": "INVOKE",
+        }))
+    }
+
+    fn get_transaction_status(&self, params: &Value) -> Result<Value, RpcError> {
+        let requested_hash = parse_tx_hash_param(params)?;
+        self.storage
+            .get_transaction_by_hash(&requested_hash)?
+            .ok_or(RpcError::TxNotFound)?;
+        Ok(json!({
+            "finality_status": "ACCEPTED_ON_L2",
+            "execution_status": "SUCCEEDED",
         }))
     }
 
@@ -440,22 +452,24 @@ fn parse_block_id_param(params: &Value) -> Result<BlockId, RpcError> {
 
 fn parse_block_id_value(block_id_value: &Value) -> Result<BlockId, RpcError> {
     match block_id_value {
-        Value::String(s) if s == "latest" => Ok(BlockId::Latest),
+        Value::String(s) if s == "latest" || s == "pending" => Ok(BlockId::Latest),
         Value::Object(obj) => {
             if let Some(number) = obj.get("block_number").and_then(Value::as_u64) {
                 return Ok(BlockId::Number(number));
             }
             if let Some(tag) = obj.get("block_tag").and_then(Value::as_str)
-                && tag == "latest"
+                && (tag == "latest" || tag == "pending")
             {
                 return Ok(BlockId::Latest);
             }
             Err(RpcError::InvalidParams(
-                "block_id object must include block_number or block_tag='latest'".to_string(),
+                "block_id object must include block_number or block_tag='latest'|'pending'"
+                    .to_string(),
             ))
         }
         _ => Err(RpcError::InvalidParams(
-            "block_id must be 'latest' or an object with block_number/block_tag".to_string(),
+            "block_id must be 'latest'|'pending' or an object with block_number/block_tag"
+                .to_string(),
         )),
     }
 }
@@ -869,6 +883,23 @@ mod tests {
     }
 
     #[test]
+    fn get_transaction_status_works() {
+        let server = seeded_server();
+        let raw = r#"{"jsonrpc":"2.0","id":20,"method":"starknet_getTransactionStatus","params":["0x1f6"]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["result"]["finality_status"], json!("ACCEPTED_ON_L2"));
+        assert_eq!(value["result"]["execution_status"], json!("SUCCEEDED"));
+    }
+
+    #[test]
+    fn get_transaction_status_returns_not_found() {
+        let server = seeded_server();
+        let raw = r#"{"jsonrpc":"2.0","id":21,"method":"starknet_getTransactionStatus","params":["0xdead"]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["error"]["code"], json!(ERR_TX_NOT_FOUND));
+    }
+
+    #[test]
     fn get_transaction_by_block_id_and_index_works() {
         let server = seeded_server();
         let raw = r#"{"jsonrpc":"2.0","id":14,"method":"starknet_getTransactionByBlockIdAndIndex","params":[{"block_number":2},0]}"#;
@@ -885,6 +916,15 @@ mod tests {
         let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
         assert_eq!(value["result"]["number"], json!(2));
         assert_eq!(value["result"]["transactions"], json!(["0x1f6"]));
+    }
+
+    #[test]
+    fn get_block_with_txs_accepts_pending_tag_as_latest() {
+        let server = seeded_server();
+        let raw =
+            r#"{"jsonrpc":"2.0","id":22,"method":"starknet_getBlockWithTxs","params":["pending"]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["result"]["number"], json!(2));
     }
 
     #[test]

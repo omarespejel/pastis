@@ -33,6 +33,7 @@ pub const DEFAULT_MAX_REPLAY_PER_POLL: u64 = 16;
 pub const DEFAULT_RPC_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_RPC_MAX_RETRIES: u32 = 3;
 pub const DEFAULT_RPC_RETRY_BACKOFF_MS: u64 = 250;
+pub const DEFAULT_CHAIN_ID_REVALIDATE_POLLS: u64 = 64;
 const MAX_UPSTREAM_RPC_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LOCAL_JOURNAL_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_LOCAL_JOURNAL_LINE_BYTES: usize = 4 * 1024 * 1024;
@@ -60,6 +61,7 @@ pub struct RuntimeConfig {
     pub upstream_rpc_url: String,
     pub replay_window: u64,
     pub max_replay_per_poll: u64,
+    pub chain_id_revalidate_polls: u64,
     pub replay_checkpoint_path: Option<String>,
     pub poll_interval: Duration,
     pub rpc_timeout: Duration,
@@ -79,6 +81,9 @@ impl RuntimeConfig {
         }
         if self.max_replay_per_poll == 0 {
             return Err("max_replay_per_poll must be > 0".to_string());
+        }
+        if self.chain_id_revalidate_polls == 0 {
+            return Err("chain_id_revalidate_polls must be > 0".to_string());
         }
         if self.poll_interval.is_zero() {
             return Err("poll_interval must be > 0".to_string());
@@ -408,6 +413,8 @@ pub struct NodeRuntime {
     recent_errors: VecDeque<String>,
     sync_progress: Arc<Mutex<SyncProgress>>,
     chain_id_validated: bool,
+    chain_id_revalidate_polls: u64,
+    polls_since_chain_id_validation: u64,
 }
 
 impl NodeRuntime {
@@ -520,6 +527,8 @@ impl NodeRuntime {
             recent_errors: VecDeque::new(),
             sync_progress: Arc::new(Mutex::new(progress)),
             chain_id_validated: false,
+            chain_id_revalidate_polls: config.chain_id_revalidate_polls,
+            polls_since_chain_id_validation: 0,
         })
     }
 
@@ -769,6 +778,13 @@ impl NodeRuntime {
     }
 
     async fn ensure_chain_id_validated(&mut self) -> Result<(), String> {
+        if self.chain_id_validated {
+            self.polls_since_chain_id_validation =
+                self.polls_since_chain_id_validation.saturating_add(1);
+            if self.polls_since_chain_id_validation < self.chain_id_revalidate_polls {
+                return Ok(());
+            }
+        }
         let upstream_chain_id = self.fetch_chain_id_with_retry().await?;
         let local_chain_id = self.chain_id().to_string();
         if normalize_chain_id(&upstream_chain_id) != normalize_chain_id(&local_chain_id) {
@@ -780,6 +796,7 @@ impl NodeRuntime {
             return Err(message);
         }
         self.chain_id_validated = true;
+        self.polls_since_chain_id_validation = 0;
         Ok(())
     }
 
@@ -1808,12 +1825,12 @@ fn value_as_felt(raw: &Value, field: &str, warnings: &mut Vec<String>) -> Option
         Value::String(value) => {
             let normalized = normalize_hex_prefix(value);
             match StarknetFelt::from_str(&normalized) {
-            Ok(felt) => Some(felt),
-            Err(error) => {
-                warnings.push(format!("invalid {field} `{value}`: {error}"));
-                None
+                Ok(felt) => Some(felt),
+                Err(error) => {
+                    warnings.push(format!("invalid {field} `{value}`: {error}"));
+                    None
+                }
             }
-        }
         }
         Value::Number(number) => {
             if let Some(value) = number.as_u64() {
@@ -2091,6 +2108,7 @@ mod tests {
             upstream_rpc_url: "http://localhost:9545".to_string(),
             replay_window: 1,
             max_replay_per_poll: 16,
+            chain_id_revalidate_polls: DEFAULT_CHAIN_ID_REVALIDATE_POLLS,
             replay_checkpoint_path: None,
             poll_interval: Duration::from_millis(500),
             rpc_timeout: Duration::from_secs(3),
@@ -2788,6 +2806,7 @@ mod tests {
             max_retries: 0,
             base_backoff: Duration::ZERO,
         };
+        config.chain_id_revalidate_polls = 1;
 
         let mut runtime = NodeRuntime::new_with_backends(config, sync_source, consensus, network)
             .expect("runtime should initialize");
@@ -2800,6 +2819,43 @@ mod tests {
             .ensure_chain_id_validated()
             .await
             .expect_err("second validation must detect upstream chain id switch");
+        assert!(error.contains("chain id mismatch"));
+    }
+
+    #[tokio::test]
+    async fn chain_id_validation_revalidates_only_after_interval() {
+        let sync_source = Arc::new(SequenceChainIdSyncSource::new([
+            "SN_MAIN".to_string(),
+            "SN_SEPOLIA".to_string(),
+        ]));
+        let consensus = Arc::new(HealthyConsensus);
+        let network = Arc::new(MockNetwork {
+            healthy: true,
+            peers: 2,
+        });
+
+        let mut config = runtime_config();
+        config.retry = RpcRetryConfig {
+            max_retries: 0,
+            base_backoff: Duration::ZERO,
+        };
+        config.chain_id_revalidate_polls = 2;
+
+        let mut runtime = NodeRuntime::new_with_backends(config, sync_source, consensus, network)
+            .expect("runtime should initialize");
+        runtime
+            .ensure_chain_id_validated()
+            .await
+            .expect("initial validation should succeed");
+        runtime
+            .ensure_chain_id_validated()
+            .await
+            .expect("second validation should be skipped inside interval");
+
+        let error = runtime
+            .ensure_chain_id_validated()
+            .await
+            .expect_err("third validation should revalidate and detect upstream switch");
         assert!(error.contains("chain id mismatch"));
     }
 }
