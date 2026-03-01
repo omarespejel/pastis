@@ -1299,7 +1299,8 @@ fn parse_block_with_txs(
         .get("block_hash")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("getBlockWithTxs missing block_hash: {block_with_txs}"))?;
-    let block_hash = StarknetFelt::from_str(block_hash_raw)
+    let block_hash_normalized = normalize_hex_prefix(block_hash_raw);
+    let block_hash = StarknetFelt::from_str(&block_hash_normalized)
         .map(|felt| format!("{:#x}", felt))
         .map_err(|error| {
             format!("invalid getBlockWithTxs block_hash `{block_hash_raw}`: {error}")
@@ -1309,7 +1310,8 @@ fn parse_block_with_txs(
         .get("parent_hash")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("getBlockWithTxs missing parent_hash: {block_with_txs}"))?;
-    let parent_hash = StarknetFelt::from_str(parent_hash_raw)
+    let parent_hash_normalized = normalize_hex_prefix(parent_hash_raw);
+    let parent_hash = StarknetFelt::from_str(&parent_hash_normalized)
         .map(|felt| format!("{:#x}", felt))
         .map_err(|error| {
             format!("invalid getBlockWithTxs parent_hash `{parent_hash_raw}`: {error}")
@@ -1320,7 +1322,8 @@ fn parse_block_with_txs(
         .get("sequencer_address")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("getBlockWithTxs missing sequencer_address: {block_with_txs}"))?;
-    let sequencer_address = StarknetFelt::from_str(sequencer_raw)
+    let sequencer_normalized = normalize_hex_prefix(sequencer_raw);
+    let sequencer_address = StarknetFelt::from_str(&sequencer_normalized)
         .map(|felt| format!("{:#x}", felt))
         .map_err(|error| {
             format!("invalid getBlockWithTxs sequencer_address `{sequencer_raw}`: {error}")
@@ -1351,7 +1354,8 @@ fn parse_block_with_txs(
                 })?
         };
 
-        let tx_hash = StarknetFelt::from_str(tx_hash_raw)
+        let tx_hash_normalized = normalize_hex_prefix(tx_hash_raw);
+        let tx_hash = StarknetFelt::from_str(&tx_hash_normalized)
             .map(|felt| format!("{:#x}", felt))
             .map_err(|error| {
                 format!("invalid transaction_hash `{tx_hash_raw}` at index {idx}: {error}")
@@ -1410,7 +1414,8 @@ fn parse_block_with_tx_hashes(
         .ok_or_else(|| {
             format!("getBlockWithTxHashes missing block_hash: {block_with_tx_hashes}")
         })?;
-    let block_hash = StarknetFelt::from_str(block_hash_raw)
+    let block_hash_normalized = normalize_hex_prefix(block_hash_raw);
+    let block_hash = StarknetFelt::from_str(&block_hash_normalized)
         .map(|felt| format!("{:#x}", felt))
         .map_err(|error| {
             format!("invalid getBlockWithTxHashes block_hash `{block_hash_raw}`: {error}")
@@ -1422,7 +1427,8 @@ fn parse_block_with_tx_hashes(
         .ok_or_else(|| {
             format!("getBlockWithTxHashes missing parent_hash: {block_with_tx_hashes}")
         })?;
-    let parent_hash = StarknetFelt::from_str(parent_hash_raw)
+    let parent_hash_normalized = normalize_hex_prefix(parent_hash_raw);
+    let parent_hash = StarknetFelt::from_str(&parent_hash_normalized)
         .map(|felt| format!("{:#x}", felt))
         .map_err(|error| {
             format!("invalid getBlockWithTxHashes parent_hash `{parent_hash_raw}`: {error}")
@@ -1444,7 +1450,8 @@ fn parse_block_with_tx_hashes(
                 "getBlockWithTxHashes transaction {idx} must be a hash string, got {tx}"
             ));
         };
-        let tx_hash = StarknetFelt::from_str(tx_hash_raw)
+        let tx_hash_normalized = normalize_hex_prefix(tx_hash_raw);
+        let tx_hash = StarknetFelt::from_str(&tx_hash_normalized)
             .map(|felt| format!("{:#x}", felt))
             .map_err(|error| {
                 format!(
@@ -1553,11 +1560,7 @@ fn parse_state_root_from_state_update(state_update: &Value) -> Result<String, St
         .get("new_root")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("state_update is missing new_root: {state_update}"))?;
-    let normalized_root = if let Some(raw) = new_root_raw.strip_prefix("0X") {
-        format!("0x{raw}")
-    } else {
-        new_root_raw.to_string()
-    };
+    let normalized_root = normalize_hex_prefix(new_root_raw);
     StarknetFelt::from_str(&normalized_root)
         .map(|felt| format!("{:#x}", felt))
         .map_err(|error| format!("invalid state_update new_root `{new_root_raw}`: {error}"))
@@ -1567,11 +1570,7 @@ fn parse_state_update_block_hash(state_update: &Value) -> Result<Option<String>,
     let Some(block_hash_raw) = state_update.get("block_hash").and_then(Value::as_str) else {
         return Ok(None);
     };
-    let normalized_hash = if let Some(raw) = block_hash_raw.strip_prefix("0X") {
-        format!("0x{raw}")
-    } else {
-        block_hash_raw.to_string()
-    };
+    let normalized_hash = normalize_hex_prefix(block_hash_raw);
     StarknetFelt::from_str(&normalized_hash)
         .map(|felt| Some(format!("{:#x}", felt)))
         .map_err(|error| format!("invalid state_update block_hash `{block_hash_raw}`: {error}"))
@@ -1584,7 +1583,8 @@ fn parse_optional_block_state_root(
     let Some(state_root_raw) = block_payload.get("state_root").and_then(Value::as_str) else {
         return Ok(None);
     };
-    StarknetFelt::from_str(state_root_raw)
+    let normalized_root = normalize_hex_prefix(state_root_raw);
+    StarknetFelt::from_str(&normalized_root)
         .map(|felt| Some(format!("{:#x}", felt)))
         .map_err(|error| format!("invalid {method} state_root `{state_root_raw}`: {error}"))
 }
@@ -1793,7 +1793,8 @@ fn parse_contract_address(raw: &str, warnings: &mut Vec<String>) -> Option<Contr
 }
 
 fn canonicalize_hex_felt(raw: &str, field: &str, warnings: &mut Vec<String>) -> Option<String> {
-    match StarknetFelt::from_str(raw) {
+    let normalized = normalize_hex_prefix(raw);
+    match StarknetFelt::from_str(&normalized) {
         Ok(value) => Some(format!("{:#x}", value)),
         Err(error) => {
             warnings.push(format!("invalid {field} `{raw}`: {error}"));
@@ -1804,13 +1805,16 @@ fn canonicalize_hex_felt(raw: &str, field: &str, warnings: &mut Vec<String>) -> 
 
 fn value_as_felt(raw: &Value, field: &str, warnings: &mut Vec<String>) -> Option<StarknetFelt> {
     match raw {
-        Value::String(value) => match StarknetFelt::from_str(value) {
+        Value::String(value) => {
+            let normalized = normalize_hex_prefix(value);
+            match StarknetFelt::from_str(&normalized) {
             Ok(felt) => Some(felt),
             Err(error) => {
                 warnings.push(format!("invalid {field} `{value}`: {error}"));
                 None
             }
-        },
+        }
+        }
         Value::Number(number) => {
             if let Some(value) = number.as_u64() {
                 Some(StarknetFelt::from(value))
@@ -1837,6 +1841,14 @@ fn value_as_u64(value: &Value) -> Option<u64> {
             }
         }
         _ => None,
+    }
+}
+
+fn normalize_hex_prefix(raw: &str) -> String {
+    if let Some(stripped) = raw.strip_prefix("0X") {
+        format!("0x{stripped}")
+    } else {
+        raw.to_string()
     }
 }
 
@@ -2174,6 +2186,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_block_with_txs_accepts_uppercase_hex_prefixes() {
+        let block = json!({
+            "block_number": 12,
+            "block_hash": "0X0ABC",
+            "parent_hash": "0X0123",
+            "state_root": "0X00ff",
+            "sequencer_address": "0X01",
+            "timestamp": 1_700_000_012_u64,
+            "transactions": [{"transaction_hash": "0X0002"}]
+        });
+
+        let mut warnings = Vec::new();
+        let parsed = parse_block_with_txs(&block, &mut warnings).expect("must parse");
+        assert_eq!(parsed.block_hash, "0xabc");
+        assert_eq!(parsed.parent_hash, "0x123");
+        assert_eq!(parsed.state_root, Some("0xff".to_string()));
+        assert_eq!(parsed.sequencer_address, "0x1");
+        assert_eq!(parsed.transaction_hashes, vec!["0x2"]);
+    }
+
+    #[test]
     fn parse_block_with_txs_rejects_duplicate_transaction_hashes() {
         let block = json!({
             "block_number": 12,
@@ -2210,6 +2243,25 @@ mod tests {
         assert_eq!(parsed.parent_hash, "0x123");
         assert_eq!(parsed.transaction_hashes, vec!["0x1", "0x2"]);
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn parse_block_with_tx_hashes_accepts_uppercase_hex_prefixes() {
+        let block = json!({
+            "block_number": 12,
+            "block_hash": "0X0abc",
+            "parent_hash": "0X0123",
+            "state_root": "0X00ff",
+            "transactions": ["0X1", "0X2"],
+            "status": "ACCEPTED_ON_L2"
+        });
+
+        let mut warnings = Vec::new();
+        let parsed = parse_block_with_tx_hashes(&block, &mut warnings).expect("must parse");
+        assert_eq!(parsed.block_hash, "0xabc");
+        assert_eq!(parsed.parent_hash, "0x123");
+        assert_eq!(parsed.state_root, Some("0xff".to_string()));
+        assert_eq!(parsed.transaction_hashes, vec!["0x1", "0x2"]);
     }
 
     #[test]

@@ -32,8 +32,6 @@ use starknet_node_types::ContractAddress;
 #[cfg(feature = "apollo-adapter")]
 use starknet_node_types::StarknetFelt;
 #[cfg(feature = "apollo-adapter")]
-use starknet_node_types::StarknetTransaction;
-#[cfg(feature = "apollo-adapter")]
 use starknet_node_types::StateReadError;
 #[cfg(feature = "apollo-adapter")]
 use starknet_node_types::{BlockGasPrices, GasPricePerToken};
@@ -640,11 +638,44 @@ fn apollo_felt_to_node_felt(value: ApolloFelt) -> Result<StarknetFelt, StorageEr
 }
 
 #[cfg(feature = "apollo-adapter")]
+fn parse_node_contract_address(
+    raw: &str,
+    field: &'static str,
+) -> Result<ContractAddress, StorageError> {
+    ContractAddress::parse(raw).map_err(|error| StorageError::InvalidFeltEncoding {
+        field,
+        value: raw.to_string(),
+        error: error.to_string(),
+    })
+}
+
+#[cfg(feature = "apollo-adapter")]
+fn parse_node_class_hash(
+    raw: &str,
+    field: &'static str,
+) -> Result<starknet_node_types::ClassHash, StorageError> {
+    starknet_node_types::ClassHash::parse(raw).map_err(|error| StorageError::InvalidFeltEncoding {
+        field,
+        value: raw.to_string(),
+        error: error.to_string(),
+    })
+}
+
+#[cfg(feature = "apollo-adapter")]
+fn parse_node_tx_hash(raw: &str, field: &'static str) -> Result<TxHash, StorageError> {
+    TxHash::parse(raw).map_err(|error| StorageError::InvalidFeltEncoding {
+        field,
+        value: raw.to_string(),
+        error: error.to_string(),
+    })
+}
+
+#[cfg(feature = "apollo-adapter")]
 fn map_thin_state_diff(diff: ApolloThinStateDiff) -> Result<StarknetStateDiff, StorageError> {
     let mut mapped = StarknetStateDiff::default();
     for (address, writes) in diff.storage_diffs {
-        let contract = ContractAddress::parse(format!("{:#x}", address.0.key()))
-            .expect("valid contract address");
+        let contract_raw = format!("{:#x}", address.0.key());
+        let contract = parse_node_contract_address(&contract_raw, "contract_address")?;
         let mapped_writes = mapped.storage_diffs.entry(contract).or_default();
         for (key, value) in writes {
             mapped_writes.insert(
@@ -654,22 +685,22 @@ fn map_thin_state_diff(diff: ApolloThinStateDiff) -> Result<StarknetStateDiff, S
         }
     }
     for (address, nonce) in diff.nonces {
+        let contract_raw = format!("{:#x}", address.0.key());
         mapped.nonces.insert(
-            ContractAddress::parse(format!("{:#x}", address.0.key()))
-                .expect("valid contract address"),
+            parse_node_contract_address(&contract_raw, "nonce_contract_address")?,
             apollo_felt_to_node_felt(nonce.0)?,
         );
     }
     for class_hash in diff.class_hash_to_compiled_class_hash.keys() {
+        let class_hash_raw = format!("{:#x}", class_hash.0);
         mapped.declared_classes.push(
-            starknet_node_types::ClassHash::parse(format!("{:#x}", class_hash.0))
-                .expect("valid class hash"),
+            parse_node_class_hash(&class_hash_raw, "class_hash")?,
         );
     }
     for class_hash in &diff.deprecated_declared_classes {
+        let class_hash_raw = format!("{:#x}", class_hash.0);
         mapped.declared_classes.push(
-            starknet_node_types::ClassHash::parse(format!("{:#x}", class_hash.0))
-                .expect("valid class hash"),
+            parse_node_class_hash(&class_hash_raw, "deprecated_class_hash")?,
         );
     }
     Ok(mapped)
@@ -820,22 +851,17 @@ impl StorageBackend for ApolloStorageAdapter {
             .unwrap_or_default()
             .into_iter()
             .map(|hash| {
-                StarknetTransaction::new(
-                    starknet_node_types::TxHash::parse(format!("{:#x}", hash.0))
-                        .expect("valid tx hash"),
-                )
+                let tx_hash_raw = format!("{:#x}", hash.0);
+                parse_node_tx_hash(&tx_hash_raw, "tx_hash").map(StarknetTransaction::new)
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
+        let sequencer_raw = format!("{:#x}", header_without_hash.sequencer.0.0.key());
         Ok(Some(StarknetBlock {
             number: number.0,
             parent_hash: format!("{:#x}", header_without_hash.parent_hash.0),
             state_root: format!("{:#x}", header_without_hash.state_root.0),
             timestamp: header_without_hash.timestamp.0,
-            sequencer_address: ContractAddress::parse(format!(
-                "{:#x}",
-                header_without_hash.sequencer.0.0.key()
-            ))
-            .expect("valid contract address"),
+            sequencer_address: parse_node_contract_address(&sequencer_raw, "sequencer_address")?,
             gas_prices: BlockGasPrices {
                 l1_gas,
                 l1_data_gas,
@@ -1578,5 +1604,38 @@ mod apollo_tests {
     fn parse_starknet_version_rejects_unknown_shapes() {
         let err = parse_starknet_version_to_semver("0.13.1.1.9").expect_err("must fail");
         assert!(matches!(err, StorageError::InvalidProtocolVersion(_)));
+    }
+
+    #[cfg(feature = "apollo-adapter")]
+    #[test]
+    fn apollo_identifier_parsers_fail_closed_without_panicking() {
+        let contract_err = parse_node_contract_address("not-a-felt", "contract_address")
+            .expect_err("invalid contract should fail");
+        assert!(matches!(
+            contract_err,
+            StorageError::InvalidFeltEncoding {
+                field: "contract_address",
+                ..
+            }
+        ));
+
+        let class_err =
+            parse_node_class_hash("not-a-felt", "class_hash").expect_err("invalid class hash");
+        assert!(matches!(
+            class_err,
+            StorageError::InvalidFeltEncoding {
+                field: "class_hash",
+                ..
+            }
+        ));
+
+        let tx_err = parse_node_tx_hash("not-a-felt", "tx_hash").expect_err("invalid tx hash");
+        assert!(matches!(
+            tx_err,
+            StorageError::InvalidFeltEncoding {
+                field: "tx_hash",
+                ..
+            }
+        ));
     }
 }
