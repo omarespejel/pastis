@@ -24,6 +24,8 @@ const DEFAULT_RPC_BIND: &str = "127.0.0.1:9545";
 const DEFAULT_REPLAY_CHECKPOINT_PATH: &str = ".pastis/node-replay-checkpoint.json";
 const DEFAULT_LOCAL_JOURNAL_PATH: &str = ".pastis/node-local-journal.jsonl";
 const DEFAULT_P2P_HEARTBEAT_MS: u64 = 30_000;
+const DEFAULT_HEALTH_MAX_CONSECUTIVE_FAILURES: u64 = 3;
+const DEFAULT_HEALTH_MAX_SYNC_LAG_BLOCKS: u64 = 64;
 
 #[derive(Debug, Clone)]
 struct DaemonConfig {
@@ -41,6 +43,8 @@ struct DaemonConfig {
     bootnodes: Vec<String>,
     require_peers: bool,
     p2p_heartbeat_ms: u64,
+    health_max_consecutive_failures: u64,
+    health_max_sync_lag_blocks: u64,
 }
 
 #[derive(Clone)]
@@ -48,6 +52,7 @@ struct RpcAppState {
     storage: ThreadSafeStorage<InMemoryStorage>,
     chain_id: String,
     sync_progress: Arc<Mutex<SyncProgress>>,
+    health_policy: HealthPolicy,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,6 +65,12 @@ struct StatusPayload {
     reorg_events: u64,
     consecutive_failures: u64,
     last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct HealthPolicy {
+    max_consecutive_failures: u64,
+    max_sync_lag: u64,
 }
 
 #[tokio::main]
@@ -107,6 +118,10 @@ async fn main() -> Result<(), String> {
         storage,
         chain_id: chain_id.clone(),
         sync_progress,
+        health_policy: HealthPolicy {
+            max_consecutive_failures: config.health_max_consecutive_failures,
+            max_sync_lag: config.health_max_sync_lag_blocks,
+        },
     };
     let app = Router::new()
         .route("/", post(handle_rpc))
@@ -202,8 +217,22 @@ async fn handle_rpc(State(state): State<RpcAppState>, raw: String) -> impl IntoR
         .into_response()
 }
 
-async fn healthz() -> impl IntoResponse {
-    StatusCode::OK
+async fn healthz(State(state): State<RpcAppState>) -> impl IntoResponse {
+    let progress = match state.sync_progress.lock() {
+        Ok(progress) => progress.clone(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sync progress lock poisoned".to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    match evaluate_health(&progress, &state.health_policy) {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(message) => (StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
+    }
 }
 
 async fn status(
@@ -400,6 +429,10 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         Some(value) => value,
         None => parse_env_u64("PASTIS_P2P_HEARTBEAT_MS")?.unwrap_or(DEFAULT_P2P_HEARTBEAT_MS),
     };
+    let health_max_consecutive_failures = parse_env_u64("PASTIS_HEALTH_MAX_CONSECUTIVE_FAILURES")?
+        .unwrap_or(DEFAULT_HEALTH_MAX_CONSECUTIVE_FAILURES);
+    let health_max_sync_lag_blocks = parse_env_u64("PASTIS_HEALTH_MAX_SYNC_LAG_BLOCKS")?
+        .unwrap_or(DEFAULT_HEALTH_MAX_SYNC_LAG_BLOCKS);
     let require_peers = if cli_require_peers {
         true
     } else {
@@ -427,6 +460,8 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         bootnodes,
         require_peers,
         p2p_heartbeat_ms,
+        health_max_consecutive_failures,
+        health_max_sync_lag_blocks,
     })
 }
 
@@ -489,6 +524,32 @@ fn redact_rpc_url(raw: &str) -> String {
     }
 }
 
+fn evaluate_health(progress: &SyncProgress, policy: &HealthPolicy) -> Result<(), String> {
+    if progress.consecutive_failures > policy.max_consecutive_failures {
+        return Err(format!(
+            "unhealthy: consecutive_failures={} exceeds threshold={}; last_error={}",
+            progress.consecutive_failures,
+            policy.max_consecutive_failures,
+            progress
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "none".to_string())
+        ));
+    }
+
+    let sync_lag = progress
+        .highest_block
+        .saturating_sub(progress.current_block);
+    if sync_lag > policy.max_sync_lag {
+        return Err(format!(
+            "unhealthy: sync_lag={} exceeds threshold={} (current={}, highest={})",
+            sync_lag, policy.max_sync_lag, progress.current_block, progress.highest_block
+        ));
+    }
+
+    Ok(())
+}
+
 fn help_text() -> String {
     format!(
         "usage: starknet-node --upstream-rpc-url <url> [options]\n\
@@ -520,6 +581,61 @@ environment:\n\
   PASTIS_RPC_RETRY_BACKOFF_MS        Upstream RPC retry backoff ms\n\
   PASTIS_BOOTNODES                   Comma-separated bootnodes\n\
   PASTIS_REQUIRE_PEERS               Require peers for sync loop health (true/false)\n\
-  PASTIS_P2P_HEARTBEAT_MS            P2P heartbeat interval"
+  PASTIS_P2P_HEARTBEAT_MS            P2P heartbeat interval\n\
+  PASTIS_HEALTH_MAX_CONSECUTIVE_FAILURES   Health failure threshold for consecutive poll failures\n\
+  PASTIS_HEALTH_MAX_SYNC_LAG_BLOCKS         Health failure threshold for sync lag in blocks"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_progress() -> SyncProgress {
+        SyncProgress {
+            starting_block: 10,
+            current_block: 10,
+            highest_block: 10,
+            peer_count: 3,
+            reorg_events: 0,
+            consecutive_failures: 0,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn evaluate_health_reports_healthy_when_within_thresholds() {
+        let progress = base_progress();
+        let policy = HealthPolicy {
+            max_consecutive_failures: 3,
+            max_sync_lag: 64,
+        };
+        assert!(evaluate_health(&progress, &policy).is_ok());
+    }
+
+    #[test]
+    fn evaluate_health_fails_when_consecutive_failures_exceed_threshold() {
+        let mut progress = base_progress();
+        progress.consecutive_failures = 4;
+        progress.last_error = Some("upstream timeout".to_string());
+        let policy = HealthPolicy {
+            max_consecutive_failures: 3,
+            max_sync_lag: 64,
+        };
+        let error = evaluate_health(&progress, &policy).expect_err("should fail health check");
+        assert!(error.contains("consecutive_failures"));
+    }
+
+    #[test]
+    fn evaluate_health_fails_when_sync_lag_exceeds_threshold() {
+        let mut progress = base_progress();
+        progress.current_block = 100;
+        progress.highest_block = 300;
+        let policy = HealthPolicy {
+            max_consecutive_failures: 3,
+            max_sync_lag: 64,
+        };
+        let error = evaluate_health(&progress, &policy).expect_err("should fail health check");
+        assert!(error.contains("sync_lag"));
+    }
 }
