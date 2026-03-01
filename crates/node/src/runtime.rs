@@ -49,6 +49,9 @@ const MAX_RECENT_ERRORS: usize = 128;
 const MAX_RPC_ERROR_CONTEXT_CHARS: usize = 1_024;
 const MAX_RUNTIME_ERROR_CHARS: usize = 2_048;
 const MAX_RPC_RETRY_BACKOFF_MS: u64 = 5_000;
+const MAX_UPSTREAM_RPC_CONNECT_TIMEOUT_SECS: u64 = 5;
+const UPSTREAM_RPC_POOL_IDLE_TIMEOUT_SECS: u64 = 30;
+const UPSTREAM_RPC_POOL_MAX_IDLE_PER_HOST: usize = 16;
 const UPSTREAM_REQUEST_ID: u64 = 1;
 const UPSTREAM_BATCH_REQUEST_ID_BASE: u64 = 10_000;
 const RUNTIME_STORAGE_SNAPSHOT_VERSION: u32 = 1;
@@ -1422,8 +1425,14 @@ impl UpstreamRpcClient {
         timeout: Duration,
         disable_batch_requests: bool,
     ) -> Result<Self, String> {
+        let connect_timeout = derive_upstream_connect_timeout(timeout);
         let http = reqwest::Client::builder()
             .timeout(timeout)
+            .connect_timeout(connect_timeout)
+            .read_timeout(timeout)
+            .pool_idle_timeout(Duration::from_secs(UPSTREAM_RPC_POOL_IDLE_TIMEOUT_SECS))
+            .pool_max_idle_per_host(UPSTREAM_RPC_POOL_MAX_IDLE_PER_HOST)
+            .tcp_nodelay(true)
             .build()
             .map_err(|error| format!("failed to build HTTP client: {error}"))?;
         Ok(Self {
@@ -1726,6 +1735,14 @@ impl UpstreamRpcClient {
         }
         parse_rpc_result(body, method, UPSTREAM_REQUEST_ID)
     }
+}
+
+fn derive_upstream_connect_timeout(total_timeout: Duration) -> Duration {
+    let mut connect_timeout = total_timeout / 2;
+    if connect_timeout.is_zero() {
+        connect_timeout = Duration::from_millis(1);
+    }
+    connect_timeout.min(Duration::from_secs(MAX_UPSTREAM_RPC_CONNECT_TIMEOUT_SECS))
 }
 
 async fn read_json_body_with_limit(
@@ -4184,6 +4201,34 @@ mod tests {
             "batch requests disabled by configuration"
         );
         assert!(!capability.mark_unsupported());
+    }
+
+    #[test]
+    fn derive_upstream_connect_timeout_uses_half_of_total_timeout() {
+        assert_eq!(
+            derive_upstream_connect_timeout(Duration::from_secs(10)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            derive_upstream_connect_timeout(Duration::from_secs(6)),
+            Duration::from_secs(3)
+        );
+    }
+
+    #[test]
+    fn derive_upstream_connect_timeout_caps_at_global_max() {
+        assert_eq!(
+            derive_upstream_connect_timeout(Duration::from_secs(120)),
+            Duration::from_secs(MAX_UPSTREAM_RPC_CONNECT_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn derive_upstream_connect_timeout_has_non_zero_minimum() {
+        assert_eq!(
+            derive_upstream_connect_timeout(Duration::from_nanos(1)),
+            Duration::from_millis(1)
+        );
     }
 
     #[test]
