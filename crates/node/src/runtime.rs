@@ -21,6 +21,21 @@ use crate::replay::{
 };
 use crate::{ChainId, NodeConfig, StarknetNode, StarknetNodeBuilder};
 #[cfg(feature = "production-adapters")]
+use starknet_api::executable_transaction::{
+    AccountTransaction as ApiExecutableAccountTransaction,
+    DeployAccountTransaction as ApiExecutableDeployAccountTransaction,
+    InvokeTransaction as ApiExecutableInvokeTransaction, Transaction as ApiExecutableTransaction,
+};
+#[cfg(feature = "production-adapters")]
+use starknet_api::hash::StarkHash as ApiStarkHash;
+#[cfg(feature = "production-adapters")]
+use starknet_api::rpc_transaction::RpcTransaction as ApiRpcTransaction;
+#[cfg(feature = "production-adapters")]
+use starknet_api::transaction::{
+    CalculateContractAddress, DeployAccountTransaction as ApiDeployAccountTransaction,
+    InvokeTransaction as ApiInvokeTransaction, TransactionHash as ApiTransactionHash,
+};
+#[cfg(feature = "production-adapters")]
 use starknet_node_execution::BlockifierVmBackend;
 use starknet_node_execution::{
     DualExecutionBackend, ExecutionBackend, ExecutionError, ExecutionMode, MismatchPolicy,
@@ -2648,6 +2663,58 @@ impl RuntimeExecutionBackend {
     }
 }
 
+#[cfg(feature = "production-adapters")]
+fn parse_api_transaction_hash(raw: &str) -> Result<ApiTransactionHash, String> {
+    let felt = ApiStarkHash::from_str(raw)
+        .map_err(|error| format!("invalid tx hash `{raw}` for executable conversion: {error}"))?;
+    Ok(ApiTransactionHash(felt))
+}
+
+#[cfg(feature = "production-adapters")]
+fn executable_from_standard_rpc_payload(
+    payload: &Value,
+    tx_hash: &TxHash,
+) -> Result<Option<ExecutableStarknetTransaction>, String> {
+    let Value::Object(object) = payload else {
+        return Ok(None);
+    };
+
+    let mut sanitized = object.clone();
+    sanitized.remove("transaction_hash");
+    let rpc_tx = match serde_json::from_value::<ApiRpcTransaction>(Value::Object(sanitized)) {
+        Ok(tx) => tx,
+        Err(_) => return Ok(None),
+    };
+
+    let api_tx_hash = parse_api_transaction_hash(tx_hash.as_ref())?;
+    let executable = match rpc_tx {
+        ApiRpcTransaction::Invoke(invoke) => {
+            let tx: ApiInvokeTransaction = invoke.into();
+            ApiExecutableTransaction::Account(ApiExecutableAccountTransaction::Invoke(
+                ApiExecutableInvokeTransaction {
+                    tx,
+                    tx_hash: api_tx_hash,
+                },
+            ))
+        }
+        ApiRpcTransaction::DeployAccount(deploy_account) => {
+            let tx: ApiDeployAccountTransaction = deploy_account.into();
+            let contract_address = tx.calculate_contract_address().map_err(|error| {
+                format!("failed to calculate deploy-account contract address: {error}")
+            })?;
+            ApiExecutableTransaction::Account(ApiExecutableAccountTransaction::DeployAccount(
+                ApiExecutableDeployAccountTransaction {
+                    tx,
+                    tx_hash: api_tx_hash,
+                    contract_address,
+                },
+            ))
+        }
+        ApiRpcTransaction::Declare(_) => return Ok(None),
+    };
+    Ok(Some(executable))
+}
+
 impl ExecutionBackend for RuntimeExecutionBackend {
     fn execute_block(
         &self,
@@ -2859,6 +2926,20 @@ fn replay_transaction_from_payload(
             return StarknetTransaction::with_executable(tx_hash, executable).map_err(|error| {
                 format!(
                     "direct executable payload hash mismatch for tx {hash} at local block {local_block_number}: {error}"
+                )
+            });
+        }
+
+        if let Some(executable) = executable_from_standard_rpc_payload(payload, &tx_hash).map_err(
+            |error| {
+                format!(
+                    "failed to convert standard RPC payload into executable tx {hash} at local block {local_block_number}: {error}"
+                )
+            },
+        )? {
+            return StarknetTransaction::with_executable(tx_hash, executable).map_err(|error| {
+                format!(
+                    "standard RPC executable payload hash mismatch for tx {hash} at local block {local_block_number}: {error}"
                 )
             });
         }
@@ -4718,6 +4799,30 @@ mod tests {
         let tx = replay_transaction_from_payload(1, "0x111", &payload)
             .expect("direct executable payload should be accepted");
         assert_eq!(tx.hash.as_ref(), "0x111");
+        assert!(tx.executable.is_some());
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn replay_transaction_from_payload_converts_standard_rpc_invoke_shape() {
+        let block_with_txs: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/replay/rpc/mainnet_block_7242623_get_block_with_txs.json"
+        ))
+        .expect("fixture must deserialize");
+        let tx_payload = block_with_txs
+            .get("transactions")
+            .and_then(Value::as_array)
+            .and_then(|transactions| transactions.first())
+            .cloned()
+            .expect("fixture must include at least one transaction");
+        let tx_hash = tx_payload
+            .get("transaction_hash")
+            .and_then(Value::as_str)
+            .expect("fixture transaction must include transaction_hash");
+
+        let tx = replay_transaction_from_payload(1, tx_hash, &tx_payload)
+            .expect("standard RPC invoke payload should convert to executable form");
+        assert_eq!(tx.hash.as_ref(), tx_hash);
         assert!(tx.executable.is_some());
     }
 
