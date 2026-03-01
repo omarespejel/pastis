@@ -731,6 +731,33 @@ impl FailoverSyncSource {
         self.active_index.store(index, Ordering::Relaxed);
     }
 
+    async fn try_with_failover<T, F>(&self, operation: &str, mut call: F) -> Result<T, String>
+    where
+        F: for<'a> FnMut(&'a Arc<dyn SyncSource>) -> SyncSourceFuture<'a, T>,
+    {
+        let total = self.sources.len();
+        let start = self.start_index();
+        let mut errors = Vec::with_capacity(total);
+        for offset in 0..total {
+            let index = (start + offset) % total;
+            let entry = &self.sources[index];
+            match call(&entry.source).await {
+                Ok(result) => {
+                    self.mark_active(index);
+                    return Ok(result);
+                }
+                Err(error) => {
+                    errors.push(format!(
+                        "{}: {}",
+                        entry.name,
+                        sanitize_error_message(&error, MAX_RPC_ERROR_CONTEXT_CHARS)
+                    ));
+                }
+            }
+        }
+        Err(Self::error_for_all_sources(operation, errors))
+    }
+
     fn error_for_all_sources(operation: &str, errors: Vec<String>) -> String {
         format!(
             "all upstream RPC endpoints failed for {operation}: {}",
@@ -743,87 +770,28 @@ impl SyncSource for FailoverSyncSource {
     fn fetch_latest_block_number(&self) -> SyncSourceFuture<'_, u64> {
         let this = self.clone();
         Box::pin(async move {
-            let total = this.sources.len();
-            let start = this.start_index();
-            let mut errors = Vec::with_capacity(total);
-            for offset in 0..total {
-                let index = (start + offset) % total;
-                let entry = &this.sources[index];
-                match entry.source.fetch_latest_block_number().await {
-                    Ok(result) => {
-                        this.mark_active(index);
-                        return Ok(result);
-                    }
-                    Err(error) => {
-                        errors.push(format!(
-                            "{}: {}",
-                            entry.name,
-                            sanitize_error_message(&error, MAX_RPC_ERROR_CONTEXT_CHARS)
-                        ));
-                    }
-                }
-            }
-            Err(Self::error_for_all_sources(
-                "starknet_blockHashAndNumber",
-                errors,
-            ))
+            this.try_with_failover("starknet_blockHashAndNumber", |source| {
+                source.fetch_latest_block_number()
+            })
+            .await
         })
     }
 
     fn fetch_chain_id(&self) -> SyncSourceFuture<'_, String> {
         let this = self.clone();
         Box::pin(async move {
-            let total = this.sources.len();
-            let start = this.start_index();
-            let mut errors = Vec::with_capacity(total);
-            for offset in 0..total {
-                let index = (start + offset) % total;
-                let entry = &this.sources[index];
-                match entry.source.fetch_chain_id().await {
-                    Ok(result) => {
-                        this.mark_active(index);
-                        return Ok(result);
-                    }
-                    Err(error) => {
-                        errors.push(format!(
-                            "{}: {}",
-                            entry.name,
-                            sanitize_error_message(&error, MAX_RPC_ERROR_CONTEXT_CHARS)
-                        ));
-                    }
-                }
-            }
-            Err(Self::error_for_all_sources("starknet_chainId", errors))
+            this.try_with_failover("starknet_chainId", |source| source.fetch_chain_id())
+                .await
         })
     }
 
     fn fetch_block(&self, block_number: u64) -> SyncSourceFuture<'_, RuntimeFetch> {
         let this = self.clone();
         Box::pin(async move {
-            let total = this.sources.len();
-            let start = this.start_index();
-            let mut errors = Vec::with_capacity(total);
-            for offset in 0..total {
-                let index = (start + offset) % total;
-                let entry = &this.sources[index];
-                match entry.source.fetch_block(block_number).await {
-                    Ok(result) => {
-                        this.mark_active(index);
-                        return Ok(result);
-                    }
-                    Err(error) => {
-                        errors.push(format!(
-                            "{}: {}",
-                            entry.name,
-                            sanitize_error_message(&error, MAX_RPC_ERROR_CONTEXT_CHARS)
-                        ));
-                    }
-                }
-            }
-            Err(Self::error_for_all_sources(
-                "starknet_getBlockWithTxs/getStateUpdate",
-                errors,
-            ))
+            this.try_with_failover("starknet_getBlockWithTxs/getStateUpdate", |source| {
+                source.fetch_block(block_number)
+            })
+            .await
         })
     }
 }
