@@ -1718,7 +1718,7 @@ fn parse_rpc_batch_results(
     body: Value,
     expected: &[(u64, &'static str)],
 ) -> Result<Vec<Value>, UpstreamBatchCallError> {
-    if looks_like_batch_unsupported_payload(&body) {
+    if is_batch_unsupported_payload(&body) {
         return Err(UpstreamBatchCallError::Unsupported(format!(
             "upstream rejected batch request: {}",
             summarize_json_for_error(&body)
@@ -1784,7 +1784,17 @@ fn parse_rpc_batch_results(
     Ok(out)
 }
 
-fn looks_like_batch_unsupported_payload(body: &Value) -> bool {
+fn is_batch_unsupported_payload(body: &Value) -> bool {
+    if let Some(items) = body.as_array() {
+        if items.len() == 1 {
+            return is_batch_unsupported_error_object(&items[0]);
+        }
+        return false;
+    }
+    is_batch_unsupported_error_object(body)
+}
+
+fn is_batch_unsupported_error_object(body: &Value) -> bool {
     let Some(object) = body.as_object() else {
         return false;
     };
@@ -3918,6 +3928,27 @@ mod tests {
             &[(UPSTREAM_BATCH_REQUEST_ID_BASE, "starknet_first")],
         )
         .expect_err("single invalid-request envelope should be treated as unsupported batch");
+        match error {
+            UpstreamBatchCallError::Unsupported(message) => {
+                assert!(message.contains("rejected batch request"));
+            }
+            UpstreamBatchCallError::Failed(message) => {
+                panic!("unexpected hard-failure error variant: {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_rpc_batch_results_classifies_singleton_error_array_as_unsupported_batch() {
+        let error = parse_rpc_batch_results(
+            json!([{
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {"code": -32600, "message": "batch requests are not supported"}
+            }]),
+            &[(UPSTREAM_BATCH_REQUEST_ID_BASE, "starknet_first")],
+        )
+        .expect_err("singleton error array should be treated as unsupported batch");
         match error {
             UpstreamBatchCallError::Unsupported(message) => {
                 assert!(message.contains("rejected batch request"));
