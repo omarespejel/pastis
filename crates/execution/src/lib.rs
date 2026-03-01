@@ -1360,7 +1360,7 @@ mod tests {
     use starknet_node_types::{
         BlockGasPrices, BuiltinStats, ContractAddress, ExecutionOutput, GasPricePerToken,
         InMemoryState, MutableState, SimulationResult, StarknetBlock, StarknetFelt,
-        StarknetReceipt, StarknetStateDiff, StarknetTransaction, StateReader,
+        StarknetReceipt, StarknetStateDiff, StarknetTransaction, StateReader, TxHash,
     };
 
     use super::*;
@@ -1585,7 +1585,8 @@ mod tests {
         executable.tx_hash =
             TransactionHash(BlockifierFelt::from_str(hash).expect("valid tx hash"));
 
-        StarknetTransaction::with_executable(hash.to_string(), ExecutableTx::L1Handler(executable))
+        let tx_hash = TxHash::parse(hash).expect("valid tx hash");
+        StarknetTransaction::with_executable(tx_hash, ExecutableTx::L1Handler(executable))
             .expect("matching executable hash")
     }
 
@@ -1604,8 +1605,9 @@ mod tests {
             tx_hash: TransactionHash(BlockifierFelt::from_str(hash).expect("valid tx hash")),
         };
 
+        let tx_hash = TxHash::parse(hash).expect("valid tx hash");
         StarknetTransaction::with_executable(
-            hash.to_string(),
+            tx_hash,
             ExecutableTx::Account(ExecutableAccountTransaction::Invoke(executable)),
         )
         .expect("matching executable hash")
