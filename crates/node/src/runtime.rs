@@ -105,6 +105,7 @@ pub struct RuntimeConfig {
     pub storage_snapshot_interval_blocks: u64,
     pub disable_batch_requests: bool,
     pub network_stale_after: Duration,
+    pub strict_canonical_execution: bool,
     pub storage: Option<ThreadSafeStorage<InMemoryStorage>>,
 }
 
@@ -1115,7 +1116,11 @@ impl NodeRuntime {
         } else {
             ThreadSafeStorage::new(InMemoryStorage::new(InMemoryState::default()))
         };
-        let mut node = build_runtime_node(config.chain_id.clone(), storage);
+        let mut node = build_runtime_node(
+            config.chain_id.clone(),
+            storage,
+            config.strict_canonical_execution,
+        );
         let journal = config
             .local_journal_path
             .as_deref()
@@ -2414,18 +2419,19 @@ impl SyncSource for UpstreamRpcClient {
 fn build_runtime_node(
     chain_id: ChainId,
     storage: ThreadSafeStorage<InMemoryStorage>,
+    strict_canonical_execution: bool,
 ) -> RuntimeNode {
     StarknetNodeBuilder::new(NodeConfig { chain_id })
         .with_storage(storage)
-        .with_execution(build_runtime_execution_backend())
+        .with_execution(build_runtime_execution_backend(strict_canonical_execution))
         .with_rpc(true)
         .build()
 }
 
-fn build_runtime_execution_backend() -> DualExecutionBackend {
+fn build_runtime_execution_backend(strict_canonical_execution: bool) -> DualExecutionBackend {
     DualExecutionBackend::new(
         None,
-        Box::new(RuntimeExecutionBackend::new()),
+        Box::new(RuntimeExecutionBackend::new(strict_canonical_execution)),
         ExecutionMode::CanonicalOnly,
         MismatchPolicy::WarnAndFallback,
     )
@@ -2530,6 +2536,7 @@ fn summarize_state_diff(diff: &StarknetStateDiff) -> String {
 }
 
 struct RuntimeExecutionBackend {
+    strict_canonical_execution: bool,
     #[cfg(feature = "production-adapters")]
     canonical: BlockifierVmBackend,
     #[cfg(feature = "production-adapters")]
@@ -2539,8 +2546,9 @@ struct RuntimeExecutionBackend {
 }
 
 impl RuntimeExecutionBackend {
-    fn new() -> Self {
+    fn new(strict_canonical_execution: bool) -> Self {
         Self {
+            strict_canonical_execution,
             #[cfg(feature = "production-adapters")]
             canonical: BlockifierVmBackend::starknet_mainnet(),
             #[cfg(feature = "production-adapters")]
@@ -2582,11 +2590,10 @@ impl RuntimeExecutionBackend {
 
     #[cfg(feature = "production-adapters")]
     fn should_try_canonical_block_execution(block: &StarknetBlock) -> bool {
-        !block.transactions.is_empty()
-            && block
-                .transactions
-                .iter()
-                .all(|tx| tx.executable.as_ref().is_some())
+        block
+            .transactions
+            .iter()
+            .all(|tx| tx.executable.as_ref().is_some())
     }
 
     #[cfg(feature = "production-adapters")]
@@ -2613,16 +2620,38 @@ impl ExecutionBackend for RuntimeExecutionBackend {
         state: &mut dyn MutableState,
     ) -> Result<ExecutionOutput, ExecutionError> {
         #[cfg(feature = "production-adapters")]
-        if self.canonical_enabled.load(Ordering::Relaxed)
-            && Self::should_try_canonical_block_execution(block)
         {
-            match self.canonical.execute_block(block, state) {
-                Ok(output) => return Ok(output),
-                Err(error) => {
-                    self.canonical_enabled.store(false, Ordering::Relaxed);
-                    self.warn_canonical_fallback("execute_block", &error);
+            let has_full_payload_coverage = Self::should_try_canonical_block_execution(block);
+            if self.strict_canonical_execution && !has_full_payload_coverage {
+                let missing_payloads = block
+                    .transactions
+                    .iter()
+                    .filter(|tx| tx.executable.is_none())
+                    .count();
+                return Err(ExecutionError::Backend(format!(
+                    "strict canonical execution requires embedded executable payloads for all transactions in block {} (missing {missing_payloads} payloads)",
+                    block.number
+                )));
+            }
+
+            if self.canonical_enabled.load(Ordering::Relaxed) && has_full_payload_coverage {
+                match self.canonical.execute_block(block, state) {
+                    Ok(output) => return Ok(output),
+                    Err(error) => {
+                        if self.strict_canonical_execution {
+                            return Err(error);
+                        }
+                        self.canonical_enabled.store(false, Ordering::Relaxed);
+                        self.warn_canonical_fallback("execute_block", &error);
+                    }
                 }
             }
+        }
+        #[cfg(not(feature = "production-adapters"))]
+        if self.strict_canonical_execution {
+            return Err(ExecutionError::Backend(
+                "strict canonical execution requires `production-adapters` feature".to_string(),
+            ));
         }
         #[cfg(not(feature = "production-adapters"))]
         let _ = state;
@@ -2637,16 +2666,33 @@ impl ExecutionBackend for RuntimeExecutionBackend {
         block_context: &BlockContext,
     ) -> Result<SimulationResult, ExecutionError> {
         #[cfg(feature = "production-adapters")]
-        if self.canonical_enabled.load(Ordering::Relaxed)
-            && Self::should_try_canonical_simulation(tx)
         {
-            match self.canonical.simulate_tx(tx, state, block_context) {
-                Ok(result) => return Ok(result),
-                Err(error) => {
-                    self.canonical_enabled.store(false, Ordering::Relaxed);
-                    self.warn_canonical_fallback("simulate_tx", &error);
+            let has_payload = Self::should_try_canonical_simulation(tx);
+            if self.strict_canonical_execution && !has_payload {
+                return Err(ExecutionError::Backend(format!(
+                    "strict canonical simulation requires embedded executable payload for tx {}",
+                    tx.hash
+                )));
+            }
+
+            if self.canonical_enabled.load(Ordering::Relaxed) && has_payload {
+                match self.canonical.simulate_tx(tx, state, block_context) {
+                    Ok(result) => return Ok(result),
+                    Err(error) => {
+                        if self.strict_canonical_execution {
+                            return Err(error);
+                        }
+                        self.canonical_enabled.store(false, Ordering::Relaxed);
+                        self.warn_canonical_fallback("simulate_tx", &error);
+                    }
                 }
             }
+        }
+        #[cfg(not(feature = "production-adapters"))]
+        if self.strict_canonical_execution {
+            return Err(ExecutionError::Backend(
+                "strict canonical simulation requires `production-adapters` feature".to_string(),
+            ));
         }
         #[cfg(not(feature = "production-adapters"))]
         {
@@ -2761,6 +2807,17 @@ fn replay_transaction_from_payload(
             return StarknetTransaction::with_executable(tx_hash, executable).map_err(|error| {
                 format!(
                     "embedded executable payload hash mismatch for tx {hash} at local block {local_block_number}: {error}"
+                )
+            });
+        }
+
+        // Some upstreams expose executable-shaped transactions directly without wrapper fields.
+        if let Ok(executable) =
+            serde_json::from_value::<ExecutableStarknetTransaction>(payload.clone())
+        {
+            return StarknetTransaction::with_executable(tx_hash, executable).map_err(|error| {
+                format!(
+                    "direct executable payload hash mismatch for tx {hash} at local block {local_block_number}: {error}"
                 )
             });
         }
@@ -4215,13 +4272,14 @@ mod tests {
             storage_snapshot_interval_blocks: DEFAULT_STORAGE_SNAPSHOT_INTERVAL_BLOCKS,
             disable_batch_requests: false,
             network_stale_after: Duration::from_secs(120),
+            strict_canonical_execution: false,
             storage: None,
         }
     }
 
     #[test]
     fn runtime_execution_backend_runs_canonical_path_once_per_block() {
-        let backend = build_runtime_execution_backend();
+        let backend = build_runtime_execution_backend(false);
         let fetch = sample_fetch(1, "0x0", "0x1");
         let block = ingest_block_from_fetch(1, &fetch).expect("sample block should ingest");
         let mut state = InMemoryState::default();
@@ -4234,6 +4292,44 @@ mod tests {
         let metrics = backend.metrics().expect("metrics should be readable");
         assert_eq!(metrics.fast_executions, 0);
         assert_eq!(metrics.canonical_executions, 1);
+    }
+
+    #[cfg(not(feature = "production-adapters"))]
+    #[test]
+    fn runtime_execution_backend_strict_mode_requires_production_adapters() {
+        let backend = build_runtime_execution_backend(true);
+        let fetch = sample_fetch(1, "0x0", "0x1");
+        let block = ingest_block_from_fetch(1, &fetch).expect("sample block should ingest");
+        let mut state = InMemoryState::default();
+
+        let error = backend
+            .execute_block(&block, &mut state)
+            .expect_err("strict mode must fail closed without production adapters");
+        match error {
+            ExecutionError::Backend(message) => {
+                assert!(message.contains("requires `production-adapters`"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn runtime_execution_backend_strict_mode_rejects_missing_executable_payloads() {
+        let backend = build_runtime_execution_backend(true);
+        let fetch = sample_fetch(1, "0x0", "0x1");
+        let block = ingest_block_from_fetch(1, &fetch).expect("sample block should ingest");
+        let mut state = InMemoryState::default();
+
+        let error = backend
+            .execute_block(&block, &mut state)
+            .expect_err("strict mode must fail closed on payload gaps");
+        match error {
+            ExecutionError::Backend(message) => {
+                assert!(message.contains("requires embedded executable payloads"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
     }
 
     fn write_replay_checkpoint(
@@ -4531,6 +4627,27 @@ mod tests {
         let error = replay_transaction_from_payload(1, "0x111", &payload)
             .expect_err("mismatched executable hash must fail closed");
         assert!(error.contains("hash mismatch"));
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn replay_transaction_from_payload_uses_direct_executable_shape() {
+        use starknet_api::executable_transaction::{
+            L1HandlerTransaction as ExecutableL1Handler, Transaction as ExecutableTransaction,
+        };
+        use starknet_api::hash::StarkHash as StarknetApiFelt;
+        use starknet_api::transaction::TransactionHash;
+
+        let mut executable = ExecutableL1Handler::default();
+        executable.tx.calldata = vec![Default::default()].into();
+        executable.tx_hash = TransactionHash(StarknetApiFelt::from(0x111_u64));
+        let payload = serde_json::to_value(ExecutableTransaction::L1Handler(executable))
+            .expect("serialize executable tx");
+
+        let tx = replay_transaction_from_payload(1, "0x111", &payload)
+            .expect("direct executable payload should be accepted");
+        assert_eq!(tx.hash.as_ref(), "0x111");
+        assert!(tx.executable.is_some());
     }
 
     #[test]
