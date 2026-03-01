@@ -154,7 +154,27 @@ impl LocalChainJournal {
         &self.path
     }
 
+    fn ensure_not_symlink(&self) -> Result<(), String> {
+        match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(format!(
+                        "local journal {} must not be a symlink",
+                        self.path.display()
+                    ));
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "failed to inspect local journal {}: {error}",
+                self.path.display()
+            )),
+        }
+    }
+
     fn load_entries(&self, limit: Option<u64>) -> Result<Vec<LocalJournalEntry>, String> {
+        self.ensure_not_symlink()?;
         if !self.path.exists() {
             return Ok(Vec::new());
         }
@@ -218,6 +238,7 @@ impl LocalChainJournal {
     }
 
     fn append_entry(&self, entry: &LocalJournalEntry) -> Result<(), String> {
+        self.ensure_not_symlink()?;
         let encoded = serde_json::to_string(entry).map_err(|error| {
             format!(
                 "failed to encode local journal entry for {}: {error}",
@@ -3288,6 +3309,44 @@ mod tests {
             .append_entry(&entry)
             .expect_err("append beyond max file size must fail closed");
         assert!(error.contains("exceed max allowed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_journal_rejects_symlink_path_on_load() {
+        let dir = tempdir().expect("tempdir");
+        let target_path = dir.path().join("target.jsonl");
+        std::fs::write(&target_path, "{}\n").expect("seed target");
+        let symlink_path = dir.path().join("journal-link.jsonl");
+        std::os::unix::fs::symlink(&target_path, &symlink_path).expect("create symlink");
+
+        let journal = LocalChainJournal::new(&symlink_path);
+        let error = journal
+            .load_entries(None)
+            .expect_err("symlink-backed journal must fail closed");
+        assert!(error.contains("must not be a symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_journal_rejects_symlink_path_on_append() {
+        let dir = tempdir().expect("tempdir");
+        let target_path = dir.path().join("target.jsonl");
+        std::fs::write(&target_path, "").expect("seed target");
+        let symlink_path = dir.path().join("journal-link.jsonl");
+        std::os::unix::fs::symlink(&target_path, &symlink_path).expect("create symlink");
+
+        let journal = LocalChainJournal::new(&symlink_path);
+        let block = ingest_block_from_fetch(1, &sample_fetch(1, "0x0", "0x1"))
+            .expect("sample block should ingest");
+        let error = journal
+            .append_entry(&LocalJournalEntry {
+                block,
+                state_diff: StarknetStateDiff::default(),
+                receipts: Vec::new(),
+            })
+            .expect_err("symlink-backed append must fail closed");
+        assert!(error.contains("must not be a symlink"));
     }
 
     #[tokio::test]
