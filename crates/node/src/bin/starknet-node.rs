@@ -38,6 +38,8 @@ const DEFAULT_RPC_MAX_CONCURRENCY: usize = 256;
 const DEFAULT_RPC_RATE_LIMIT_PER_MINUTE: u32 = 1_200;
 const MAX_RPC_RATE_LIMIT_PER_MINUTE: u32 = 100_000;
 const MAX_BOOTNODE_PROBE_CONCURRENCY: usize = 32;
+const MAX_BOOTNODES: usize = 1_024;
+const MAX_BOOTNODE_ENTRY_BYTES: usize = 1_024;
 const DEFAULT_HEALTH_MAX_CONSECUTIVE_FAILURES: u64 = 3;
 const DEFAULT_HEALTH_MAX_SYNC_LAG_BLOCKS: u64 = 64;
 const DAEMON_GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
@@ -1162,6 +1164,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
             }
         }
     }
+    validate_bootnode_inputs(&bootnodes)?;
 
     let poll_ms = match cli_poll_ms {
         Some(value) => value,
@@ -1470,6 +1473,34 @@ fn validate_rpc_bind_exposure(
     Err(format!(
         "refusing non-loopback rpc bind `{rpc_bind}` without auth token; set --rpc-auth-token/PASTIS_RPC_AUTH_TOKEN or --allow-public-rpc-bind/PASTIS_ALLOW_PUBLIC_RPC_BIND=true"
     ))
+}
+
+fn validate_bootnode_inputs(bootnodes: &[String]) -> Result<(), String> {
+    if bootnodes.len() > MAX_BOOTNODES {
+        return Err(format!(
+            "too many bootnodes configured: {} (max {MAX_BOOTNODES})",
+            bootnodes.len()
+        ));
+    }
+
+    for (index, bootnode) in bootnodes.iter().enumerate() {
+        let trimmed = bootnode.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.len() > MAX_BOOTNODE_ENTRY_BYTES {
+            return Err(format!(
+                "bootnode entry at index {index} exceeds max {MAX_BOOTNODE_ENTRY_BYTES} bytes"
+            ));
+        }
+        if trimmed.chars().any(char::is_control) {
+            return Err(format!(
+                "bootnode entry at index {index} contains control characters"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn redact_rpc_url(raw: &str) -> String {
@@ -2098,6 +2129,38 @@ mod tests {
     fn validate_rpc_bind_exposure_allows_named_host_with_auth() {
         validate_rpc_bind_exposure("example.com:9545", Some("token"), false)
             .expect("named host should be allowed when auth is configured");
+    }
+
+    #[test]
+    fn validate_bootnode_inputs_rejects_excessive_count() {
+        let bootnodes = vec!["127.0.0.1:9090".to_string(); MAX_BOOTNODES + 1];
+        let err =
+            validate_bootnode_inputs(&bootnodes).expect_err("too many bootnodes must fail closed");
+        assert!(err.contains("too many bootnodes"));
+    }
+
+    #[test]
+    fn validate_bootnode_inputs_rejects_oversized_entry() {
+        let oversized = format!("127.0.0.1:{}", "9".repeat(MAX_BOOTNODE_ENTRY_BYTES));
+        let err = validate_bootnode_inputs(&[oversized])
+            .expect_err("oversized bootnode entry must fail closed");
+        assert!(err.contains("exceeds max"));
+    }
+
+    #[test]
+    fn validate_bootnode_inputs_rejects_control_characters() {
+        let err = validate_bootnode_inputs(&["127.0.0.1:9090\nbad".to_string()])
+            .expect_err("control characters must fail closed");
+        assert!(err.contains("control characters"));
+    }
+
+    #[test]
+    fn validate_bootnode_inputs_accepts_reasonable_entries() {
+        validate_bootnode_inputs(&[
+            "127.0.0.1:9090".to_string(),
+            "/ip4/127.0.0.1/tcp/9091/p2p/12D3KooWabc".to_string(),
+        ])
+        .expect("valid bootnodes should be accepted");
     }
 
     #[test]
