@@ -20,6 +20,8 @@ use crate::replay::{
     FileReplayCheckpointStore, ReplayPipeline, ReplayPipelineError, ReplayPipelineStep,
 };
 use crate::{ChainId, NodeConfig, StarknetNode, StarknetNodeBuilder};
+#[cfg(feature = "production-adapters")]
+use starknet_node_execution::BlockifierVmBackend;
 use starknet_node_execution::{
     DualExecutionBackend, ExecutionBackend, ExecutionError, ExecutionMode, MismatchPolicy,
 };
@@ -2422,11 +2424,9 @@ fn build_runtime_node(
 
 fn build_runtime_execution_backend() -> DualExecutionBackend {
     DualExecutionBackend::new(
-        Some(Box::new(RuntimeExecutionBackend)),
-        Box::new(RuntimeExecutionBackend),
-        ExecutionMode::DualWithVerification {
-            verification_depth: 32,
-        },
+        None,
+        Box::new(RuntimeExecutionBackend::new()),
+        ExecutionMode::CanonicalOnly,
         MismatchPolicy::WarnAndFallback,
     )
 }
@@ -2529,15 +2529,29 @@ fn summarize_state_diff(diff: &StarknetStateDiff) -> String {
     )
 }
 
-struct RuntimeExecutionBackend;
+struct RuntimeExecutionBackend {
+    #[cfg(feature = "production-adapters")]
+    canonical: BlockifierVmBackend,
+    #[cfg(feature = "production-adapters")]
+    warned_canonical_fallback: AtomicBool,
+    #[cfg(feature = "production-adapters")]
+    canonical_enabled: AtomicBool,
+}
 
-impl ExecutionBackend for RuntimeExecutionBackend {
-    fn execute_block(
-        &self,
-        block: &StarknetBlock,
-        _state: &mut dyn MutableState,
-    ) -> Result<ExecutionOutput, ExecutionError> {
-        Ok(ExecutionOutput {
+impl RuntimeExecutionBackend {
+    fn new() -> Self {
+        Self {
+            #[cfg(feature = "production-adapters")]
+            canonical: BlockifierVmBackend::starknet_mainnet(),
+            #[cfg(feature = "production-adapters")]
+            warned_canonical_fallback: AtomicBool::new(false),
+            #[cfg(feature = "production-adapters")]
+            canonical_enabled: AtomicBool::new(true),
+        }
+    }
+
+    fn synthetic_execute_block(block: &StarknetBlock) -> ExecutionOutput {
+        ExecutionOutput {
             receipts: block
                 .transactions
                 .iter()
@@ -2551,16 +2565,11 @@ impl ExecutionBackend for RuntimeExecutionBackend {
             state_diff: StarknetStateDiff::default(),
             builtin_stats: BuiltinStats::default(),
             execution_time: Duration::from_millis(1),
-        })
+        }
     }
 
-    fn simulate_tx(
-        &self,
-        tx: &StarknetTransaction,
-        _state: &dyn StateReader,
-        _block_context: &BlockContext,
-    ) -> Result<SimulationResult, ExecutionError> {
-        Ok(SimulationResult {
+    fn synthetic_simulation(tx: &StarknetTransaction) -> SimulationResult {
+        SimulationResult {
             receipt: StarknetReceipt {
                 tx_hash: tx.hash.clone(),
                 execution_status: true,
@@ -2568,7 +2577,84 @@ impl ExecutionBackend for RuntimeExecutionBackend {
                 gas_consumed: 1,
             },
             estimated_fee: 1,
-        })
+        }
+    }
+
+    #[cfg(feature = "production-adapters")]
+    fn should_try_canonical_block_execution(block: &StarknetBlock) -> bool {
+        !block.transactions.is_empty()
+            && block
+                .transactions
+                .iter()
+                .all(|tx| tx.executable.as_ref().is_some())
+    }
+
+    #[cfg(feature = "production-adapters")]
+    fn should_try_canonical_simulation(tx: &StarknetTransaction) -> bool {
+        tx.executable.as_ref().is_some()
+    }
+
+    #[cfg(feature = "production-adapters")]
+    fn warn_canonical_fallback(&self, context: &str, error: &ExecutionError) {
+        if self.warned_canonical_fallback.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let sanitized = sanitize_error_message(&error.to_string(), MAX_RUNTIME_ERROR_CHARS);
+        eprintln!(
+            "warning: runtime canonical execution backend disabled after first failure ({context}): {sanitized}"
+        );
+    }
+}
+
+impl ExecutionBackend for RuntimeExecutionBackend {
+    fn execute_block(
+        &self,
+        block: &StarknetBlock,
+        state: &mut dyn MutableState,
+    ) -> Result<ExecutionOutput, ExecutionError> {
+        #[cfg(feature = "production-adapters")]
+        if self.canonical_enabled.load(Ordering::Relaxed)
+            && Self::should_try_canonical_block_execution(block)
+        {
+            match self.canonical.execute_block(block, state) {
+                Ok(output) => return Ok(output),
+                Err(error) => {
+                    self.canonical_enabled.store(false, Ordering::Relaxed);
+                    self.warn_canonical_fallback("execute_block", &error);
+                }
+            }
+        }
+        #[cfg(not(feature = "production-adapters"))]
+        let _ = state;
+
+        Ok(Self::synthetic_execute_block(block))
+    }
+
+    fn simulate_tx(
+        &self,
+        tx: &StarknetTransaction,
+        state: &dyn StateReader,
+        block_context: &BlockContext,
+    ) -> Result<SimulationResult, ExecutionError> {
+        #[cfg(feature = "production-adapters")]
+        if self.canonical_enabled.load(Ordering::Relaxed)
+            && Self::should_try_canonical_simulation(tx)
+        {
+            match self.canonical.simulate_tx(tx, state, block_context) {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    self.canonical_enabled.store(false, Ordering::Relaxed);
+                    self.warn_canonical_fallback("simulate_tx", &error);
+                }
+            }
+        }
+        #[cfg(not(feature = "production-adapters"))]
+        {
+            let _ = state;
+            let _ = block_context;
+        }
+
+        Ok(Self::synthetic_simulation(tx))
     }
 }
 
@@ -4131,6 +4217,23 @@ mod tests {
             network_stale_after: Duration::from_secs(120),
             storage: None,
         }
+    }
+
+    #[test]
+    fn runtime_execution_backend_runs_canonical_path_once_per_block() {
+        let backend = build_runtime_execution_backend();
+        let fetch = sample_fetch(1, "0x0", "0x1");
+        let block = ingest_block_from_fetch(1, &fetch).expect("sample block should ingest");
+        let mut state = InMemoryState::default();
+
+        let output = backend
+            .execute_block(&block, &mut state)
+            .expect("execution should succeed");
+        assert_eq!(output.receipts.len(), block.transactions.len());
+
+        let metrics = backend.metrics().expect("metrics should be readable");
+        assert_eq!(metrics.fast_executions, 0);
+        assert_eq!(metrics.canonical_executions, 1);
     }
 
     fn write_replay_checkpoint(
