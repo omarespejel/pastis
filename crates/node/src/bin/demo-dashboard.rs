@@ -187,19 +187,27 @@ struct DemoRuntime {
 }
 
 impl DemoRuntime {
-    fn new() -> Self {
+    fn new() -> Result<Self, String> {
         let node = build_dashboard_node();
 
+        let wbtc_contract = ContractAddress::parse(WBTC_CONTRACT)
+            .map_err(|error| format!("invalid demo WBTC contract `{WBTC_CONTRACT}`: {error}"))?;
         let wrapper = StandardWrapperMonitor::new(StandardWrapperConfig {
             wrapper: StandardWrapper::Wbtc,
-            token_contract: ContractAddress::parse(WBTC_CONTRACT).expect("valid contract address"),
+            token_contract: wbtc_contract,
             total_supply_key: "0x1".to_string(),
             expected_supply_sats: 1_000_000,
             allowed_deviation_bps: 50,
         });
 
+        let strkbtc_pool_contract =
+            ContractAddress::parse(STRKBTC_SHIELDED_POOL).map_err(|error| {
+                format!(
+                    "invalid demo strkBTC shielded pool contract `{STRKBTC_SHIELDED_POOL}`: {error}"
+                )
+            })?;
         let strkbtc = StrkBtcMonitor::new(StrkBtcMonitorConfig {
-            shielded_pool_contract: ContractAddress::parse(STRKBTC_SHIELDED_POOL).expect("valid contract address"),
+            shielded_pool_contract: strkbtc_pool_contract,
             merkle_root_key: STRKBTC_MERKLE_ROOT_KEY.to_string(),
             commitment_count_key: STRKBTC_COMMITMENT_COUNT_KEY.to_string(),
             nullifier_count_key: STRKBTC_NULLIFIER_COUNT_KEY.to_string(),
@@ -212,7 +220,7 @@ impl DemoRuntime {
             max_tracked_nullifiers: 10_000,
         });
 
-        Self {
+        Ok(Self {
             node,
             execution_state: InMemoryState::default(),
             btcfi: Mutex::new(BtcfiExEx::new(vec![wrapper], strkbtc, 256)),
@@ -228,13 +236,31 @@ impl DemoRuntime {
             last_replay_error: None,
             last_error: None,
             recent_errors: VecDeque::new(),
-        }
+        })
     }
 
     fn tick(&mut self) -> Result<(), String> {
         let block_number = self.next_block;
-        let block = demo_block(block_number);
-        let diff = self.build_state_diff(block_number);
+        let block = match demo_block(block_number) {
+            Ok(block) => block,
+            Err(error) => {
+                let message = format!("failed to build demo block {block_number}: {error}");
+                self.replay_failures = self.replay_failures.saturating_add(1);
+                self.last_replay_error = Some(message.clone());
+                self.record_tick_error(message.clone());
+                return Err(message);
+            }
+        };
+        let diff = match self.build_state_diff(block_number) {
+            Ok(diff) => diff,
+            Err(error) => {
+                let message = format!("failed to build demo state diff {block_number}: {error}");
+                self.replay_failures = self.replay_failures.saturating_add(1);
+                self.last_replay_error = Some(message.clone());
+                self.record_tick_error(message.clone());
+                return Err(message);
+            }
+        };
 
         if let Err(error) = self
             .node
@@ -279,7 +305,7 @@ impl DemoRuntime {
         push_recent_error(&mut self.recent_errors, message);
     }
 
-    fn build_state_diff(&mut self, block_number: u64) -> StarknetStateDiff {
+    fn build_state_diff(&mut self, block_number: u64) -> Result<StarknetStateDiff, String> {
         let mut storage_diffs: BTreeMap<
             ContractAddress,
             BTreeMap<String, starknet_node_types::StarknetFelt>,
@@ -290,8 +316,10 @@ impl DemoRuntime {
         } else {
             1_000_000_u64 + (block_number % 2_000)
         };
+        let wbtc_contract = ContractAddress::parse(WBTC_CONTRACT)
+            .map_err(|error| format!("invalid demo WBTC contract `{WBTC_CONTRACT}`: {error}"))?;
         storage_diffs.insert(
-            ContractAddress::parse(WBTC_CONTRACT).expect("valid contract address"),
+            wbtc_contract,
             BTreeMap::from([(
                 "0x1".to_string(),
                 starknet_node_types::StarknetFelt::from(wbtc_supply),
@@ -322,8 +350,13 @@ impl DemoRuntime {
             generated
         };
 
+        let strkbtc_contract = ContractAddress::parse(STRKBTC_SHIELDED_POOL).map_err(|error| {
+            format!(
+                "invalid demo strkBTC shielded pool contract `{STRKBTC_SHIELDED_POOL}`: {error}"
+            )
+        })?;
         storage_diffs.insert(
-            ContractAddress::parse(STRKBTC_SHIELDED_POOL).expect("valid contract address"),
+            strkbtc_contract,
             BTreeMap::from([
                 (
                     STRKBTC_MERKLE_ROOT_KEY.to_string(),
@@ -344,23 +377,25 @@ impl DemoRuntime {
             ]),
         );
 
-        StarknetStateDiff {
+        Ok(StarknetStateDiff {
             storage_diffs,
             nonces: BTreeMap::new(),
             declared_classes: Vec::new(),
-        }
+        })
     }
 
-    fn mcp_access_controller(&self) -> McpAccessController {
+    fn mcp_access_controller(&self) -> Result<McpAccessController, String> {
         let permissions = BTreeSet::from([
             ToolPermission::GetNodeStatus,
             ToolPermission::GetAnomalies,
             ToolPermission::QueryState,
         ]);
-        McpAccessController::new([(
+        let policy = AgentPolicy::new(DEMO_API_KEY, permissions, 5_000)
+            .map_err(|error| format!("failed to build MCP demo policy: {error}"))?;
+        Ok(McpAccessController::new([(
             "boss-demo".to_string(),
-            AgentPolicy::new(DEMO_API_KEY, permissions, 5_000),
-        )])
+            policy,
+        )]))
     }
 
     fn mcp_limits(&self) -> ValidationLimits {
@@ -373,7 +408,7 @@ impl DemoRuntime {
 
     fn query_anomalies_via_mcp(&self, limit: u64) -> Result<Vec<BtcfiAnomaly>, String> {
         let server = self.node.new_mcp_server_with_anomalies(
-            self.mcp_access_controller(),
+            self.mcp_access_controller()?,
             self.mcp_limits(),
             &self.btcfi,
         );
@@ -932,16 +967,18 @@ impl RealRuntime {
         }
     }
 
-    fn mcp_access_controller(&self) -> McpAccessController {
+    fn mcp_access_controller(&self) -> Result<McpAccessController, String> {
         let permissions = BTreeSet::from([
             ToolPermission::GetNodeStatus,
             ToolPermission::GetAnomalies,
             ToolPermission::QueryState,
         ]);
-        McpAccessController::new([(
+        let policy = AgentPolicy::new(DEMO_API_KEY, permissions, 5_000)
+            .map_err(|error| format!("failed to build MCP real policy: {error}"))?;
+        Ok(McpAccessController::new([(
             "boss-real".to_string(),
-            AgentPolicy::new(DEMO_API_KEY, permissions, 5_000),
-        )])
+            policy,
+        )]))
     }
 
     fn mcp_limits(&self) -> ValidationLimits {
@@ -961,7 +998,7 @@ impl RealRuntime {
             .lock()
             .map_err(|_| "real runtime lock poisoned".to_string())?;
         let server = guard.node.new_mcp_server_with_anomalies(
-            self.mcp_access_controller(),
+            self.mcp_access_controller()?,
             self.mcp_limits(),
             btcfi.as_ref(),
         );
@@ -1251,7 +1288,7 @@ async fn main() -> Result<(), String> {
 
     let source = match config.mode {
         DashboardModeKind::Demo => {
-            let runtime = Arc::new(Mutex::new(DemoRuntime::new()));
+            let runtime = Arc::new(Mutex::new(DemoRuntime::new()?));
             let simulation_runtime = Arc::clone(&runtime);
             tokio::spawn(async move {
                 let mut ticker = interval(Duration::from_millis(refresh_ms));
@@ -1334,7 +1371,10 @@ fn redact_rpc_url(raw: &str) -> String {
     match reqwest::Url::parse(raw) {
         Ok(url) => {
             let host = url.host_str().unwrap_or("unknown-host");
-            let port = url.port().map(|value| format!(":{value}")).unwrap_or_default();
+            let port = url
+                .port()
+                .map(|value| format!(":{value}"))
+                .unwrap_or_default();
             format!("{}://{}{port}", url.scheme(), host)
         }
         Err(_) => "<invalid-rpc-url>".to_string(),
@@ -1578,13 +1618,17 @@ fn real_debug(runtime: &Arc<RealRuntime>, refresh_ms: u64) -> Result<DebugPayloa
     })
 }
 
-fn demo_block(number: u64) -> StarknetBlock {
-    StarknetBlock {
+fn demo_block(number: u64) -> Result<StarknetBlock, String> {
+    let sequencer_address = ContractAddress::parse("0x1234")
+        .map_err(|error| format!("invalid demo sequencer address: {error}"))?;
+    let tx_hash = TxHash::parse(format!("0x{number:x}"))
+        .map_err(|error| format!("invalid demo tx hash for block {number}: {error}"))?;
+    Ok(StarknetBlock {
         number,
         parent_hash: format!("0x{:x}", number.saturating_sub(1)),
         state_root: format!("0x{:x}", number.saturating_mul(17)),
         timestamp: 1_700_000_000 + number,
-        sequencer_address: ContractAddress::parse("0x1234").expect("valid contract address"),
+        sequencer_address,
         gas_prices: BlockGasPrices {
             l1_gas: GasPricePerToken {
                 price_in_fri: 1,
@@ -1599,11 +1643,9 @@ fn demo_block(number: u64) -> StarknetBlock {
                 price_in_wei: 1,
             },
         },
-        protocol_version: Version::parse("0.14.2").expect("demo protocol version must be valid"),
-        transactions: vec![StarknetTransaction::new(
-            TxHash::parse(format!("0x{number:x}")).expect("valid demo tx hash"),
-        )],
-    }
+        protocol_version: Version::new(0, 14, 2),
+        transactions: vec![StarknetTransaction::new(tx_hash)],
+    })
 }
 
 fn ingest_block_from_fetch(local_number: u64, fetch: &RealFetch) -> Result<StarknetBlock, String> {
@@ -1647,7 +1689,12 @@ fn ingest_block_from_fetch(local_number: u64, fetch: &RealFetch) -> Result<Stark
         parent_hash,
         state_root,
         timestamp: replay.timestamp,
-        sequencer_address: ContractAddress::parse(sequencer_address).expect("valid contract address"),
+        sequencer_address: ContractAddress::parse(sequencer_address).map_err(|error| {
+            format!(
+                "invalid canonical replay sequencer address `{}`: {error}",
+                replay.sequencer_address
+            )
+        })?,
         gas_prices: BlockGasPrices {
             l1_gas: GasPricePerToken {
                 price_in_fri: 1,
@@ -1662,7 +1709,7 @@ fn ingest_block_from_fetch(local_number: u64, fetch: &RealFetch) -> Result<Stark
                 price_in_wei: 1,
             },
         },
-        protocol_version: Version::parse("0.14.2").expect("replay protocol version must be valid"),
+        protocol_version: Version::new(0, 14, 2),
         transactions,
     };
     block
@@ -1837,9 +1884,12 @@ fn parse_real_btcfi_config_from_env() -> Result<Option<RealBtcfiConfig>, String>
 
     let mut wrappers = Vec::new();
     if let Ok(wbtc_contract) = env::var("PASTIS_MONITOR_WBTC_CONTRACT") {
+        let token_contract = ContractAddress::parse(wbtc_contract.clone()).map_err(|error| {
+            format!("invalid PASTIS_MONITOR_WBTC_CONTRACT `{wbtc_contract}`: {error}")
+        })?;
         wrappers.push(StandardWrapperConfig {
             wrapper: StandardWrapper::Wbtc,
-            token_contract: ContractAddress::parse(wbtc_contract).expect("valid contract address"),
+            token_contract,
             total_supply_key: env::var("PASTIS_MONITOR_WBTC_TOTAL_SUPPLY_KEY")
                 .unwrap_or_else(|_| "0x1".to_string()),
             expected_supply_sats: parse_env_u128(
@@ -1850,8 +1900,11 @@ fn parse_real_btcfi_config_from_env() -> Result<Option<RealBtcfiConfig>, String>
         });
     }
 
+    let shielded_pool_contract = ContractAddress::parse(strkbtc_pool.clone()).map_err(|error| {
+        format!("invalid PASTIS_MONITOR_STRKBTC_SHIELDED_POOL `{strkbtc_pool}`: {error}")
+    })?;
     let strkbtc = StrkBtcMonitorConfig {
-        shielded_pool_contract: ContractAddress::parse(strkbtc_pool).expect("valid contract address"),
+        shielded_pool_contract,
         merkle_root_key: env::var("PASTIS_MONITOR_STRKBTC_MERKLE_ROOT_KEY")
             .unwrap_or_else(|_| STRKBTC_MERKLE_ROOT_KEY.to_string()),
         commitment_count_key: env::var("PASTIS_MONITOR_STRKBTC_COMMITMENT_COUNT_KEY")
@@ -2219,7 +2272,9 @@ fn parse_contract_address(raw: &str, warnings: &mut Vec<String>) -> Option<Contr
     canonicalize_hex_felt(raw, "contract address", warnings).and_then(|value| {
         ContractAddress::parse(value).map_or_else(
             |error| {
-                warnings.push(format!("invalid canonical contract address `{raw}`: {error}"));
+                warnings.push(format!(
+                    "invalid canonical contract address `{raw}`: {error}"
+                ));
                 None
             },
             Some,
@@ -3380,9 +3435,10 @@ mod tests {
             ContractAddress::parse("0x1").expect("valid contract address"),
             BTreeMap::from([("0x3".to_string(), StarknetFelt::from(3_u64))]),
         );
-        diff_a
-            .nonces
-            .insert(ContractAddress::parse("0x1").expect("valid contract address"), StarknetFelt::from(9_u64));
+        diff_a.nonces.insert(
+            ContractAddress::parse("0x1").expect("valid contract address"),
+            StarknetFelt::from(9_u64),
+        );
         diff_a
             .declared_classes
             .push(ClassHash::parse("0xa").expect("valid class hash"));
@@ -3399,9 +3455,10 @@ mod tests {
                 ("0x2".to_string(), StarknetFelt::from(2_u64)),
             ]),
         );
-        diff_b
-            .nonces
-            .insert(ContractAddress::parse("0x1").expect("valid contract address"), StarknetFelt::from(9_u64));
+        diff_b.nonces.insert(
+            ContractAddress::parse("0x1").expect("valid contract address"),
+            StarknetFelt::from(9_u64),
+        );
         diff_b
             .declared_classes
             .push(ClassHash::parse("0xa").expect("valid class hash"));
@@ -3494,7 +3551,9 @@ mod tests {
             Some(StarknetFelt::from(2_u64))
         );
         assert_eq!(
-            diff.nonces.get(&ContractAddress::parse("0x111").expect("valid contract address")).copied(),
+            diff.nonces
+                .get(&ContractAddress::parse("0x111").expect("valid contract address"))
+                .copied(),
             Some(StarknetFelt::from(9_u64))
         );
         assert_eq!(diff.declared_classes.len(), 2);
@@ -3527,7 +3586,9 @@ mod tests {
             Some(StarknetFelt::from(0x20_u64))
         );
         assert_eq!(
-            diff.nonces.get(&ContractAddress::parse("0x222").expect("valid contract address")).copied(),
+            diff.nonces
+                .get(&ContractAddress::parse("0x222").expect("valid contract address"))
+                .copied(),
             Some(StarknetFelt::from(5_u64))
         );
     }
@@ -3655,7 +3716,7 @@ mod tests {
 
     #[test]
     fn demo_runtime_tick_updates_dual_execution_metrics() {
-        let mut runtime = DemoRuntime::new();
+        let mut runtime = DemoRuntime::new().expect("demo runtime should initialize");
         runtime.tick().expect("tick should succeed");
 
         let metrics = runtime

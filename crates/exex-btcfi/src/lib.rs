@@ -373,7 +373,8 @@ fn find_writes_for_contract<'a>(
 ) -> Option<&'a BTreeMap<String, StarknetFelt>> {
     let target = canonical_felt_hex(target.as_ref())?;
     diff.storage_diffs.iter().find_map(|(contract, writes)| {
-        (canonical_felt_hex(contract.as_ref()).as_deref() == Some(target.as_str())).then_some(writes)
+        (canonical_felt_hex(contract.as_ref()).as_deref() == Some(target.as_str()))
+            .then_some(writes)
     })
 }
 
@@ -473,7 +474,8 @@ mod tests {
 
     fn strkbtc_config() -> StrkBtcMonitorConfig {
         StrkBtcMonitorConfig {
-            shielded_pool_contract: ContractAddress::parse("0x222").expect("valid contract address"),
+            shielded_pool_contract: ContractAddress::parse("0x222")
+                .expect("valid contract address"),
             merkle_root_key: "0x10".to_string(),
             commitment_count_key: "0x11".to_string(),
             nullifier_count_key: "0x12".to_string(),

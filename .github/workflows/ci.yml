@@ -32,6 +32,9 @@ jobs:
       - name: Verify replay fixture lock
         run: ./scripts/check-replay-fixture-lock.sh
 
+      - name: Security audit check
+        run: ./scripts/security-audit-check.sh
+
       - name: Format check
         run: cargo fmt --all --check
 

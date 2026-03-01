@@ -141,7 +141,7 @@ impl ExExManager {
             disabled_sinks_until: HashMap::new(),
             buffer: VecDeque::new(),
             next_id: 1,
-            max_capacity: max_capacity.min(MAX_WAL_REPLAY_ENTRIES),
+            max_capacity: max_capacity.clamp(1, MAX_WAL_REPLAY_ENTRIES),
             wal: InMemoryWal::default(),
             delivery_pool,
             registration_tokens: registration_tokens.into_iter().collect(),
@@ -390,10 +390,7 @@ impl ExExManager {
         }
 
         if tier_failures.len() == 1 {
-            let (name, message) = tier_failures
-                .into_iter()
-                .next()
-                .expect("exactly one failure");
+            let (name, message) = tier_failures.remove(0);
             return Err(ManagerError::SinkFailure { name, message });
         }
         if !tier_failures.is_empty() {
@@ -702,6 +699,27 @@ mod tests {
             .enqueue(sample_notification())
             .expect_err("second should fail");
         assert!(matches!(err, ManagerError::CapacityExceeded));
+    }
+
+    #[test]
+    fn zero_capacity_configuration_is_hardened_to_one_slot() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut manager = manager(0, &["otel"]);
+        let creds = credentials_for(&["otel"]);
+        manager
+            .register(vec![reg("otel", &[], log.clone())], &creds)
+            .expect("register");
+
+        manager
+            .enqueue(sample_notification())
+            .expect("first enqueue should fit hardened one-slot capacity");
+        let err = manager
+            .enqueue(sample_notification())
+            .expect_err("second enqueue should exceed one-slot capacity");
+        assert!(matches!(err, ManagerError::CapacityExceeded));
+
+        manager.drain_one().expect("drain");
+        assert!(log.lock().expect("lock log").contains(&"otel".to_string()));
     }
 
     #[test]

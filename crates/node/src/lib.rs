@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod replay;
+pub mod runtime;
 
 #[cfg(feature = "production-adapters")]
 use std::cell::RefCell;
@@ -686,7 +687,8 @@ mod tests {
     };
     #[cfg(feature = "production-adapters")]
     use starknet_node_types::{
-        BlockGasPrices, BlockId, ComponentHealth, GasPricePerToken, HealthCheck, HealthStatus,
+        BlockGasPrices, BlockId, ComponentHealth, ContractAddress, GasPricePerToken, HealthCheck,
+        HealthStatus, TxHash,
     };
     #[cfg(feature = "production-adapters")]
     use tempfile::tempdir;
@@ -807,7 +809,8 @@ mod tests {
             .build();
         let policies = [(
             "agent-a".to_string(),
-            AgentPolicy::new("api-key", BTreeSet::from([ToolPermission::QueryState]), 5),
+            AgentPolicy::new("api-key", BTreeSet::from([ToolPermission::QueryState]), 5)
+                .expect("test policy should build"),
         )];
         let limits = ValidationLimits {
             max_batch_size: 8,
@@ -836,7 +839,8 @@ mod tests {
             .build();
         let policies = [(
             "agent-a".to_string(),
-            AgentPolicy::new("api-key", BTreeSet::from([ToolPermission::GetAnomalies]), 5),
+            AgentPolicy::new("api-key", BTreeSet::from([ToolPermission::GetAnomalies]), 5)
+                .expect("test policy should build"),
         )];
         let limits = ValidationLimits {
             max_batch_size: 8,
@@ -871,13 +875,14 @@ mod tests {
         .with_rpc(true)
         .build();
         let rpc = node.new_rpc_server();
-        let response = rpc.handle_request(JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            method: "starknet_chainId".to_string(),
-            params: serde_json::json!([]),
-            id: Some(serde_json::json!(7)),
-        })
-        .expect("request with id should produce response");
+        let response = rpc
+            .handle_request(JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "starknet_chainId".to_string(),
+                params: serde_json::json!([]),
+                id: Some(serde_json::json!(7)),
+            })
+            .expect("request with id should produce response");
         assert_eq!(response.result, Some(serde_json::json!("SN_SEPOLIA")));
     }
 
@@ -1069,7 +1074,7 @@ mod tests {
         .expect("create executable deploy-account tx");
         let tx_hash = format!("{:#x}", executable.tx_hash.0);
         StarknetTransaction::with_executable(
-            tx_hash,
+            TxHash::parse(tx_hash).expect("valid executable transaction hash"),
             StarknetApiExecutableTransaction::Account(
                 StarknetApiExecutableAccountTransaction::DeployAccount(executable),
             ),

@@ -1230,11 +1230,9 @@ impl ExecutionBackend for BlockifierVmBackend {
             let mut state_diff = starknet_node_types::StarknetStateDiff::default();
             for (address, writes) in summary.state_diff.storage_updates {
                 let contract_felt: BlockifierFelt = address.into();
-                let contract = starknet_node_types::ContractAddress::parse(format!(
-                    "{:#x}",
-                    contract_felt
-                ))
-                .expect("valid contract address");
+                let contract =
+                    starknet_node_types::ContractAddress::parse(format!("{:#x}", contract_felt))
+                        .expect("valid contract address");
                 let contract_writes = state_diff.storage_diffs.entry(contract).or_default();
                 for (key, value) in writes {
                     let key_felt: BlockifierFelt = key.into();
@@ -1253,12 +1251,10 @@ impl ExecutionBackend for BlockifierVmBackend {
                 );
             }
             for class_hash in summary.state_diff.class_hash_to_compiled_class_hash.keys() {
-                state_diff
-                    .declared_classes
-                    .push(
-                        starknet_node_types::ClassHash::parse(format!("{:#x}", class_hash.0))
-                            .expect("valid class hash"),
-                    );
+                state_diff.declared_classes.push(
+                    starknet_node_types::ClassHash::parse(format!("{:#x}", class_hash.0))
+                        .expect("valid class hash"),
+                );
             }
             state_diff.validate().map_err(|error| {
                 ExecutionError::Backend(format!("invalid blockifier state diff output: {error}"))
@@ -1364,7 +1360,7 @@ mod tests {
     use starknet_node_types::{
         BlockGasPrices, BuiltinStats, ContractAddress, ExecutionOutput, GasPricePerToken,
         InMemoryState, MutableState, SimulationResult, StarknetBlock, StarknetFelt,
-        StarknetReceipt, StarknetStateDiff, StarknetTransaction, StateReader,
+        StarknetReceipt, StarknetStateDiff, StarknetTransaction, StateReader, TxHash,
     };
 
     use super::*;
@@ -1535,8 +1531,7 @@ mod tests {
             gas_prices: sample_gas_prices(),
             protocol_version: Version::parse(version).expect("valid version"),
             transactions: vec![StarknetTransaction::new(
-                starknet_node_types::TxHash::parse(format!("0x{number:x}"))
-                    .expect("valid tx hash"),
+                starknet_node_types::TxHash::parse(format!("0x{number:x}")).expect("valid tx hash"),
             )],
         }
     }
@@ -1590,7 +1585,8 @@ mod tests {
         executable.tx_hash =
             TransactionHash(BlockifierFelt::from_str(hash).expect("valid tx hash"));
 
-        StarknetTransaction::with_executable(hash.to_string(), ExecutableTx::L1Handler(executable))
+        let tx_hash = TxHash::parse(hash).expect("valid tx hash");
+        StarknetTransaction::with_executable(tx_hash, ExecutableTx::L1Handler(executable))
             .expect("matching executable hash")
     }
 
@@ -1609,8 +1605,9 @@ mod tests {
             tx_hash: TransactionHash(BlockifierFelt::from_str(hash).expect("valid tx hash")),
         };
 
+        let tx_hash = TxHash::parse(hash).expect("valid tx hash");
         StarknetTransaction::with_executable(
-            hash.to_string(),
+            tx_hash,
             ExecutableTx::Account(ExecutableAccountTransaction::Invoke(executable)),
         )
         .expect("matching executable hash")
@@ -2010,7 +2007,10 @@ mod tests {
             .expect("fallback");
         assert_eq!(result.receipts[0].gas_consumed, 7);
         assert_eq!(
-            state.get_storage(&ContractAddress::parse("0x1").expect("valid contract address"), "0x2"),
+            state.get_storage(
+                &ContractAddress::parse("0x1").expect("valid contract address"),
+                "0x2"
+            ),
             Ok(Some(StarknetFelt::from(999_u64)))
         );
     }

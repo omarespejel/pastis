@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::ops::Deref;
 use std::str::FromStr;
@@ -143,6 +143,8 @@ pub enum BlockValidationError {
         number: BlockNumber,
         field: &'static str,
     },
+    #[error("duplicate transaction hash '{hash}' in block {number}")]
+    DuplicateTransactionHash { number: BlockNumber, hash: TxHash },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -486,6 +488,7 @@ impl StarknetBlock {
             },
         )?;
 
+        let mut seen_hashes = HashSet::with_capacity(self.transactions.len());
         for tx in &self.transactions {
             tx.validate_hash()
                 .map_err(|source| BlockValidationError::InvalidIdentifier {
@@ -493,6 +496,12 @@ impl StarknetBlock {
                     field: "tx_hash",
                     source,
                 })?;
+            if !seen_hashes.insert(tx.hash.clone()) {
+                return Err(BlockValidationError::DuplicateTransactionHash {
+                    number: self.number,
+                    hash: tx.hash.clone(),
+                });
+            }
         }
 
         Ok(())
@@ -502,6 +511,7 @@ impl StarknetBlock {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockId {
     Number(BlockNumber),
+    Hash(BlockHash),
     Latest,
 }
 
@@ -548,6 +558,9 @@ pub trait StateReader: Send + Sync {
         key: &str,
     ) -> Result<Option<StarknetFelt>, StateReadError>;
     fn nonce_of(&self, contract: &ContractAddress) -> Result<Option<StarknetFelt>, StateReadError>;
+    fn contract_exists(&self, contract: &ContractAddress) -> Result<bool, StateReadError> {
+        Ok(self.nonce_of(contract)?.is_some())
+    }
 }
 
 pub trait MutableState: StateReader {
@@ -675,6 +688,15 @@ impl StateReader for InMemoryState {
         .map_err(|error| StateReadError::Backend(error.to_string()))?;
         Ok(self.nonces.get(&contract).copied())
     }
+
+    fn contract_exists(&self, contract: &ContractAddress) -> Result<bool, StateReadError> {
+        let contract = ContractAddress::parse(
+            canonicalize_felt_hex("contract_address", contract.as_ref())
+                .map_err(|error| StateReadError::Backend(error.to_string()))?,
+        )
+        .map_err(|error| StateReadError::Backend(error.to_string()))?;
+        Ok(self.storage.contains_key(&contract) || self.nonces.contains_key(&contract))
+    }
 }
 
 impl MutableState for InMemoryState {
@@ -683,7 +705,10 @@ impl MutableState for InMemoryState {
             Ok(value) => match ContractAddress::parse(value) {
                 Ok(parsed) => parsed,
                 Err(error) => {
-                    debug_assert!(false, "set_storage rejected canonical contract address: {error}");
+                    debug_assert!(
+                        false,
+                        "set_storage rejected canonical contract address: {error}"
+                    );
                     return;
                 }
             },
@@ -713,7 +738,10 @@ impl MutableState for InMemoryState {
             Ok(value) => match ContractAddress::parse(value) {
                 Ok(parsed) => parsed,
                 Err(error) => {
-                    debug_assert!(false, "set_nonce rejected canonical contract address: {error}");
+                    debug_assert!(
+                        false,
+                        "set_nonce rejected canonical contract address: {error}"
+                    );
                     return;
                 }
             },
@@ -786,13 +814,18 @@ mod tests {
             .entry(ContractAddress::parse("0xabc").expect("valid contract address"))
             .or_default()
             .insert("0x2".to_string(), StarknetFelt::from(7_u64));
-        diff.nonces
-            .insert(ContractAddress::parse("0xabc").expect("valid contract address"), StarknetFelt::from(2_u64));
+        diff.nonces.insert(
+            ContractAddress::parse("0xabc").expect("valid contract address"),
+            StarknetFelt::from(2_u64),
+        );
 
         state.apply_state_diff(&diff).expect("valid state diff");
 
         assert_eq!(
-            state.get_storage(&ContractAddress::parse("0xabc").expect("valid contract address"), "0x2"),
+            state.get_storage(
+                &ContractAddress::parse("0xabc").expect("valid contract address"),
+                "0x2"
+            ),
             Ok(Some(StarknetFelt::from(7_u64)))
         );
         assert_eq!(
@@ -809,15 +842,42 @@ mod tests {
             "0x0002".to_string(),
             StarknetFelt::from(9_u64),
         );
-        state.set_nonce(ContractAddress::parse("0x0001").expect("valid contract address"), StarknetFelt::from(3_u64));
+        state.set_nonce(
+            ContractAddress::parse("0x0001").expect("valid contract address"),
+            StarknetFelt::from(3_u64),
+        );
 
         assert_eq!(
-            state.get_storage(&ContractAddress::parse("0x1").expect("valid contract address"), "0x2"),
+            state.get_storage(
+                &ContractAddress::parse("0x1").expect("valid contract address"),
+                "0x2"
+            ),
             Ok(Some(StarknetFelt::from(9_u64)))
         );
         assert_eq!(
             state.nonce_of(&ContractAddress::parse("0x1").expect("valid contract address")),
             Ok(Some(StarknetFelt::from(3_u64)))
+        );
+    }
+
+    #[test]
+    fn contract_exists_detects_contracts_with_storage_even_without_nonce() {
+        let mut state = InMemoryState::default();
+        state.set_storage(
+            ContractAddress::parse("0xabc").expect("valid contract address"),
+            "0x2".to_string(),
+            StarknetFelt::from(7_u64),
+        );
+
+        assert_eq!(
+            state
+                .contract_exists(&ContractAddress::parse("0xabc").expect("valid contract address")),
+            Ok(true)
+        );
+        assert_eq!(
+            state
+                .contract_exists(&ContractAddress::parse("0xdef").expect("valid contract address")),
+            Ok(false)
         );
     }
 
@@ -829,7 +889,10 @@ mod tests {
             "0x2".to_string(),
             StarknetFelt::from(9_u64),
         );
-        state.set_nonce(ContractAddress::parse("0x1").expect("valid contract address"), StarknetFelt::from(3_u64));
+        state.set_nonce(
+            ContractAddress::parse("0x1").expect("valid contract address"),
+            StarknetFelt::from(3_u64),
+        );
 
         let snapshot = state.clone();
         assert_eq!(Arc::as_ptr(&state.storage), Arc::as_ptr(&snapshot.storage));
@@ -848,7 +911,9 @@ mod tests {
     fn rejects_blocks_with_too_many_transactions() {
         let mut txs = Vec::with_capacity(MAX_TRANSACTIONS_PER_BLOCK + 1);
         for i in 0..(MAX_TRANSACTIONS_PER_BLOCK + 1) {
-            txs.push(StarknetTransaction::new(parsed_tx_hash(&format!("0x{i:x}"))));
+            txs.push(StarknetTransaction::new(parsed_tx_hash(&format!(
+                "0x{i:x}"
+            ))));
         }
         let block = StarknetBlock {
             number: 1,
@@ -882,14 +947,54 @@ mod tests {
     }
 
     #[test]
+    fn rejects_blocks_with_duplicate_transaction_hashes() {
+        let block = StarknetBlock {
+            number: 1,
+            parent_hash: "0x0".to_string(),
+            state_root: "0x1".to_string(),
+            timestamp: 1_700_000_001,
+            sequencer_address: ContractAddress::parse("0x1").expect("valid contract address"),
+            gas_prices: BlockGasPrices {
+                l1_gas: GasPricePerToken {
+                    price_in_fri: 1,
+                    price_in_wei: 1,
+                },
+                l1_data_gas: GasPricePerToken {
+                    price_in_fri: 1,
+                    price_in_wei: 1,
+                },
+                l2_gas: GasPricePerToken {
+                    price_in_fri: 1,
+                    price_in_wei: 1,
+                },
+            },
+            protocol_version: Version::parse("0.14.2").expect("valid version"),
+            transactions: vec![
+                StarknetTransaction::new(parsed_tx_hash("0x1")),
+                StarknetTransaction::new(parsed_tx_hash("0x1")),
+            ],
+        };
+
+        let err = block
+            .validate()
+            .expect_err("must reject duplicate transaction hashes");
+        assert!(matches!(
+            err,
+            BlockValidationError::DuplicateTransactionHash { .. }
+        ));
+    }
+
+    #[test]
     fn rejects_state_diffs_with_too_many_writes() {
         let mut diff = StarknetStateDiff::default();
         let mut writes = BTreeMap::new();
         for i in 0..(MAX_STORAGE_WRITES_PER_STATE_DIFF + 1) {
             writes.insert(format!("0x{:x}", i + 1), StarknetFelt::from(i as u64));
         }
-        diff.storage_diffs
-            .insert(ContractAddress::parse("0x1").expect("valid contract address"), writes);
+        diff.storage_diffs.insert(
+            ContractAddress::parse("0x1").expect("valid contract address"),
+            writes,
+        );
 
         let err = diff
             .validate()
@@ -977,7 +1082,10 @@ mod tests {
         );
 
         let err = state
-            .get_storage(&ContractAddress::parse("0x1").expect("valid contract address"), "not-a-key")
+            .get_storage(
+                &ContractAddress::parse("0x1").expect("valid contract address"),
+                "not-a-key",
+            )
             .expect_err("invalid storage key must fail");
         assert!(matches!(err, StateReadError::Backend(message) if message.contains("storage_key")));
     }
