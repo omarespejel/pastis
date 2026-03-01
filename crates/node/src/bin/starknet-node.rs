@@ -48,6 +48,7 @@ struct DaemonConfig {
     p2p_heartbeat_ms: u64,
     health_max_consecutive_failures: u64,
     health_max_sync_lag_blocks: u64,
+    exit_on_unhealthy: bool,
 }
 
 #[derive(Clone)]
@@ -148,6 +149,7 @@ async fn main() -> Result<(), String> {
     println!("rpc_bind: {}", config.rpc_bind);
     println!("poll_ms: {}", config.poll_ms);
     println!("rpc_max_concurrency: {}", config.rpc_max_concurrency);
+    println!("exit_on_unhealthy: {}", config.exit_on_unhealthy);
     if let Some(path) = &config.local_journal_path {
         println!("local_journal_path: {path}");
     }
@@ -178,6 +180,23 @@ async fn main() -> Result<(), String> {
             _ = ticker.tick() => {
                 if let Err(error) = runtime.poll_once().await {
                     eprintln!("warning: sync poll failed: {error}");
+                }
+                let progress = runtime
+                    .sync_progress_handle()
+                    .lock()
+                    .map_err(|_| "sync progress lock poisoned".to_string())?
+                    .clone();
+                if let Some(reason) = unhealthy_exit_reason(
+                    &progress,
+                    &HealthPolicy {
+                        max_consecutive_failures: config.health_max_consecutive_failures,
+                        max_sync_lag: config.health_max_sync_lag_blocks,
+                    },
+                    config.exit_on_unhealthy,
+                ) {
+                    return Err(format!(
+                        "fatal health condition while sync loop is active: {reason}"
+                    ));
                 }
             }
         }
@@ -298,6 +317,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
     let mut cli_rpc_max_concurrency: Option<usize> = None;
     let mut cli_bootnodes: Vec<String> = Vec::new();
     let mut cli_require_peers = false;
+    let mut cli_exit_on_unhealthy = false;
     let mut cli_p2p_heartbeat_ms: Option<u64> = None;
 
     let mut args = env::args().skip(1);
@@ -387,6 +407,9 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
             "--require-peers" => {
                 cli_require_peers = true;
             }
+            "--exit-on-unhealthy" => {
+                cli_exit_on_unhealthy = true;
+            }
             "--p2p-heartbeat-ms" => {
                 let raw = args
                     .next()
@@ -473,6 +496,11 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
     } else {
         parse_env_bool("PASTIS_REQUIRE_PEERS")?.unwrap_or(false)
     };
+    let exit_on_unhealthy = if cli_exit_on_unhealthy {
+        true
+    } else {
+        parse_env_bool("PASTIS_EXIT_ON_UNHEALTHY")?.unwrap_or(false)
+    };
 
     Ok(DaemonConfig {
         upstream_rpc_url,
@@ -498,6 +526,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         p2p_heartbeat_ms,
         health_max_consecutive_failures,
         health_max_sync_lag_blocks,
+        exit_on_unhealthy,
     })
 }
 
@@ -613,6 +642,17 @@ fn classify_rpc_task_completion(
     }
 }
 
+fn unhealthy_exit_reason(
+    progress: &SyncProgress,
+    policy: &HealthPolicy,
+    exit_on_unhealthy: bool,
+) -> Option<String> {
+    if !exit_on_unhealthy {
+        return None;
+    }
+    evaluate_health(progress, policy).err()
+}
+
 fn help_text() -> String {
     format!(
         "usage: starknet-node --upstream-rpc-url <url> [options]\n\
@@ -630,6 +670,7 @@ options:\n\
   --rpc-max-concurrency <n>          Max concurrent local RPC requests (default: {DEFAULT_RPC_MAX_CONCURRENCY})\n\
   --bootnode <multiaddr>             Configure bootnode (repeatable)\n\
   --require-peers                    Fail closed when no peers are configured/available\n\
+  --exit-on-unhealthy                Exit daemon when health checks fail\n\
   --p2p-heartbeat-ms <ms>            P2P heartbeat logging interval\n\
 environment:\n\
   STARKNET_RPC_URL                   Upstream Starknet RPC URL\n\
@@ -646,6 +687,7 @@ environment:\n\
   PASTIS_RPC_MAX_CONCURRENCY         Max concurrent local RPC requests\n\
   PASTIS_BOOTNODES                   Comma-separated bootnodes\n\
   PASTIS_REQUIRE_PEERS               Require peers for sync loop health (true/false)\n\
+  PASTIS_EXIT_ON_UNHEALTHY           Exit daemon when health checks fail (true/false)\n\
   PASTIS_P2P_HEARTBEAT_MS            P2P heartbeat interval\n\
   PASTIS_HEALTH_MAX_CONSECUTIVE_FAILURES   Health failure threshold for consecutive poll failures\n\
   PASTIS_HEALTH_MAX_SYNC_LAG_BLOCKS         Health failure threshold for sync lag in blocks"
@@ -723,6 +765,32 @@ mod tests {
         let error = classify_rpc_task_completion(Ok(Err("rpc boom".to_string())))
             .expect_err("rpc server error should be propagated");
         assert_eq!(error, "rpc boom");
+    }
+
+    #[test]
+    fn unhealthy_exit_reason_is_none_when_exit_disabled() {
+        let mut progress = base_progress();
+        progress.current_block = 1;
+        progress.highest_block = 1_000;
+        let policy = HealthPolicy {
+            max_consecutive_failures: 3,
+            max_sync_lag: 64,
+        };
+        assert!(unhealthy_exit_reason(&progress, &policy, false).is_none());
+    }
+
+    #[test]
+    fn unhealthy_exit_reason_reports_failure_when_exit_enabled() {
+        let mut progress = base_progress();
+        progress.consecutive_failures = 10;
+        progress.last_error = Some("upstream timeout".to_string());
+        let policy = HealthPolicy {
+            max_consecutive_failures: 3,
+            max_sync_lag: 64,
+        };
+        let reason = unhealthy_exit_reason(&progress, &policy, true)
+            .expect("enabled unhealthy exit should surface reason");
+        assert!(reason.contains("consecutive_failures"));
     }
 
     #[tokio::test]
