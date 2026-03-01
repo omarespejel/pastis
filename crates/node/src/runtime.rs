@@ -27,6 +27,8 @@ use starknet_node_storage::{
     InMemoryStateSnapshot, InMemoryStorage, InMemoryStorageSnapshot, StorageBackend,
     ThreadSafeStorage,
 };
+#[cfg(feature = "production-adapters")]
+use starknet_node_types::ExecutableStarknetTransaction;
 use starknet_node_types::{
     BlockContext, BlockGasPrices, BuiltinStats, ClassHash, ContractAddress, ExecutionOutput,
     GasPricePerToken, InMemoryState, MutableState, SimulationResult, StarknetBlock, StarknetFelt,
@@ -558,6 +560,7 @@ struct RuntimeBlockReplay {
     sequencer_address: String,
     timestamp: u64,
     transaction_hashes: Vec<String>,
+    transactions: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -576,6 +579,7 @@ struct RuntimeBlockReceipts {
     parent_hash: String,
     state_root: Option<String>,
     transaction_hashes: Vec<String>,
+    transaction_payloads: Vec<Value>,
     receipts: Vec<StarknetReceipt>,
 }
 
@@ -1464,7 +1468,7 @@ impl UpstreamRpcClient {
             self.fetch_block_payloads(block_selector).await?;
 
         let mut warnings = Vec::new();
-        let replay = parse_block_with_txs(&block_with_txs, &mut warnings)?;
+        let mut replay = parse_block_with_txs(&block_with_txs, &mut warnings)?;
         if replay.external_block_number != block_number {
             return Err(format!(
                 "block number mismatch: requested {block_number}, getBlockWithTxs returned {}",
@@ -1476,6 +1480,7 @@ impl UpstreamRpcClient {
         compare_block_views(&replay, &hashes_view, &mut warnings);
         let receipts_view = parse_block_with_receipts(&block_with_receipts, &mut warnings)?;
         compare_receipt_view(&replay, &receipts_view, &mut warnings);
+        merge_transaction_payloads(&mut replay, &receipts_view);
 
         let tx_count_from_rpc = value_as_u64(&tx_count_raw)
             .ok_or_else(|| format!("invalid tx count payload: {tx_count_raw}"))?;
@@ -2204,14 +2209,23 @@ fn ingest_block_from_fetch(
                 replay.sequencer_address
             )
         })?;
+    if !replay.transactions.is_empty()
+        && replay.transactions.len() != replay.transaction_hashes.len()
+    {
+        return Err(format!(
+            "invalid replay block {}: transaction payload/hash count mismatch (payloads={}, hashes={})",
+            replay.external_block_number,
+            replay.transactions.len(),
+            replay.transaction_hashes.len()
+        ));
+    }
     let transactions = replay
         .transaction_hashes
         .iter()
-        .cloned()
-        .map(|hash| {
-            TxHash::parse(hash)
-                .map(StarknetTransaction::new)
-                .map_err(|error| format!("invalid replay tx hash: {error}"))
+        .enumerate()
+        .map(|(idx, hash)| {
+            let payload = replay.transactions.get(idx).unwrap_or(&Value::Null);
+            replay_transaction_from_payload(local_number, hash, payload)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let parsed_sequencer = ContractAddress::parse(sequencer_address).map_err(|error| {
@@ -2247,6 +2261,39 @@ fn ingest_block_from_fetch(
         .validate()
         .map_err(|error| format!("invalid replay block {local_number}: {error}"))?;
     Ok(block)
+}
+
+fn replay_transaction_from_payload(
+    local_block_number: u64,
+    hash: &str,
+    payload: &Value,
+) -> Result<StarknetTransaction, String> {
+    let tx_hash = TxHash::parse(hash).map_err(|error| {
+        format!("invalid replay tx hash `{hash}` for local block {local_block_number}: {error}")
+    })?;
+    #[cfg(feature = "production-adapters")]
+    {
+        if let Some(executable_raw) = payload
+            .get("__pastis_executable")
+            .or_else(|| payload.get("executable"))
+        {
+            let executable = serde_json::from_value::<ExecutableStarknetTransaction>(
+                executable_raw.clone(),
+            )
+            .map_err(|error| {
+                format!(
+                    "invalid embedded executable payload for tx {hash} at local block {local_block_number}: {error}"
+                )
+            })?;
+            return StarknetTransaction::with_executable(tx_hash, executable).map_err(|error| {
+                format!(
+                    "embedded executable payload hash mismatch for tx {hash} at local block {local_block_number}: {error}"
+                )
+            });
+        }
+    }
+    let _ = payload;
+    Ok(StarknetTransaction::new(tx_hash))
 }
 
 fn parse_block_with_txs(
@@ -2307,17 +2354,16 @@ fn parse_block_with_txs(
         .ok_or_else(|| format!("getBlockWithTxs missing transactions array: {block_with_txs}"))?;
 
     let mut transaction_hashes = Vec::with_capacity(transactions.len());
+    let mut replay_transactions = Vec::with_capacity(transactions.len());
     let mut seen_hashes = HashSet::with_capacity(transactions.len());
     for (idx, tx) in transactions.iter().enumerate() {
-        let tx_hash_raw = if let Some(raw) = tx.as_str() {
-            raw
-        } else {
-            tx.get("transaction_hash")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    format!("transaction {idx} in getBlockWithTxs missing transaction_hash: {tx}")
-                })?
-        };
+        let tx_hash_raw = tx
+            .as_str()
+            .or_else(|| tx.get("transaction_hash").and_then(Value::as_str))
+            .or_else(|| tx.get("hash").and_then(Value::as_str))
+            .ok_or_else(|| {
+                format!("transaction {idx} in getBlockWithTxs missing transaction_hash/hash: {tx}")
+            })?;
 
         let tx_hash_normalized = normalize_hex_prefix(tx_hash_raw);
         let tx_hash = StarknetFelt::from_str(&tx_hash_normalized)
@@ -2331,6 +2377,7 @@ fn parse_block_with_txs(
             ));
         }
         transaction_hashes.push(tx_hash);
+        replay_transactions.push(tx.clone());
     }
 
     if let Some(status_raw) = block_with_txs.get("status").and_then(Value::as_str) {
@@ -2358,6 +2405,7 @@ fn parse_block_with_txs(
         sequencer_address,
         timestamp,
         transaction_hashes,
+        transactions: replay_transactions,
     })
 }
 
@@ -2552,6 +2600,7 @@ fn parse_block_with_receipts(
     }
 
     let mut transaction_hashes = Vec::with_capacity(transactions.len());
+    let mut transaction_payloads = Vec::with_capacity(transactions.len());
     let mut seen_hashes = HashSet::with_capacity(transactions.len());
     for (idx, tx) in transactions.iter().enumerate() {
         let tx_hash = if let Some(raw) = tx.as_str() {
@@ -2593,6 +2642,8 @@ fn parse_block_with_receipts(
             ));
         }
         transaction_hashes.push(tx_hash);
+        let payload = tx.get("transaction").cloned().unwrap_or_else(|| tx.clone());
+        transaction_payloads.push(payload);
     }
 
     let mut parsed_receipts = Vec::with_capacity(receipt_entries.len());
@@ -2669,6 +2720,7 @@ fn parse_block_with_receipts(
         parent_hash,
         state_root,
         transaction_hashes,
+        transaction_payloads,
         receipts: parsed_receipts,
     })
 }
@@ -2746,6 +2798,43 @@ fn compare_receipt_view(
             txs_view.transaction_hashes.len(),
             receipts_view.transaction_hashes.len()
         ));
+    }
+}
+
+fn merge_transaction_payloads(
+    replay: &mut RuntimeBlockReplay,
+    receipts_view: &RuntimeBlockReceipts,
+) {
+    if replay.transactions.len() != receipts_view.transaction_payloads.len() {
+        return;
+    }
+
+    for (existing, candidate) in replay
+        .transactions
+        .iter_mut()
+        .zip(receipts_view.transaction_payloads.iter())
+    {
+        if transaction_payload_richness(candidate) > transaction_payload_richness(existing) {
+            *existing = candidate.clone();
+        }
+    }
+}
+
+fn transaction_payload_richness(payload: &Value) -> usize {
+    match payload {
+        Value::Null => 0,
+        Value::String(_) | Value::Number(_) | Value::Bool(_) => 1,
+        Value::Array(entries) => entries.len(),
+        Value::Object(map) => {
+            let mut score = map.len();
+            if map.contains_key("transaction_hash") {
+                score = score.saturating_sub(1);
+            }
+            if map.contains_key("hash") {
+                score = score.saturating_sub(1);
+            }
+            score
+        }
     }
 }
 
@@ -3536,6 +3625,7 @@ mod tests {
                 sequencer_address: "0x1".to_string(),
                 timestamp: 1_700_000_000 + external_block_number,
                 transaction_hashes: vec!["0x111".to_string()],
+                transactions: vec![json!({"transaction_hash": "0x111"})],
             },
             state_diff: StarknetStateDiff::default(),
             state_root: "0x10".to_string(),
@@ -3567,6 +3657,7 @@ mod tests {
     ) -> RuntimeFetch {
         let mut fetch = sample_fetch(external_block_number, parent_hash, block_hash);
         fetch.replay.transaction_hashes = vec![tx_hash_raw.to_string()];
+        fetch.replay.transactions = vec![json!({"transaction_hash": tx_hash_raw})];
         let tx_hash = TxHash::parse(tx_hash_raw).expect("sample tx hash should parse");
         fetch.receipts = vec![StarknetReceipt {
             tx_hash,
@@ -3575,6 +3666,23 @@ mod tests {
             gas_consumed: 7,
         }];
         fetch
+    }
+
+    #[test]
+    fn ingest_block_from_fetch_rejects_transaction_payload_hash_count_mismatch() {
+        let mut fetch = sample_fetch(1, "0x0", "0x1");
+        fetch.replay.transactions.clear();
+        fetch
+            .replay
+            .transactions
+            .push(json!({"transaction_hash": "0x111"}));
+        fetch
+            .replay
+            .transactions
+            .push(json!({"transaction_hash": "0x222"}));
+        let error = ingest_block_from_fetch(1, &fetch)
+            .expect_err("payload/hash count mismatch must fail closed");
+        assert!(error.contains("payload/hash count mismatch"));
     }
 
     #[test]
@@ -3649,6 +3757,54 @@ mod tests {
         assert_eq!(parsed.state_root, Some("0xff".to_string()));
         assert_eq!(parsed.sequencer_address, "0x1");
         assert_eq!(parsed.transaction_hashes, vec!["0x2"]);
+    }
+
+    #[test]
+    fn parse_block_with_txs_falls_back_to_hash_field() {
+        let block = json!({
+            "block_number": 12,
+            "block_hash": "0xabc",
+            "parent_hash": "0x123",
+            "sequencer_address": "0x1",
+            "timestamp": 1_700_000_012_u64,
+            "transactions": [
+                {"hash": "0x1"},
+                {"hash": "0x2"}
+            ]
+        });
+
+        let mut warnings = Vec::new();
+        let parsed = parse_block_with_txs(&block, &mut warnings).expect("must parse");
+        assert_eq!(parsed.transaction_hashes, vec!["0x1", "0x2"]);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn parse_block_with_txs_preserves_transaction_payloads() {
+        let block = json!({
+            "block_number": 12,
+            "block_hash": "0xabc",
+            "parent_hash": "0x123",
+            "sequencer_address": "0x1",
+            "timestamp": 1_700_000_012_u64,
+            "transactions": [
+                {"transaction_hash": "0x1", "type": "INVOKE", "version": "0x3"},
+                {"transaction_hash": "0x2", "type": "DECLARE", "version": "0x3"}
+            ]
+        });
+
+        let mut warnings = Vec::new();
+        let parsed = parse_block_with_txs(&block, &mut warnings).expect("must parse");
+        assert_eq!(parsed.transactions.len(), 2);
+        assert_eq!(
+            parsed.transactions[0]["type"],
+            Value::String("INVOKE".to_string())
+        );
+        assert_eq!(
+            parsed.transactions[1]["type"],
+            Value::String("DECLARE".to_string())
+        );
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -3836,6 +3992,14 @@ mod tests {
             .expect("embedded receipt wrappers should parse");
         assert_eq!(parsed.transaction_hashes, vec!["0x111", "0x222"]);
         assert_eq!(parsed.receipts.len(), 2);
+        assert_eq!(
+            parsed.transaction_payloads[0]["type"],
+            Value::String("INVOKE".to_string())
+        );
+        assert_eq!(
+            parsed.transaction_payloads[1]["type"],
+            Value::String("INVOKE".to_string())
+        );
         assert!(warnings.is_empty());
     }
 
@@ -3908,6 +4072,10 @@ mod tests {
             sequencer_address: "0x1".to_string(),
             timestamp: 1_700_000_007,
             transaction_hashes: vec!["0x1".to_string(), "0x2".to_string()],
+            transactions: vec![
+                json!({"transaction_hash": "0x1"}),
+                json!({"transaction_hash": "0x2"}),
+            ],
         };
         let hashes_view = RuntimeBlockHashes {
             external_block_number: 7,
@@ -3935,6 +4103,10 @@ mod tests {
             sequencer_address: "0x1".to_string(),
             timestamp: 1_700_000_007,
             transaction_hashes: vec!["0x1".to_string(), "0x2".to_string()],
+            transactions: vec![
+                json!({"transaction_hash": "0x1"}),
+                json!({"transaction_hash": "0x2"}),
+            ],
         };
         let receipts_view = RuntimeBlockReceipts {
             external_block_number: 7,
@@ -3942,6 +4114,7 @@ mod tests {
             parent_hash: "0xbbb".to_string(),
             state_root: Some("0x222".to_string()),
             transaction_hashes: vec!["0x1".to_string()],
+            transaction_payloads: vec![json!({"transaction_hash": "0x1"})],
             receipts: vec![StarknetReceipt {
                 tx_hash: TxHash::parse("0x1").expect("valid tx hash"),
                 execution_status: true,
@@ -3956,6 +4129,48 @@ mod tests {
         assert!(warnings[0].contains("block hash mismatch"));
         assert!(warnings[1].contains("state root mismatch"));
         assert!(warnings[2].contains("transaction hash list mismatch"));
+    }
+
+    #[test]
+    fn merge_transaction_payloads_prefers_richer_receipt_payloads() {
+        let mut replay = RuntimeBlockReplay {
+            external_block_number: 7,
+            block_hash: "0xaaa".to_string(),
+            parent_hash: "0xbbb".to_string(),
+            state_root: Some("0x111".to_string()),
+            sequencer_address: "0x1".to_string(),
+            timestamp: 1_700_000_007,
+            transaction_hashes: vec!["0x1".to_string()],
+            transactions: vec![json!({"transaction_hash": "0x1"})],
+        };
+        let receipts_view = RuntimeBlockReceipts {
+            external_block_number: 7,
+            block_hash: "0xaaa".to_string(),
+            parent_hash: "0xbbb".to_string(),
+            state_root: Some("0x111".to_string()),
+            transaction_hashes: vec!["0x1".to_string()],
+            transaction_payloads: vec![json!({
+                "transaction_hash": "0x1",
+                "type": "INVOKE",
+                "version": "0x3"
+            })],
+            receipts: vec![StarknetReceipt {
+                tx_hash: TxHash::parse("0x1").expect("valid tx hash"),
+                execution_status: true,
+                events: 0,
+                gas_consumed: 0,
+            }],
+        };
+
+        merge_transaction_payloads(&mut replay, &receipts_view);
+        assert_eq!(
+            replay.transactions[0]["type"],
+            Value::String("INVOKE".to_string())
+        );
+        assert_eq!(
+            replay.transactions[0]["version"],
+            Value::String("0x3".to_string())
+        );
     }
 
     #[test]

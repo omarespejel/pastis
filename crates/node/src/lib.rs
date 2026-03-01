@@ -687,7 +687,8 @@ mod tests {
     };
     #[cfg(feature = "production-adapters")]
     use starknet_node_types::{
-        BlockGasPrices, BlockId, ComponentHealth, GasPricePerToken, HealthCheck, HealthStatus,
+        BlockGasPrices, BlockId, ComponentHealth, ContractAddress, GasPricePerToken, HealthCheck,
+        HealthStatus, TxHash,
     };
     #[cfg(feature = "production-adapters")]
     use tempfile::tempdir;
@@ -1073,7 +1074,7 @@ mod tests {
         .expect("create executable deploy-account tx");
         let tx_hash = format!("{:#x}", executable.tx_hash.0);
         StarknetTransaction::with_executable(
-            tx_hash,
+            TxHash::parse(tx_hash).expect("valid executable transaction hash"),
             StarknetApiExecutableTransaction::Account(
                 StarknetApiExecutableAccountTransaction::DeployAccount(executable),
             ),
