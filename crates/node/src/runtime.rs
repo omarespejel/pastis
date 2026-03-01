@@ -615,6 +615,19 @@ impl NodeRuntime {
                 return Err(message);
             }
 
+            let mut staged_execution_state = self.execution_state.clone();
+            if let Err(error) =
+                apply_state_diff_checked(&mut staged_execution_state, &fetch.state_diff)
+            {
+                self.diagnostics.execution_failures =
+                    self.diagnostics.execution_failures.saturating_add(1);
+                let message = format!(
+                    "execution state update failed for local block {local_block_number} (external {external_block}): {error}"
+                );
+                self.record_failure(message.clone());
+                return Err(message);
+            }
+
             if let Some(journal) = &self.journal {
                 let journal_entry = LocalJournalEntry {
                     block: local_block_for_journal,
@@ -643,6 +656,7 @@ impl NodeRuntime {
                 self.record_failure(message.clone());
                 return Err(message);
             }
+            self.execution_state = staged_execution_state;
 
             if let Err(error) = self
                 .replay
@@ -1044,22 +1058,26 @@ fn restore_storage_from_journal(
                     idx + 1
                 )
             })?;
-        apply_state_diff_to_in_memory_state(execution_state, &entry.state_diff);
+        apply_state_diff_checked(execution_state, &entry.state_diff).map_err(|error| {
+            format!(
+                "failed to apply local journal {} entry {} to runtime execution state: {error}",
+                journal.path().display(),
+                idx + 1
+            )
+        })?;
         restored = restored.saturating_add(1);
         expected = expected.saturating_add(1);
     }
     Ok(restored)
 }
 
-fn apply_state_diff_to_in_memory_state(state: &mut InMemoryState, diff: &StarknetStateDiff) {
-    for (contract, writes) in &diff.storage_diffs {
-        for (key, value) in writes {
-            state.set_storage(contract.clone(), key.clone(), *value);
-        }
-    }
-    for (contract, nonce) in &diff.nonces {
-        state.set_nonce(contract.clone(), *nonce);
-    }
+fn apply_state_diff_checked(
+    state: &mut InMemoryState,
+    diff: &StarknetStateDiff,
+) -> Result<(), String> {
+    state
+        .apply_state_diff(diff)
+        .map_err(|error| format!("state diff application failed: {error}"))
 }
 
 struct RuntimeExecutionBackend;
@@ -1950,6 +1968,17 @@ mod tests {
         }
     }
 
+    fn sample_fetch_with_state_diff(
+        external_block_number: u64,
+        parent_hash: &str,
+        block_hash: &str,
+        state_diff: StarknetStateDiff,
+    ) -> RuntimeFetch {
+        let mut fetch = sample_fetch(external_block_number, parent_hash, block_hash);
+        fetch.state_diff = state_diff;
+        fetch
+    }
+
     #[test]
     fn parses_block_with_txs_hashes_from_objects() {
         let block = json!({
@@ -2154,6 +2183,49 @@ mod tests {
                 .latest_block_number()
                 .expect("storage read should work"),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_once_applies_state_diff_to_execution_state() {
+        let contract = ContractAddress::parse("0x123").expect("valid contract");
+        let mut diff = StarknetStateDiff::default();
+        diff.storage_diffs
+            .entry(contract.clone())
+            .or_default()
+            .insert("0x10".to_string(), StarknetFelt::from(77_u64));
+        diff.nonces
+            .insert(contract.clone(), StarknetFelt::from(2_u64));
+
+        let sync_source = Arc::new(MockSyncSource::with_blocks(
+            "SN_MAIN",
+            1,
+            vec![sample_fetch_with_state_diff(1, "0x0", "0x1", diff)],
+        ));
+        let consensus = Arc::new(HealthyConsensus);
+        let network = Arc::new(MockNetwork {
+            healthy: true,
+            peers: 3,
+        });
+        let mut runtime =
+            NodeRuntime::new_with_backends(runtime_config(), sync_source, consensus, network)
+                .expect("runtime should initialize");
+
+        runtime.poll_once().await.expect("poll should succeed");
+
+        assert_eq!(
+            runtime
+                .execution_state
+                .get_storage(&contract, "0x10")
+                .expect("read storage"),
+            Some(StarknetFelt::from(77_u64))
+        );
+        assert_eq!(
+            runtime
+                .execution_state
+                .nonce_of(&contract)
+                .expect("read nonce"),
+            Some(StarknetFelt::from(2_u64))
         );
     }
 
