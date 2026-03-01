@@ -1681,15 +1681,7 @@ impl UpstreamRpcClient {
         )
         .await
         .map_err(UpstreamBatchCallError::Failed)?;
-
-        if !http_status.is_success() {
-            let body_summary = summarize_json_for_error(&body);
-            return Err(UpstreamBatchCallError::Failed(format!(
-                "RPC batch request returned HTTP {} with body {}",
-                http_status, body_summary
-            )));
-        }
-        parse_rpc_batch_results(body, &expected)
+        parse_rpc_batch_response(http_status, body, &expected)
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -1889,6 +1881,27 @@ fn parse_rpc_batch_results(
         out.push(result);
     }
     Ok(out)
+}
+
+fn parse_rpc_batch_response(
+    http_status: reqwest::StatusCode,
+    body: Value,
+    expected: &[(u64, &'static str)],
+) -> Result<Vec<Value>, UpstreamBatchCallError> {
+    if !http_status.is_success() {
+        let body_summary = summarize_json_for_error(&body);
+        if is_batch_unsupported_payload(&body) {
+            return Err(UpstreamBatchCallError::Unsupported(format!(
+                "upstream rejected batch request with HTTP {}: {}",
+                http_status, body_summary
+            )));
+        }
+        return Err(UpstreamBatchCallError::Failed(format!(
+            "RPC batch request returned HTTP {} with body {}",
+            http_status, body_summary
+        )));
+    }
+    parse_rpc_batch_results(body, expected)
 }
 
 fn is_batch_unsupported_payload(body: &Value) -> bool {
@@ -4063,6 +4076,51 @@ mod tests {
             }
             UpstreamBatchCallError::Failed(message) => {
                 panic!("unexpected hard-failure error variant: {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_rpc_batch_response_classifies_http_invalid_request_as_unsupported_batch() {
+        let error = parse_rpc_batch_response(
+            reqwest::StatusCode::BAD_REQUEST,
+            json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {"code": -32600, "message": "batch requests are not supported"}
+            }),
+            &[(UPSTREAM_BATCH_REQUEST_ID_BASE, "starknet_first")],
+        )
+        .expect_err("HTTP invalid-request envelope should be treated as unsupported batch");
+        match error {
+            UpstreamBatchCallError::Unsupported(message) => {
+                assert!(message.contains("upstream rejected batch request"));
+                assert!(message.contains("400"));
+            }
+            UpstreamBatchCallError::Failed(message) => {
+                panic!("unexpected hard-failure error variant: {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_rpc_batch_response_keeps_http_failures_hard_when_payload_is_not_unsupported() {
+        let error = parse_rpc_batch_response(
+            reqwest::StatusCode::BAD_GATEWAY,
+            json!({
+                "jsonrpc": "2.0",
+                "id": UPSTREAM_BATCH_REQUEST_ID_BASE,
+                "error": {"code": -32000, "message": "upstream unavailable"}
+            }),
+            &[(UPSTREAM_BATCH_REQUEST_ID_BASE, "starknet_first")],
+        )
+        .expect_err("non-unsupported batch HTTP failure should remain hard");
+        match error {
+            UpstreamBatchCallError::Failed(message) => {
+                assert!(message.contains("HTTP 502"));
+            }
+            UpstreamBatchCallError::Unsupported(message) => {
+                panic!("unexpected unsupported error variant: {message}");
             }
         }
     }
