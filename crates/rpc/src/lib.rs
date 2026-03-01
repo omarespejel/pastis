@@ -218,6 +218,7 @@ impl<'a> StarknetRpcServer<'a> {
     fn execute(&self, method: &str, params: &Value) -> Result<Value, RpcError> {
         match method {
             "starknet_blockNumber" => self.block_number(params),
+            "starknet_blockHashAndNumber" => self.block_hash_and_number(params),
             "starknet_chainId" => self.chain_id(params),
             "starknet_getBlockWithTxHashes" => self.get_block_with_tx_hashes(params),
             "starknet_getBlockWithTxs" => self.get_block_with_txs(params),
@@ -243,6 +244,19 @@ impl<'a> StarknetRpcServer<'a> {
     fn chain_id(&self, params: &Value) -> Result<Value, RpcError> {
         ensure_no_params(params)?;
         Ok(json!(self.chain_id.as_str()))
+    }
+
+    fn block_hash_and_number(&self, params: &Value) -> Result<Value, RpcError> {
+        ensure_no_params(params)?;
+        let latest = self.storage.latest_block_number()?;
+        let block = self
+            .storage
+            .get_block(BlockId::Number(latest))?
+            .ok_or(RpcError::BlockNotFound)?;
+        Ok(json!({
+            "block_hash": format!("0x{:x}", block.number),
+            "block_number": block.number,
+        }))
     }
 
     fn get_block_with_txs(&self, params: &Value) -> Result<Value, RpcError> {
@@ -772,6 +786,15 @@ mod tests {
         let raw = r#"{"jsonrpc":"2.0","id":"x","method":"starknet_chainId","params":[]}"#;
         let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
         assert_eq!(value["result"], json!("SN_MAIN"));
+    }
+
+    #[test]
+    fn block_hash_and_number_works() {
+        let server = seeded_server();
+        let raw = r#"{"jsonrpc":"2.0","id":6,"method":"starknet_blockHashAndNumber","params":[]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["result"]["block_number"], json!(2));
+        assert_eq!(value["result"]["block_hash"], json!("0x2"));
     }
 
     #[test]
