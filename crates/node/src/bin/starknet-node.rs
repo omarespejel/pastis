@@ -357,7 +357,15 @@ async fn readyz(State(state): State<RpcAppState>) -> impl IntoResponse {
 
 async fn status(
     State(state): State<RpcAppState>,
+    headers: HeaderMap,
 ) -> Result<Json<StatusPayload>, (StatusCode, String)> {
+    if !is_rpc_request_authorized(&headers, state.rpc_auth_token.as_deref()) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid bearer token".to_string(),
+        ));
+    }
+
     let progress = state
         .sync_progress
         .lock()
@@ -1164,5 +1172,53 @@ mod tests {
         .await
         .into_response();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn status_rejects_missing_bearer_token_when_required() {
+        let storage = ThreadSafeStorage::new(InMemoryStorage::new(InMemoryState::default()));
+        let state = RpcAppState {
+            storage,
+            chain_id: "SN_MAIN".to_string(),
+            rpc_auth_token: Some("supersecret".to_string()),
+            sync_progress: Arc::new(Mutex::new(base_progress())),
+            health_policy: HealthPolicy {
+                max_consecutive_failures: 3,
+                max_sync_lag: 64,
+            },
+            rpc_slots: Arc::new(Semaphore::new(1)),
+        };
+
+        let response = status(State(state), HeaderMap::new())
+            .await
+            .expect_err("missing token should fail");
+        assert_eq!(response.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn status_accepts_valid_bearer_token_when_required() {
+        let storage = ThreadSafeStorage::new(InMemoryStorage::new(InMemoryState::default()));
+        let state = RpcAppState {
+            storage,
+            chain_id: "SN_MAIN".to_string(),
+            rpc_auth_token: Some("supersecret".to_string()),
+            sync_progress: Arc::new(Mutex::new(base_progress())),
+            health_policy: HealthPolicy {
+                max_consecutive_failures: 3,
+                max_sync_lag: 64,
+            },
+            rpc_slots: Arc::new(Semaphore::new(1)),
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer supersecret"),
+        );
+        let payload = status(State(state), headers)
+            .await
+            .expect("valid token should allow status access");
+        assert_eq!(payload.0.chain_id, "SN_MAIN");
+        assert_eq!(payload.0.current_block, 10);
     }
 }
