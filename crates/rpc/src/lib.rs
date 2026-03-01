@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use starknet_node_storage::{StorageBackend, StorageError};
 use starknet_node_types::{
-    BlockId, ContractAddress, StarknetBlock, StarknetFelt, StarknetStateDiff, TxHash,
+    BlockId, ContractAddress, StarknetBlock, StarknetFelt, StarknetReceipt, StarknetStateDiff,
+    TxHash,
 };
 
 const JSONRPC_VERSION: &str = "2.0";
@@ -223,6 +224,7 @@ impl<'a> StarknetRpcServer<'a> {
             "starknet_specVersion" => self.spec_version(params),
             "starknet_getBlockWithTxHashes" => self.get_block_with_tx_hashes(params),
             "starknet_getBlockWithTxs" => self.get_block_with_txs(params),
+            "starknet_getBlockWithReceipts" => self.get_block_with_receipts(params),
             "starknet_getBlockTransactionCount" => self.get_block_transaction_count(params),
             "starknet_getTransactionByBlockIdAndIndex" => {
                 self.get_transaction_by_block_id_and_index(params)
@@ -283,6 +285,28 @@ impl<'a> StarknetRpcServer<'a> {
             .get_block(block_id)?
             .ok_or(RpcError::BlockNotFound)?;
         Ok(block_with_hashes_to_json(&block))
+    }
+
+    fn get_block_with_receipts(&self, params: &Value) -> Result<Value, RpcError> {
+        let block_id = parse_block_id_param(params)?;
+        let block = self
+            .storage
+            .get_block(block_id)?
+            .ok_or(RpcError::BlockNotFound)?;
+        let mut payload = block_to_json(&block);
+        let mut receipts = Vec::with_capacity(block.transactions.len());
+        for (tx_index, tx) in block.transactions.iter().enumerate() {
+            let receipt = self
+                .storage
+                .get_transaction_receipt(&tx.hash)?
+                .map(|(_, _, receipt)| receipt)
+                .unwrap_or_else(|| default_receipt_for_hash(&tx.hash));
+            receipts.push(receipt_to_json(&receipt, block.number, tx_index));
+        }
+        if let Value::Object(map) = &mut payload {
+            map.insert("receipts".to_string(), Value::Array(receipts));
+        }
+        Ok(payload)
     }
 
     fn get_block_transaction_count(&self, params: &Value) -> Result<Value, RpcError> {
@@ -360,26 +384,9 @@ impl<'a> StarknetRpcServer<'a> {
                     .storage
                     .get_transaction_by_hash(&requested_hash)?
                     .ok_or(RpcError::TxNotFound)?;
-                (
-                    block_number,
-                    tx_index,
-                    starknet_node_types::StarknetReceipt {
-                        tx_hash: tx.hash,
-                        execution_status: true,
-                        events: 0,
-                        gas_consumed: 0,
-                    },
-                )
+                (block_number, tx_index, default_receipt_for_hash(&tx.hash))
             };
-        Ok(json!({
-            "transaction_hash": receipt.tx_hash,
-            "block_number": block_number,
-            "transaction_index": tx_index as u64,
-            "finality_status": "ACCEPTED_ON_L2",
-            "execution_status": receipt_execution_status(receipt.execution_status),
-            "events": receipt.events,
-            "gas_consumed": receipt.gas_consumed,
-        }))
+        Ok(receipt_to_json(&receipt, block_number, tx_index))
     }
 
     fn get_transaction_by_block_id_and_index(&self, params: &Value) -> Result<Value, RpcError> {
@@ -716,6 +723,27 @@ fn state_diff_to_json(diff: &StarknetStateDiff) -> Value {
     })
 }
 
+fn default_receipt_for_hash(tx_hash: &TxHash) -> StarknetReceipt {
+    StarknetReceipt {
+        tx_hash: tx_hash.clone(),
+        execution_status: true,
+        events: 0,
+        gas_consumed: 0,
+    }
+}
+
+fn receipt_to_json(receipt: &StarknetReceipt, block_number: u64, tx_index: usize) -> Value {
+    json!({
+        "transaction_hash": receipt.tx_hash,
+        "block_number": block_number,
+        "transaction_index": tx_index as u64,
+        "finality_status": "ACCEPTED_ON_L2",
+        "execution_status": receipt_execution_status(receipt.execution_status),
+        "events": receipt.events,
+        "gas_consumed": receipt.gas_consumed,
+    })
+}
+
 fn receipt_execution_status(execution_status: bool) -> &'static str {
     if execution_status {
         "SUCCEEDED"
@@ -929,6 +957,40 @@ mod tests {
     }
 
     #[test]
+    fn get_block_with_receipts_works() {
+        let server = seeded_server();
+        let raw = r#"{"jsonrpc":"2.0","id":26,"method":"starknet_getBlockWithReceipts","params":[{"block_number":2}]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["result"]["number"], json!(2));
+        assert_eq!(
+            value["result"]["receipts"][0]["transaction_hash"],
+            json!("0x1f6")
+        );
+        assert_eq!(
+            value["result"]["receipts"][0]["execution_status"],
+            json!("SUCCEEDED")
+        );
+    }
+
+    #[test]
+    fn get_block_with_receipts_reflects_reverted_receipts() {
+        let server = seeded_server_with_reverted_tx();
+        let raw = r#"{"jsonrpc":"2.0","id":27,"method":"starknet_getBlockWithReceipts","params":[{"block_number":2}]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["result"]["number"], json!(2));
+        assert_eq!(
+            value["result"]["receipts"][0]["transaction_hash"],
+            json!("0x1f6")
+        );
+        assert_eq!(
+            value["result"]["receipts"][0]["execution_status"],
+            json!("REVERTED")
+        );
+        assert_eq!(value["result"]["receipts"][0]["events"], json!(3));
+        assert_eq!(value["result"]["receipts"][0]["gas_consumed"], json!(42));
+    }
+
+    #[test]
     fn get_block_transaction_count_works() {
         let server = seeded_server();
         let raw = r#"{"jsonrpc":"2.0","id":7,"method":"starknet_getBlockTransactionCount","params":[{"block_number":2}]}"#;
@@ -1099,6 +1161,14 @@ mod tests {
     fn get_block_with_txs_returns_not_found() {
         let server = seeded_server();
         let raw = r#"{"jsonrpc":"2.0","id":2,"method":"starknet_getBlockWithTxs","params":[{"block_number":99}]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["error"]["code"], json!(ERR_BLOCK_NOT_FOUND));
+    }
+
+    #[test]
+    fn get_block_with_receipts_returns_not_found() {
+        let server = seeded_server();
+        let raw = r#"{"jsonrpc":"2.0","id":28,"method":"starknet_getBlockWithReceipts","params":[{"block_number":99}]}"#;
         let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
         assert_eq!(value["error"]["code"], json!(ERR_BLOCK_NOT_FOUND));
     }
