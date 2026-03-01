@@ -34,6 +34,8 @@ const DEFAULT_REPLAY_CHECKPOINT_PATH: &str = ".pastis/node-replay-checkpoint.jso
 const DEFAULT_LOCAL_JOURNAL_PATH: &str = ".pastis/node-local-journal.jsonl";
 const DEFAULT_STORAGE_SNAPSHOT_PATH: &str = ".pastis/node-storage.snapshot";
 const DEFAULT_P2P_HEARTBEAT_MS: u64 = 30_000;
+const MIN_NETWORK_STALE_AFTER_MS: u64 = 30_000;
+const MAX_NETWORK_STALE_AFTER_MS: u64 = 600_000;
 const DEFAULT_RPC_MAX_CONCURRENCY: usize = 256;
 const DEFAULT_RPC_RATE_LIMIT_PER_MINUTE: u32 = 1_200;
 const MAX_RPC_RATE_LIMIT_PER_MINUTE: u32 = 100_000;
@@ -193,6 +195,34 @@ struct RpcRuntimeMetrics {
     internal_error_total: u64,
 }
 
+#[derive(Debug)]
+struct BootnodeObservation {
+    peer_count: AtomicU64,
+    observed_at_unix_seconds: AtomicU64,
+}
+
+impl BootnodeObservation {
+    fn new(peer_count: u64, observed_at_unix_seconds: u64) -> Self {
+        Self {
+            peer_count: AtomicU64::new(peer_count),
+            observed_at_unix_seconds: AtomicU64::new(observed_at_unix_seconds),
+        }
+    }
+
+    fn update(&self, peer_count: u64, observed_at_unix_seconds: u64) {
+        self.peer_count.store(peer_count, Ordering::Relaxed);
+        self.observed_at_unix_seconds
+            .store(observed_at_unix_seconds, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.peer_count.load(Ordering::Relaxed),
+            self.observed_at_unix_seconds.load(Ordering::Relaxed),
+        )
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let config = parse_daemon_config()?;
@@ -227,13 +257,20 @@ async fn main() -> Result<(), String> {
             base_backoff: Duration::from_millis(config.rpc_retry_backoff_ms),
         },
         disable_batch_requests: config.disable_batch_requests,
+        network_stale_after: derive_network_stale_after(config.p2p_heartbeat_ms),
         peer_count_hint: initial_peers,
         require_peers: config.require_peers,
         storage: None,
     };
 
+    let initial_observed_at = unix_now_seconds();
+    let bootnode_observation = Arc::new(BootnodeObservation::new(
+        initial_peers as u64,
+        initial_observed_at,
+    ));
+
     let mut runtime = NodeRuntime::new(runtime_config)?;
-    runtime.report_peer_count(initial_peers);
+    runtime.report_peer_observation(initial_peers, initial_observed_at);
     let storage = runtime.storage();
     let sync_progress = runtime.sync_progress_handle();
     let chain_id = runtime.chain_id().to_string();
@@ -255,7 +292,6 @@ async fn main() -> Result<(), String> {
         rpc_metrics: Arc::new(Mutex::new(RpcRuntimeMetrics::default())),
     };
 
-    let bootnode_peer_count = Arc::new(AtomicU64::new(initial_peers as u64));
     if let Ok(mut progress) = app_state.sync_progress.lock() {
         progress.peer_count = initial_peers as u64;
     }
@@ -266,7 +302,7 @@ async fn main() -> Result<(), String> {
         let endpoints = bootnode_endpoints.clone();
         let bootnode_count = endpoints.len();
         let heartbeat_ms = config.p2p_heartbeat_ms.max(1_000);
-        let peer_counter = bootnode_peer_count.clone();
+        let observation = Arc::clone(&bootnode_observation);
         let sync_progress = app_state.sync_progress.clone();
         let heartbeat_shutdown_rx = shutdown_rx.clone();
         Some(tokio::spawn(async move {
@@ -274,7 +310,7 @@ async fn main() -> Result<(), String> {
                 endpoints,
                 bootnode_count,
                 heartbeat_ms,
-                peer_counter,
+                observation,
                 sync_progress,
                 heartbeat_shutdown_rx,
             )
@@ -366,8 +402,8 @@ async fn main() -> Result<(), String> {
                 break;
             }
             _ = ticker.tick() => {
-                let observed_peers = bootnode_peer_count.load(Ordering::Relaxed) as usize;
-                runtime.report_peer_count(observed_peers);
+                let (observed_peers, observed_at) = bootnode_observation.snapshot();
+                runtime.report_peer_observation(observed_peers as usize, observed_at);
                 if let Err(error) = runtime.poll_once().await {
                     eprintln!("warning: sync poll failed: {error}");
                 }
@@ -376,7 +412,7 @@ async fn main() -> Result<(), String> {
                     let mut progress = progress_handle
                         .lock()
                         .map_err(|_| "sync progress lock poisoned".to_string())?;
-                    progress.peer_count = observed_peers as u64;
+                    progress.peer_count = observed_peers;
                     progress.clone()
                 };
                 if let Some(reason) = unhealthy_exit_reason(
@@ -621,6 +657,14 @@ fn new_daemon_interval(period: Duration) -> tokio::time::Interval {
     ticker
 }
 
+fn derive_network_stale_after(heartbeat_ms: u64) -> Duration {
+    let heartbeat_ms = heartbeat_ms.max(1_000);
+    let stale_ms = heartbeat_ms
+        .saturating_mul(4)
+        .clamp(MIN_NETWORK_STALE_AFTER_MS, MAX_NETWORK_STALE_AFTER_MS);
+    Duration::from_millis(stale_ms)
+}
+
 async fn wait_for_shutdown_signal(shutdown_rx: &mut watch::Receiver<bool>) {
     loop {
         if *shutdown_rx.borrow() {
@@ -636,7 +680,7 @@ async fn run_bootnode_heartbeat(
     endpoints: Vec<BootnodeEndpoint>,
     bootnode_count: usize,
     heartbeat_ms: u64,
-    peer_counter: Arc<AtomicU64>,
+    observation: Arc<BootnodeObservation>,
     sync_progress: Arc<Mutex<SyncProgress>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
@@ -651,7 +695,7 @@ async fn run_bootnode_heartbeat(
             }
             _ = ticker.tick() => {
                 let reachable = probe_bootnodes(&endpoints, Duration::from_millis(1_500)).await;
-                peer_counter.store(reachable as u64, Ordering::Relaxed);
+                observation.update(reachable as u64, unix_now_seconds());
                 if let Ok(mut progress) = sync_progress.lock() {
                     progress.peer_count = reachable as u64;
                 }
@@ -1762,6 +1806,22 @@ mod tests {
     }
 
     #[test]
+    fn derive_network_stale_after_scales_with_heartbeat_and_respects_bounds() {
+        assert_eq!(
+            derive_network_stale_after(250),
+            Duration::from_millis(MIN_NETWORK_STALE_AFTER_MS)
+        );
+        assert_eq!(
+            derive_network_stale_after(30_000),
+            Duration::from_millis(120_000)
+        );
+        assert_eq!(
+            derive_network_stale_after(500_000),
+            Duration::from_millis(MAX_NETWORK_STALE_AFTER_MS)
+        );
+    }
+
+    #[test]
     fn evaluate_readiness_is_ready_when_synced_and_healthy() {
         let progress = base_progress();
         let policy = HealthPolicy {
@@ -2115,13 +2175,13 @@ mod tests {
     #[tokio::test]
     async fn bootnode_heartbeat_stops_when_shutdown_requested() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let peer_counter = Arc::new(AtomicU64::new(0));
+        let observation = Arc::new(BootnodeObservation::new(0, unix_now_seconds()));
         let sync_progress = Arc::new(Mutex::new(base_progress()));
         let heartbeat = tokio::spawn(run_bootnode_heartbeat(
             Vec::new(),
             0,
             1_000,
-            peer_counter,
+            observation,
             sync_progress,
             shutdown_rx,
         ));
@@ -2143,27 +2203,27 @@ mod tests {
         let addr = listener.local_addr().expect("listener local addr");
         let endpoints = vec![BootnodeEndpoint::Socket(addr)];
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let peer_counter = Arc::new(AtomicU64::new(0));
+        let observation = Arc::new(BootnodeObservation::new(0, unix_now_seconds()));
         let sync_progress = Arc::new(Mutex::new(base_progress()));
         let heartbeat = tokio::spawn(run_bootnode_heartbeat(
             endpoints,
             1,
             250,
-            peer_counter.clone(),
+            observation.clone(),
             sync_progress.clone(),
             shutdown_rx,
         ));
 
         tokio::time::sleep(Duration::from_millis(50)).await;
+        let (initial_peers, _) = observation.snapshot();
         assert_eq!(
-            peer_counter.load(Ordering::Relaxed),
-            0,
+            initial_peers, 0,
             "heartbeat should not probe before one full interval"
         );
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if peer_counter.load(Ordering::Relaxed) >= 1 {
+                if observation.snapshot().0 >= 1 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;

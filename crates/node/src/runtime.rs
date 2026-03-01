@@ -62,7 +62,6 @@ const UPSTREAM_BATCH_REQUEST_ID_BASE: u64 = 10_000;
 const RUNTIME_STORAGE_SNAPSHOT_VERSION: u32 = 1;
 pub const DEFAULT_STORAGE_SNAPSHOT_INTERVAL_BLOCKS: u64 = 128;
 const DEFAULT_CONSENSUS_MAX_FUTURE_SKEW_SECS: u64 = 120;
-const DEFAULT_NETWORK_STALE_AFTER_SECS: u64 = 120;
 const BATCH_MODE_AUTO: u8 = 0;
 const BATCH_MODE_SUPPORTED: u8 = 1;
 const BATCH_MODE_UNSUPPORTED: u8 = 2;
@@ -103,6 +102,7 @@ pub struct RuntimeConfig {
     pub storage_snapshot_path: Option<String>,
     pub storage_snapshot_interval_blocks: u64,
     pub disable_batch_requests: bool,
+    pub network_stale_after: Duration,
     pub storage: Option<ThreadSafeStorage<InMemoryStorage>>,
 }
 
@@ -123,6 +123,9 @@ impl RuntimeConfig {
         }
         if self.rpc_timeout.is_zero() {
             return Err("rpc_timeout must be > 0".to_string());
+        }
+        if self.network_stale_after.is_zero() {
+            return Err("network_stale_after must be > 0".to_string());
         }
         if let Some(path) = self.local_journal_path.as_deref()
             && path.trim().is_empty()
@@ -934,6 +937,9 @@ impl ConsensusBackend for ProductionConsensusBackend {
                 }
                 return Ok(ConsensusVerdict::Reject);
             }
+            if input.external_block_number > previous.block_number.saturating_add(1) {
+                return Ok(ConsensusVerdict::Reject);
+            }
             if input.external_block_number == previous.block_number.saturating_add(1)
                 && input.parent_hash != previous.block_hash
             {
@@ -956,7 +962,10 @@ impl ConsensusBackend for ProductionConsensusBackend {
 trait NetworkBackend: Send + Sync {
     fn is_healthy(&self) -> bool;
     fn peer_count(&self) -> usize;
-    fn report_peer_count(&self, _peer_count: usize) {}
+    fn report_peer_observation(&self, _peer_count: usize, _observed_at_unix_seconds: u64) {}
+    fn report_peer_count(&self, peer_count: usize) {
+        self.report_peer_observation(peer_count, unix_now_seconds());
+    }
 }
 
 struct ProductionNetworkBackend {
@@ -1002,10 +1011,15 @@ impl NetworkBackend for ProductionNetworkBackend {
         self.peer_count.load(Ordering::Relaxed)
     }
 
-    fn report_peer_count(&self, peer_count: usize) {
+    fn report_peer_observation(&self, peer_count: usize, observed_at_unix_seconds: u64) {
         self.peer_count.store(peer_count, Ordering::Relaxed);
+        let observed_at = if observed_at_unix_seconds == 0 {
+            unix_now_seconds()
+        } else {
+            observed_at_unix_seconds
+        };
         self.last_observation_unix_seconds
-            .store(unix_now_seconds(), Ordering::Relaxed);
+            .store(observed_at, Ordering::Relaxed);
         self.has_observation.store(true, Ordering::Relaxed);
     }
 }
@@ -1059,7 +1073,7 @@ impl NodeRuntime {
         let network = Arc::new(ProductionNetworkBackend::from_config(
             config.peer_count_hint,
             config.require_peers,
-            DEFAULT_NETWORK_STALE_AFTER_SECS,
+            config.network_stale_after.as_secs().max(1),
         ));
         Self::new_with_backends(config, sync_source, consensus, network)
     }
@@ -1214,6 +1228,14 @@ impl NodeRuntime {
 
     pub fn report_peer_count(&self, peer_count: usize) {
         self.network.report_peer_count(peer_count);
+        let _ = self.update_sync_progress(|progress| {
+            progress.peer_count = peer_count as u64;
+        });
+    }
+
+    pub fn report_peer_observation(&self, peer_count: usize, observed_at_unix_seconds: u64) {
+        self.network
+            .report_peer_observation(peer_count, observed_at_unix_seconds);
         let _ = self.update_sync_progress(|progress| {
             progress.peer_count = peer_count as u64;
         });
@@ -3994,6 +4016,7 @@ mod tests {
             storage_snapshot_path: None,
             storage_snapshot_interval_blocks: DEFAULT_STORAGE_SNAPSHOT_INTERVAL_BLOCKS,
             disable_batch_requests: false,
+            network_stale_after: Duration::from_secs(120),
             storage: None,
         }
     }
@@ -4139,6 +4162,16 @@ mod tests {
         let error = parse_upstream_rpc_urls("https://rpc.\nexample")
             .expect_err("control characters in URL must fail validation");
         assert!(error.contains("control characters"));
+    }
+
+    #[test]
+    fn runtime_config_validate_rejects_zero_network_stale_after() {
+        let mut config = runtime_config();
+        config.network_stale_after = Duration::ZERO;
+        let error = config
+            .validate()
+            .expect_err("zero network staleness threshold must fail");
+        assert!(error.contains("network_stale_after must be > 0"));
     }
 
     #[tokio::test]
@@ -5274,6 +5307,77 @@ mod tests {
     }
 
     #[test]
+    fn production_consensus_rejects_non_contiguous_blocks_and_future_skew() {
+        let backend = ProductionConsensusBackend::new(ProductionConsensusPolicy {
+            max_future_skew_secs: 0,
+            reject_timestamp_regression: true,
+        });
+        let now = unix_now_seconds();
+        let base = ConsensusInput {
+            external_block_number: 100,
+            block_hash: "0x100".to_string(),
+            parent_hash: "0xff".to_string(),
+            timestamp: now,
+            tx_count: 2,
+        };
+        assert_eq!(
+            backend
+                .validate_block(&base)
+                .expect("base block should validate"),
+            ConsensusVerdict::Accept
+        );
+
+        let skipped = ConsensusInput {
+            external_block_number: 102,
+            block_hash: "0x102".to_string(),
+            parent_hash: "0x101".to_string(),
+            timestamp: now,
+            tx_count: 1,
+        };
+        assert_eq!(
+            backend
+                .validate_block(&skipped)
+                .expect("skipped block should return verdict"),
+            ConsensusVerdict::Reject
+        );
+
+        let future = ConsensusInput {
+            external_block_number: 101,
+            block_hash: "0x101".to_string(),
+            parent_hash: "0x100".to_string(),
+            timestamp: now.saturating_add(30),
+            tx_count: 1,
+        };
+        assert_eq!(
+            backend
+                .validate_block(&future)
+                .expect("future-skewed block should return verdict"),
+            ConsensusVerdict::Reject
+        );
+    }
+
+    #[test]
+    fn production_consensus_rejects_excessive_transaction_counts() {
+        let backend = ProductionConsensusBackend::new(ProductionConsensusPolicy {
+            max_future_skew_secs: u64::MAX,
+            reject_timestamp_regression: true,
+        });
+        let input = ConsensusInput {
+            external_block_number: 1,
+            block_hash: "0x1".to_string(),
+            parent_hash: "0x0".to_string(),
+            timestamp: unix_now_seconds(),
+            tx_count: MAX_TRANSACTIONS_PER_BLOCK.saturating_add(1),
+        };
+        assert_eq!(
+            backend
+                .validate_block(&input)
+                .expect("oversized tx count should return verdict"),
+            ConsensusVerdict::Reject
+        );
+    }
+
+    #[test]
     fn production_network_requires_fresh_peer_observations() {
         let backend = ProductionNetworkBackend::from_config(1, true, 1);
         assert!(backend.is_healthy());
@@ -5288,6 +5392,18 @@ mod tests {
 
         backend.report_peer_count(0);
         assert!(!backend.is_healthy());
+    }
+
+    #[test]
+    fn production_network_uses_observation_timestamp_for_staleness() {
+        let backend = ProductionNetworkBackend::from_config(1, true, 2);
+        let stale_observation = unix_now_seconds().saturating_sub(30);
+        backend.report_peer_observation(2, stale_observation);
+        assert!(!backend.is_healthy());
+
+        let fresh_observation = unix_now_seconds();
+        backend.report_peer_observation(2, fresh_observation);
+        assert!(backend.is_healthy());
     }
 
     #[tokio::test]
@@ -5327,6 +5443,26 @@ mod tests {
             .poll_once()
             .await
             .expect_err("peer loss must fail closed");
+        assert!(error.contains("network backend unhealthy"));
+        assert_eq!(runtime.diagnostics().network_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn poll_once_fails_closed_when_peer_observation_is_stale() {
+        let sync_source = Arc::new(MockSyncSource::with_blocks("SN_MAIN", 0, Vec::new()));
+        let consensus = Arc::new(HealthyConsensus);
+        let network = Arc::new(ProductionNetworkBackend::from_config(1, true, 1));
+        let mut config = runtime_config();
+        config.require_peers = true;
+
+        let mut runtime = NodeRuntime::new_with_backends(config, sync_source, consensus, network)
+            .expect("runtime should initialize");
+        runtime.report_peer_observation(1, unix_now_seconds().saturating_sub(30));
+
+        let error = runtime
+            .poll_once()
+            .await
+            .expect_err("stale peer observation must fail closed");
         assert!(error.contains("network backend unhealthy"));
         assert_eq!(runtime.diagnostics().network_failures, 1);
     }
