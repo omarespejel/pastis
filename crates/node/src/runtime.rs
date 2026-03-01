@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -54,6 +54,7 @@ const MAX_RPC_RETRY_BACKOFF_MS: u64 = 5_000;
 const MAX_UPSTREAM_RPC_CONNECT_TIMEOUT_SECS: u64 = 5;
 const UPSTREAM_RPC_POOL_IDLE_TIMEOUT_SECS: u64 = 30;
 const UPSTREAM_RPC_POOL_MAX_IDLE_PER_HOST: usize = 16;
+const MAX_UPSTREAM_RPC_ENDPOINTS: usize = 16;
 const UPSTREAM_REQUEST_ID: u64 = 1;
 const UPSTREAM_BATCH_REQUEST_ID_BASE: u64 = 10_000;
 const RUNTIME_STORAGE_SNAPSHOT_VERSION: u32 = 1;
@@ -103,20 +104,7 @@ pub struct RuntimeConfig {
 
 impl RuntimeConfig {
     fn validate(&self) -> Result<(), String> {
-        if self.upstream_rpc_url.trim().is_empty() {
-            return Err("upstream_rpc_url cannot be empty".to_string());
-        }
-        let parsed = reqwest::Url::parse(self.upstream_rpc_url.trim())
-            .map_err(|error| format!("upstream_rpc_url is invalid: {error}"))?;
-        if !matches!(parsed.scheme(), "http" | "https") {
-            return Err(format!(
-                "upstream_rpc_url must use http or https, got `{}`",
-                parsed.scheme()
-            ));
-        }
-        if parsed.host_str().is_none() {
-            return Err("upstream_rpc_url must include a host".to_string());
-        }
+        let _ = parse_upstream_rpc_urls(&self.upstream_rpc_url)?;
         if self.replay_window == 0 {
             return Err("replay_window must be > 0".to_string());
         }
@@ -147,6 +135,52 @@ impl RuntimeConfig {
         }
         Ok(())
     }
+}
+
+fn parse_upstream_rpc_urls(raw: &str) -> Result<Vec<String>, String> {
+    if raw.trim().is_empty() {
+        return Err("upstream_rpc_url cannot be empty".to_string());
+    }
+
+    let mut urls = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in raw.split(',') {
+        let candidate = entry.trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        validate_upstream_rpc_url(candidate)?;
+        if seen.insert(candidate.to_string()) {
+            urls.push(candidate.to_string());
+        }
+    }
+
+    if urls.is_empty() {
+        return Err("upstream_rpc_url must include at least one valid URL".to_string());
+    }
+    if urls.len() > MAX_UPSTREAM_RPC_ENDPOINTS {
+        return Err(format!(
+            "upstream_rpc_url config has {} endpoints; max supported is {}",
+            urls.len(),
+            MAX_UPSTREAM_RPC_ENDPOINTS
+        ));
+    }
+    Ok(urls)
+}
+
+fn validate_upstream_rpc_url(raw: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(raw)
+        .map_err(|error| format!("upstream_rpc_url is invalid: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!(
+            "upstream_rpc_url must use http or https, got `{}`",
+            parsed.scheme()
+        ));
+    }
+    if parsed.host_str().is_none() {
+        return Err("upstream_rpc_url must include a host".to_string());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -651,6 +685,138 @@ trait SyncSource: Send + Sync {
     fn fetch_block(&self, block_number: u64) -> SyncSourceFuture<'_, RuntimeFetch>;
 }
 
+#[derive(Clone)]
+struct NamedSyncSource {
+    name: String,
+    source: Arc<dyn SyncSource>,
+}
+
+#[derive(Clone)]
+struct FailoverSyncSource {
+    sources: Arc<Vec<NamedSyncSource>>,
+    active_index: Arc<AtomicUsize>,
+}
+
+impl FailoverSyncSource {
+    fn new(sources: Vec<NamedSyncSource>) -> Result<Self, String> {
+        if sources.is_empty() {
+            return Err("failover sync source requires at least one endpoint".to_string());
+        }
+        Ok(Self {
+            sources: Arc::new(sources),
+            active_index: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    fn start_index(&self) -> usize {
+        let total = self.sources.len();
+        if total == 0 {
+            return 0;
+        }
+        self.active_index.load(Ordering::Relaxed) % total
+    }
+
+    fn mark_active(&self, index: usize) {
+        self.active_index.store(index, Ordering::Relaxed);
+    }
+
+    fn error_for_all_sources(operation: &str, errors: Vec<String>) -> String {
+        format!(
+            "all upstream RPC endpoints failed for {operation}: {}",
+            errors.join(" | ")
+        )
+    }
+}
+
+impl SyncSource for FailoverSyncSource {
+    fn fetch_latest_block_number(&self) -> SyncSourceFuture<'_, u64> {
+        let this = self.clone();
+        Box::pin(async move {
+            let total = this.sources.len();
+            let start = this.start_index();
+            let mut errors = Vec::with_capacity(total);
+            for offset in 0..total {
+                let index = (start + offset) % total;
+                let entry = &this.sources[index];
+                match entry.source.fetch_latest_block_number().await {
+                    Ok(result) => {
+                        this.mark_active(index);
+                        return Ok(result);
+                    }
+                    Err(error) => {
+                        errors.push(format!(
+                            "{}: {}",
+                            entry.name,
+                            sanitize_error_message(&error, MAX_RPC_ERROR_CONTEXT_CHARS)
+                        ));
+                    }
+                }
+            }
+            Err(Self::error_for_all_sources(
+                "starknet_blockHashAndNumber",
+                errors,
+            ))
+        })
+    }
+
+    fn fetch_chain_id(&self) -> SyncSourceFuture<'_, String> {
+        let this = self.clone();
+        Box::pin(async move {
+            let total = this.sources.len();
+            let start = this.start_index();
+            let mut errors = Vec::with_capacity(total);
+            for offset in 0..total {
+                let index = (start + offset) % total;
+                let entry = &this.sources[index];
+                match entry.source.fetch_chain_id().await {
+                    Ok(result) => {
+                        this.mark_active(index);
+                        return Ok(result);
+                    }
+                    Err(error) => {
+                        errors.push(format!(
+                            "{}: {}",
+                            entry.name,
+                            sanitize_error_message(&error, MAX_RPC_ERROR_CONTEXT_CHARS)
+                        ));
+                    }
+                }
+            }
+            Err(Self::error_for_all_sources("starknet_chainId", errors))
+        })
+    }
+
+    fn fetch_block(&self, block_number: u64) -> SyncSourceFuture<'_, RuntimeFetch> {
+        let this = self.clone();
+        Box::pin(async move {
+            let total = this.sources.len();
+            let start = this.start_index();
+            let mut errors = Vec::with_capacity(total);
+            for offset in 0..total {
+                let index = (start + offset) % total;
+                let entry = &this.sources[index];
+                match entry.source.fetch_block(block_number).await {
+                    Ok(result) => {
+                        this.mark_active(index);
+                        return Ok(result);
+                    }
+                    Err(error) => {
+                        errors.push(format!(
+                            "{}: {}",
+                            entry.name,
+                            sanitize_error_message(&error, MAX_RPC_ERROR_CONTEXT_CHARS)
+                        ));
+                    }
+                }
+            }
+            Err(Self::error_for_all_sources(
+                "starknet_getBlockWithTxs/getStateUpdate",
+                errors,
+            ))
+        })
+    }
+}
+
 async fn fetch_block_with_retry_from_source(
     sync_source: Arc<dyn SyncSource>,
     retry: RpcRetryConfig,
@@ -774,11 +940,28 @@ pub struct NodeRuntime {
 impl NodeRuntime {
     pub fn new(config: RuntimeConfig) -> Result<Self, String> {
         config.validate()?;
-        let sync_source = Arc::new(UpstreamRpcClient::new(
-            config.upstream_rpc_url.clone(),
-            config.rpc_timeout,
-            config.disable_batch_requests,
-        )?);
+        let upstream_rpc_urls = parse_upstream_rpc_urls(&config.upstream_rpc_url)?;
+        let sync_source: Arc<dyn SyncSource> = if upstream_rpc_urls.len() == 1 {
+            Arc::new(UpstreamRpcClient::new(
+                upstream_rpc_urls[0].clone(),
+                config.rpc_timeout,
+                config.disable_batch_requests,
+            )?)
+        } else {
+            let mut sources = Vec::with_capacity(upstream_rpc_urls.len());
+            for (index, url) in upstream_rpc_urls.iter().enumerate() {
+                let client = Arc::new(UpstreamRpcClient::new(
+                    url.clone(),
+                    config.rpc_timeout,
+                    config.disable_batch_requests,
+                )?);
+                sources.push(NamedSyncSource {
+                    name: format!("endpoint-{}({})", index + 1, redact_upstream_endpoint(url)),
+                    source: client,
+                });
+            }
+            Arc::new(FailoverSyncSource::new(sources)?)
+        };
         let consensus = Arc::new(AllowAllConsensusBackend);
         let network = Arc::new(StaticNetworkBackend::from_config(
             config.peer_count_hint,
@@ -3254,10 +3437,25 @@ fn decode_ascii_hex(hex: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+fn redact_upstream_endpoint(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
+        Ok(url) => {
+            let host = url.host_str().unwrap_or("unknown-host");
+            let port = url
+                .port()
+                .map(|value| format!(":{value}"))
+                .unwrap_or_default();
+            format!("{}://{}{port}", url.scheme(), host)
+        }
+        Err(_) => "<invalid-rpc-url>".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashSet};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use std::time::Instant;
 
@@ -3392,6 +3590,47 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct CountingSyncSource {
+        latest_result: Result<u64, String>,
+        chain_id_result: Result<String, String>,
+        block_result: Result<RuntimeFetch, String>,
+        latest_calls: Arc<AtomicUsize>,
+        chain_id_calls: Arc<AtomicUsize>,
+        block_calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingSyncSource {
+        fn new(
+            latest_result: Result<u64, &str>,
+            chain_id_result: Result<&str, &str>,
+            block_result: Result<RuntimeFetch, &str>,
+        ) -> Self {
+            Self {
+                latest_result: latest_result.map_err(std::string::ToString::to_string),
+                chain_id_result: chain_id_result
+                    .map(std::string::ToString::to_string)
+                    .map_err(std::string::ToString::to_string),
+                block_result: block_result.map_err(std::string::ToString::to_string),
+                latest_calls: Arc::new(AtomicUsize::new(0)),
+                chain_id_calls: Arc::new(AtomicUsize::new(0)),
+                block_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn latest_calls(&self) -> usize {
+            self.latest_calls.load(Ordering::Relaxed)
+        }
+
+        fn chain_id_calls(&self) -> usize {
+            self.chain_id_calls.load(Ordering::Relaxed)
+        }
+
+        fn block_calls(&self) -> usize {
+            self.block_calls.load(Ordering::Relaxed)
+        }
+    }
+
     impl SyncSource for SequenceChainIdSyncSource {
         fn fetch_latest_block_number(&self) -> SyncSourceFuture<'_, u64> {
             Box::pin(async move { Ok(0) })
@@ -3420,6 +3659,35 @@ mod tests {
                 Err(format!(
                     "fetch_block({block_number}) should not be called in this test"
                 ))
+            })
+        }
+    }
+
+    impl SyncSource for CountingSyncSource {
+        fn fetch_latest_block_number(&self) -> SyncSourceFuture<'_, u64> {
+            let result = self.latest_result.clone();
+            let calls = Arc::clone(&self.latest_calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                result
+            })
+        }
+
+        fn fetch_chain_id(&self) -> SyncSourceFuture<'_, String> {
+            let result = self.chain_id_result.clone();
+            let calls = Arc::clone(&self.chain_id_calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                result
+            })
+        }
+
+        fn fetch_block(&self, _block_number: u64) -> SyncSourceFuture<'_, RuntimeFetch> {
+            let result = self.block_result.clone();
+            let calls = Arc::clone(&self.block_calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                result
             })
         }
     }
@@ -3717,6 +3985,122 @@ mod tests {
             gas_consumed: 7,
         }];
         fetch
+    }
+
+    #[test]
+    fn parse_upstream_rpc_urls_accepts_comma_separated_values_and_deduplicates() {
+        let parsed = parse_upstream_rpc_urls(
+            " https://rpc-1.example,https://rpc-2.example:9545 , https://rpc-1.example ",
+        )
+        .expect("comma-separated upstream URLs should parse");
+        assert_eq!(
+            parsed,
+            vec![
+                "https://rpc-1.example".to_string(),
+                "https://rpc-2.example:9545".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_upstream_rpc_urls_rejects_excessive_endpoint_count() {
+        let raw = (0..=MAX_UPSTREAM_RPC_ENDPOINTS)
+            .map(|index| format!("https://rpc-{index}.example"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let error =
+            parse_upstream_rpc_urls(&raw).expect_err("too many endpoints must fail validation");
+        assert!(error.contains("max supported"));
+    }
+
+    #[test]
+    fn parse_upstream_rpc_urls_rejects_invalid_entries() {
+        let error = parse_upstream_rpc_urls("https://rpc-1.example,not-a-url")
+            .expect_err("invalid URL entry must fail validation");
+        assert!(error.contains("upstream_rpc_url is invalid"));
+    }
+
+    #[tokio::test]
+    async fn failover_sync_source_switches_to_healthy_endpoint() {
+        let primary = Arc::new(CountingSyncSource::new(
+            Ok(10),
+            Err("primary chain-id failed"),
+            Err("primary block failed"),
+        ));
+        let secondary = Arc::new(CountingSyncSource::new(
+            Ok(10),
+            Ok("SN_MAIN"),
+            Ok(sample_fetch(1, "0x0", "0x1")),
+        ));
+        let failover = FailoverSyncSource::new(vec![
+            NamedSyncSource {
+                name: "primary".to_string(),
+                source: primary.clone(),
+            },
+            NamedSyncSource {
+                name: "secondary".to_string(),
+                source: secondary.clone(),
+            },
+        ])
+        .expect("failover source should initialize");
+
+        let first_chain_id = failover
+            .fetch_chain_id()
+            .await
+            .expect("secondary endpoint should provide chain id");
+        assert_eq!(first_chain_id, "SN_MAIN");
+        assert_eq!(primary.chain_id_calls(), 1);
+        assert_eq!(secondary.chain_id_calls(), 1);
+
+        let second_chain_id = failover
+            .fetch_chain_id()
+            .await
+            .expect("active endpoint should remain on healthy secondary");
+        assert_eq!(second_chain_id, "SN_MAIN");
+        assert_eq!(primary.chain_id_calls(), 1);
+        assert_eq!(secondary.chain_id_calls(), 2);
+
+        let _ = failover
+            .fetch_block(1)
+            .await
+            .expect("block fetch should use healthy secondary endpoint");
+        assert_eq!(primary.block_calls(), 0);
+        assert_eq!(secondary.block_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn failover_sync_source_reports_all_endpoint_errors() {
+        let primary = Arc::new(CountingSyncSource::new(
+            Err("primary latest failed"),
+            Err("primary chain-id failed"),
+            Err("primary block failed"),
+        ));
+        let secondary = Arc::new(CountingSyncSource::new(
+            Err("secondary latest failed"),
+            Err("secondary chain-id failed"),
+            Err("secondary block failed"),
+        ));
+        let failover = FailoverSyncSource::new(vec![
+            NamedSyncSource {
+                name: "primary".to_string(),
+                source: primary.clone(),
+            },
+            NamedSyncSource {
+                name: "secondary".to_string(),
+                source: secondary.clone(),
+            },
+        ])
+        .expect("failover source should initialize");
+
+        let error = failover
+            .fetch_latest_block_number()
+            .await
+            .expect_err("latest block fetch must fail when all endpoints fail");
+        assert!(error.contains("all upstream RPC endpoints failed"));
+        assert!(error.contains("primary"));
+        assert!(error.contains("secondary"));
+        assert_eq!(primary.latest_calls(), 1);
+        assert_eq!(secondary.latest_calls(), 1);
     }
 
     #[test]

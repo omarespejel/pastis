@@ -298,8 +298,8 @@ async fn main() -> Result<(), String> {
     println!("starknet-node daemon starting");
     println!("chain_id: {chain_id}");
     println!(
-        "upstream_rpc_url: {}",
-        redact_rpc_url(&config.upstream_rpc_url)
+        "upstream_rpc_urls: {}",
+        redact_rpc_urls(&config.upstream_rpc_url)
     );
     println!("rpc_bind: {}", config.rpc_bind);
     println!("poll_ms: {}", config.poll_ms);
@@ -1128,18 +1128,7 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
         .ok_or_else(|| {
             "missing upstream RPC URL; pass --upstream-rpc-url or set STARKNET_RPC_URL".to_string()
         })?;
-    let parsed_url = reqwest::Url::parse(&upstream_rpc_url)
-        .map_err(|error| format!("invalid upstream RPC URL `{upstream_rpc_url}`: {error}"))?;
-    if !matches!(parsed_url.scheme(), "http" | "https") {
-        return Err(format!(
-            "invalid upstream RPC URL `{upstream_rpc_url}`: scheme must be http or https"
-        ));
-    }
-    if parsed_url.host_str().is_none() {
-        return Err(format!(
-            "invalid upstream RPC URL `{upstream_rpc_url}`: host is required"
-        ));
-    }
+    let _validated_upstreams = parse_upstream_rpc_urls(&upstream_rpc_url)?;
 
     let chain_id = match cli_chain_id {
         Some(id) => id,
@@ -1346,6 +1335,41 @@ fn parse_positive_usize(raw: &str, field: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
+fn parse_upstream_rpc_urls(raw: &str) -> Result<Vec<String>, String> {
+    if raw.trim().is_empty() {
+        return Err("invalid upstream RPC URL list: empty input".to_string());
+    }
+
+    let mut urls = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in raw.split(',') {
+        let candidate = entry.trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        let parsed = reqwest::Url::parse(candidate)
+            .map_err(|error| format!("invalid upstream RPC URL `{candidate}`: {error}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(format!(
+                "invalid upstream RPC URL `{candidate}`: scheme must be http or https"
+            ));
+        }
+        if parsed.host_str().is_none() {
+            return Err(format!(
+                "invalid upstream RPC URL `{candidate}`: host is required"
+            ));
+        }
+        if seen.insert(candidate.to_string()) {
+            urls.push(candidate.to_string());
+        }
+    }
+
+    if urls.is_empty() {
+        return Err("invalid upstream RPC URL list: no valid URLs provided".to_string());
+    }
+    Ok(urls)
+}
+
 fn validate_rpc_rate_limit_per_minute(value: u32) -> Result<u32, String> {
     if value > MAX_RPC_RATE_LIMIT_PER_MINUTE {
         return Err(format!(
@@ -1532,6 +1556,17 @@ fn redact_rpc_url(raw: &str) -> String {
     }
 }
 
+fn redact_rpc_urls(raw: &str) -> String {
+    parse_upstream_rpc_urls(raw)
+        .map(|urls| {
+            urls.iter()
+                .map(|url| redact_rpc_url(url))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_else(|_| redact_rpc_url(raw))
+}
+
 fn evaluate_health(progress: &SyncProgress, policy: &HealthPolicy) -> Result<(), String> {
     if policy.require_peers && progress.peer_count == 0 {
         return Err("unhealthy: peer_count=0 while peers are required".to_string());
@@ -1603,7 +1638,7 @@ fn unhealthy_exit_reason(
 
 fn help_text() -> String {
     format!(
-        "usage: starknet-node --upstream-rpc-url <url> [options]\n\
+        "usage: starknet-node --upstream-rpc-url <url[,url...]> [options]\n\
 options:\n\
   --rpc-bind <addr>                  JSON-RPC bind address (default: {DEFAULT_RPC_BIND})\n\
   --rpc-auth-token <token>           Require bearer token for POST / JSON-RPC\n\
@@ -1629,7 +1664,7 @@ options:\n\
   --exit-on-unhealthy                Exit daemon when health checks fail\n\
   --p2p-heartbeat-ms <ms>            P2P heartbeat logging interval\n\
 environment:\n\
-  STARKNET_RPC_URL                   Upstream Starknet RPC URL\n\
+  STARKNET_RPC_URL                   Upstream Starknet RPC URL (single URL or comma-separated failover list)\n\
   PASTIS_NODE_RPC_BIND               Local JSON-RPC bind\n\
   PASTIS_RPC_AUTH_TOKEN              Bearer token required for POST / JSON-RPC\n\
   PASTIS_ALLOW_PUBLIC_RPC_BIND       Allow non-loopback RPC bind without token (true/false)\n\
