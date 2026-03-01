@@ -1018,6 +1018,30 @@ impl StateReader for ApolloStateReaderAdapter {
             })
             .transpose()
     }
+
+    fn contract_exists(&self, contract: &ContractAddress) -> Result<bool, StateReadError> {
+        let contract = parse_contract_address(contract.as_ref()).ok_or_else(|| {
+            StateReadError::Backend(format!("invalid contract address '{contract}'"))
+        })?;
+        let txn = self
+            .reader
+            .begin_ro_txn()
+            .map_err(|error| StateReadError::Backend(error.to_string()))?;
+        let state_reader = txn
+            .get_state_reader()
+            .map_err(|error| StateReadError::Backend(error.to_string()))?;
+        if state_reader
+            .get_class_hash_at(self.state_number, &contract)
+            .map_err(|error| StateReadError::Backend(error.to_string()))?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        Ok(state_reader
+            .get_nonce_at(self.state_number, &contract)
+            .map_err(|error| StateReadError::Backend(error.to_string()))?
+            .is_some())
+    }
 }
 
 #[cfg(feature = "apollo-adapter")]
@@ -2356,6 +2380,11 @@ mod apollo_tests {
         assert_eq!(
             reader.nonce_of(&contract),
             Ok(Some(StarknetFelt::from(5_u64)))
+        );
+        assert_eq!(reader.contract_exists(&contract), Ok(true));
+        assert_eq!(
+            reader.contract_exists(&ContractAddress::parse("0x999").expect("valid contract")),
+            Ok(false)
         );
 
         let diff = adapter

@@ -861,6 +861,27 @@ mod tests {
     }
 
     #[test]
+    fn contract_exists_detects_contracts_with_storage_even_without_nonce() {
+        let mut state = InMemoryState::default();
+        state.set_storage(
+            ContractAddress::parse("0xabc").expect("valid contract address"),
+            "0x2".to_string(),
+            StarknetFelt::from(7_u64),
+        );
+
+        assert_eq!(
+            state
+                .contract_exists(&ContractAddress::parse("0xabc").expect("valid contract address")),
+            Ok(true)
+        );
+        assert_eq!(
+            state
+                .contract_exists(&ContractAddress::parse("0xdef").expect("valid contract address")),
+            Ok(false)
+        );
+    }
+
+    #[test]
     fn clone_shares_maps_until_first_mutation() {
         let mut state = InMemoryState::default();
         state.set_storage(

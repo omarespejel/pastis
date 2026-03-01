@@ -448,16 +448,21 @@ impl<'a> StarknetRpcServer<'a> {
         let (block_id, contract_address) = parse_block_id_and_contract_params(params)?;
         let block_number = self.resolve_block_number(block_id)?;
         let state_reader = self.storage.get_state_reader(block_number)?;
-        let contract_exists = state_reader
-            .contract_exists(&contract_address)
-            .map_err(|error| RpcError::StateRead(error.to_string()))?;
-        if !contract_exists {
-            return Err(RpcError::ContractNotFound);
-        }
         let nonce = state_reader
             .nonce_of(&contract_address)
-            .map_err(|error| RpcError::StateRead(error.to_string()))?
-            .unwrap_or_else(|| StarknetFelt::from(0_u8));
+            .map_err(|error| RpcError::StateRead(error.to_string()))?;
+        let nonce = match nonce {
+            Some(value) => value,
+            None => {
+                let contract_exists = state_reader
+                    .contract_exists(&contract_address)
+                    .map_err(|error| RpcError::StateRead(error.to_string()))?;
+                if !contract_exists {
+                    return Err(RpcError::ContractNotFound);
+                }
+                StarknetFelt::from(0_u8)
+            }
+        };
         Ok(json!(format!("{:#x}", nonce)))
     }
 
@@ -465,16 +470,21 @@ impl<'a> StarknetRpcServer<'a> {
         let (contract_address, storage_key, block_id) = parse_storage_at_params(params)?;
         let block_number = self.resolve_block_number(block_id)?;
         let state_reader = self.storage.get_state_reader(block_number)?;
-        let contract_exists = state_reader
-            .contract_exists(&contract_address)
-            .map_err(|error| RpcError::StateRead(error.to_string()))?;
-        if !contract_exists {
-            return Err(RpcError::ContractNotFound);
-        }
         let value = state_reader
             .get_storage(&contract_address, &storage_key)
-            .map_err(|error| RpcError::StateRead(error.to_string()))?
-            .unwrap_or_else(|| StarknetFelt::from(0_u8));
+            .map_err(|error| RpcError::StateRead(error.to_string()))?;
+        let value = match value {
+            Some(value) => value,
+            None => {
+                let contract_exists = state_reader
+                    .contract_exists(&contract_address)
+                    .map_err(|error| RpcError::StateRead(error.to_string()))?;
+                if !contract_exists {
+                    return Err(RpcError::ContractNotFound);
+                }
+                StarknetFelt::from(0_u8)
+            }
+        };
         Ok(json!(format!("{:#x}", value)))
     }
 
@@ -1239,6 +1249,21 @@ mod tests {
         StarknetRpcServer::new(leaked, "SN_MAIN")
     }
 
+    fn seeded_server_with_storage_only_contract() -> StarknetRpcServer<'static> {
+        let mut storage = InMemoryStorage::new(InMemoryState::default());
+        let mut diff = StarknetStateDiff::default();
+        let contract = ContractAddress::parse("0x3").expect("valid contract");
+        diff.storage_diffs
+            .entry(contract)
+            .or_default()
+            .insert("0x30".to_string(), StarknetFelt::from(30_u64));
+        storage
+            .insert_block_with_metadata(sample_block(1), diff, Vec::new(), Some("0x1".to_string()))
+            .expect("insert");
+        let leaked: &'static mut InMemoryStorage = Box::leak(Box::new(storage));
+        StarknetRpcServer::new(leaked, "SN_MAIN")
+    }
+
     #[test]
     fn block_number_works() {
         let server = seeded_server();
@@ -1569,6 +1594,14 @@ mod tests {
     }
 
     #[test]
+    fn get_nonce_returns_zero_for_contract_with_storage_only() {
+        let server = seeded_server_with_storage_only_contract();
+        let raw = r#"{"jsonrpc":"2.0","id":90,"method":"starknet_getNonce","params":[{"block_number":1},"0x3"]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["result"], json!("0x0"));
+    }
+
+    #[test]
     fn get_storage_at_works() {
         let server = seeded_server();
         let raw = r#"{"jsonrpc":"2.0","id":18,"method":"starknet_getStorageAt","params":["0x2","0x20",{"block_number":2}]}"#;
@@ -1590,6 +1623,14 @@ mod tests {
         let raw = r#"{"jsonrpc":"2.0","id":89,"method":"starknet_getStorageAt","params":["0x999","0x1",{"block_number":2}]}"#;
         let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
         assert_eq!(value["error"]["code"], json!(ERR_CONTRACT_NOT_FOUND));
+    }
+
+    #[test]
+    fn get_storage_at_storage_only_contract_returns_zero_for_missing_slot() {
+        let server = seeded_server_with_storage_only_contract();
+        let raw = r#"{"jsonrpc":"2.0","id":91,"method":"starknet_getStorageAt","params":["0x3","0xdead",{"block_number":1}]}"#;
+        let value: Value = serde_json::from_str(&server.handle_raw(raw)).expect("response json");
+        assert_eq!(value["result"], json!("0x0"));
     }
 
     #[test]
