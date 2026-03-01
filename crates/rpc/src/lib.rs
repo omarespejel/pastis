@@ -13,6 +13,7 @@ const ERR_INVALID_PARAMS: i64 = -32602;
 const ERR_INTERNAL: i64 = -32603;
 const ERR_BLOCK_NOT_FOUND: i64 = -32001;
 const ERR_TX_NOT_FOUND: i64 = -32003;
+const MAX_BATCH_REQUESTS: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncStatus {
@@ -109,6 +110,16 @@ impl<'a> StarknetRpcServer<'a> {
                         Value::Null,
                         ERR_INVALID_REQUEST,
                         "empty batch request",
+                    ));
+                }
+                if items.len() > MAX_BATCH_REQUESTS {
+                    return serialize_response(error_response(
+                        Value::Null,
+                        ERR_INVALID_REQUEST,
+                        format!(
+                            "batch request too large: max {MAX_BATCH_REQUESTS}, got {}",
+                            items.len()
+                        ),
                     ));
                 }
                 let mut responses = Vec::with_capacity(items.len());
@@ -256,26 +267,16 @@ impl<'a> StarknetRpcServer<'a> {
 
     fn get_transaction_by_hash(&self, params: &Value) -> Result<Value, RpcError> {
         let requested_hash = parse_tx_hash_param(params)?;
-        let latest = self.storage.latest_block_number()?;
-        for number in (1..=latest).rev() {
-            let Some(block) = self.storage.get_block(BlockId::Number(number))? else {
-                continue;
-            };
-            if let Some((index, tx)) = block
-                .transactions
-                .iter()
-                .enumerate()
-                .find(|(_, tx)| tx.hash == requested_hash)
-            {
-                return Ok(json!({
-                    "transaction_hash": tx.hash,
-                    "block_number": block.number,
-                    "transaction_index": index as u64,
-                    "type": "INVOKE",
-                }));
-            }
-        }
-        Err(RpcError::TxNotFound)
+        let (block_number, tx_index, tx) = self
+            .storage
+            .get_transaction_by_hash(&requested_hash)?
+            .ok_or(RpcError::TxNotFound)?;
+        Ok(json!({
+            "transaction_hash": tx.hash,
+            "block_number": block_number,
+            "transaction_index": tx_index as u64,
+            "type": "INVOKE",
+        }))
     }
 
     fn syncing(&self, params: &Value) -> Result<Value, RpcError> {
@@ -673,6 +674,29 @@ mod tests {
         assert_eq!(arr[0]["result"], json!(2));
         assert_eq!(arr[1]["id"], json!(2));
         assert_eq!(arr[1]["result"], json!("SN_MAIN"));
+    }
+
+    #[test]
+    fn oversized_batch_is_rejected() {
+        let server = seeded_server();
+        let mut batch = Vec::new();
+        for id in 0..(MAX_BATCH_REQUESTS + 1) {
+            batch.push(json!({
+                "jsonrpc": "2.0",
+                "id": id as u64,
+                "method": "starknet_blockNumber",
+                "params": [],
+            }));
+        }
+        let raw = serde_json::to_string(&batch).expect("serialize oversized batch");
+        let value: Value = serde_json::from_str(&server.handle_raw(&raw)).expect("response json");
+        assert_eq!(value["error"]["code"], json!(ERR_INVALID_REQUEST));
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .expect("error message")
+                .contains("batch request too large")
+        );
     }
 
     #[test]

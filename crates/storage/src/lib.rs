@@ -39,7 +39,7 @@ use starknet_node_types::StateReadError;
 use starknet_node_types::{BlockGasPrices, GasPricePerToken};
 use starknet_node_types::{
     BlockId, BlockNumber, ComponentHealth, HealthCheck, HealthStatus, InMemoryState, StarknetBlock,
-    StarknetStateDiff, StateReader,
+    StarknetStateDiff, StarknetTransaction, StateReader, TxHash,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -75,6 +75,16 @@ pub enum StorageError {
     InvalidStateDiff(String),
     #[error("state limits exceeded while applying diff: {0}")]
     StateLimitExceeded(String),
+    #[error(
+        "transaction hash {hash} already exists in block {existing_block}; cannot insert duplicate in block {new_block}"
+    )]
+    DuplicateTransactionHash {
+        hash: TxHash,
+        existing_block: BlockNumber,
+        new_block: BlockNumber,
+    },
+    #[error("storage backend index inconsistency: {0}")]
+    IndexInconsistency(String),
     #[cfg(feature = "apollo-adapter")]
     #[error("apollo storage error: {0}")]
     Apollo(String),
@@ -119,6 +129,26 @@ pub trait StorageBackend: Send + Sync + HealthCheck {
         block_number: BlockNumber,
     ) -> Result<Option<StarknetStateDiff>, StorageError>;
     fn latest_block_number(&self) -> Result<BlockNumber, StorageError>;
+    fn get_transaction_by_hash(
+        &self,
+        hash: &TxHash,
+    ) -> Result<Option<(BlockNumber, usize, StarknetTransaction)>, StorageError> {
+        let latest = self.latest_block_number()?;
+        for number in (1..=latest).rev() {
+            let Some(block) = self.get_block(BlockId::Number(number))? else {
+                continue;
+            };
+            if let Some((index, tx)) = block
+                .transactions
+                .iter()
+                .enumerate()
+                .find(|(_, tx)| tx.hash == *hash)
+            {
+                return Ok(Some((number, index, tx.clone())));
+            }
+        }
+        Ok(None)
+    }
     fn current_state_root(&self) -> Result<String, StorageError>;
     fn state_root_semantics(&self) -> StateRootSemantics {
         StateRootSemantics::Canonical
@@ -247,6 +277,7 @@ pub struct InMemoryStorage {
     blocks: BTreeMap<BlockNumber, StarknetBlock>,
     state_diffs: BTreeMap<BlockNumber, StarknetStateDiff>,
     states: BTreeMap<BlockNumber, InMemoryState>,
+    tx_index: BTreeMap<TxHash, (BlockNumber, usize)>,
 }
 
 impl InMemoryStorage {
@@ -257,6 +288,7 @@ impl InMemoryStorage {
             blocks: BTreeMap::new(),
             state_diffs: BTreeMap::new(),
             states,
+            tx_index: BTreeMap::new(),
         }
     }
 }
@@ -346,8 +378,21 @@ impl StorageBackend for InMemoryStorage {
                 parent_timestamp: parent_block.timestamp,
             });
         }
+        for tx in &block.transactions {
+            if let Some((existing_block, _)) = self.tx_index.get(&tx.hash) {
+                return Err(StorageError::DuplicateTransactionHash {
+                    hash: tx.hash.clone(),
+                    existing_block: *existing_block,
+                    new_block: block.number,
+                });
+            }
+        }
 
-        self.blocks.insert(block.number, block);
+        let block_number = block.number;
+        for (index, tx) in block.transactions.iter().enumerate() {
+            self.tx_index.insert(tx.hash.clone(), (block_number, index));
+        }
+        self.blocks.insert(block_number, block);
         self.state_diffs.insert(expected, state_diff);
         self.states.insert(expected, next_state);
         Ok(())
@@ -374,6 +419,32 @@ impl StorageBackend for InMemoryStorage {
 
     fn latest_block_number(&self) -> Result<BlockNumber, StorageError> {
         Ok(self.blocks.keys().next_back().copied().unwrap_or(0))
+    }
+
+    fn get_transaction_by_hash(
+        &self,
+        hash: &TxHash,
+    ) -> Result<Option<(BlockNumber, usize, StarknetTransaction)>, StorageError> {
+        let Some((block_number, tx_index)) = self.tx_index.get(hash).copied() else {
+            return Ok(None);
+        };
+        let block = self.blocks.get(&block_number).ok_or_else(|| {
+            StorageError::IndexInconsistency(format!(
+                "tx index points to missing block {block_number} for hash {hash}"
+            ))
+        })?;
+        let tx = block.transactions.get(tx_index).ok_or_else(|| {
+            StorageError::IndexInconsistency(format!(
+                "tx index points to missing transaction index {tx_index} in block {block_number} for hash {hash}"
+            ))
+        })?;
+        if tx.hash != *hash {
+            return Err(StorageError::IndexInconsistency(format!(
+                "tx index hash mismatch for block {block_number} index {tx_index}: indexed {hash}, found {}",
+                tx.hash
+            )));
+        }
+        Ok(Some((block_number, tx_index, tx.clone())))
     }
 
     fn current_state_root(&self) -> Result<String, StorageError> {
@@ -590,20 +661,16 @@ fn map_thin_state_diff(diff: ApolloThinStateDiff) -> Result<StarknetStateDiff, S
         );
     }
     for class_hash in diff.class_hash_to_compiled_class_hash.keys() {
-        mapped
-            .declared_classes
-            .push(
-                starknet_node_types::ClassHash::parse(format!("{:#x}", class_hash.0))
-                    .expect("valid class hash"),
-            );
+        mapped.declared_classes.push(
+            starknet_node_types::ClassHash::parse(format!("{:#x}", class_hash.0))
+                .expect("valid class hash"),
+        );
     }
     for class_hash in &diff.deprecated_declared_classes {
-        mapped
-            .declared_classes
-            .push(
-                starknet_node_types::ClassHash::parse(format!("{:#x}", class_hash.0))
-                    .expect("valid class hash"),
-            );
+        mapped.declared_classes.push(
+            starknet_node_types::ClassHash::parse(format!("{:#x}", class_hash.0))
+                .expect("valid class hash"),
+        );
     }
     Ok(mapped)
 }
@@ -906,10 +973,17 @@ mod tests {
             },
             protocol_version: Version::parse("0.14.2").expect("valid semver"),
             transactions: vec![StarknetTransaction::new(
-                starknet_node_types::TxHash::parse(format!("0x{number:x}"))
-                    .expect("valid tx hash"),
+                starknet_node_types::TxHash::parse(format!("0x{number:x}")).expect("valid tx hash"),
             )],
         }
+    }
+
+    fn block_with_tx_hash(number: BlockNumber, tx_hash: &str) -> StarknetBlock {
+        let mut block = block(number);
+        block.transactions = vec![StarknetTransaction::new(
+            starknet_node_types::TxHash::parse(tx_hash).expect("valid tx hash"),
+        )];
+        block
     }
 
     fn diff_with_balance(contract: &str, value: u64) -> StarknetStateDiff {
@@ -932,9 +1006,58 @@ mod tests {
 
         let reader = storage.get_state_reader(1).expect("state reader");
         assert_eq!(
-            reader.get_storage(&ContractAddress::parse("0xabc").expect("valid contract address"), "0x2"),
+            reader.get_storage(
+                &ContractAddress::parse("0xabc").expect("valid contract address"),
+                "0x2"
+            ),
             Ok(Some(StarknetFelt::from(11_u64)))
         );
+    }
+
+    #[test]
+    fn indexed_transaction_lookup_returns_location_and_transaction() {
+        let mut storage = InMemoryStorage::new(InMemoryState::default());
+        storage
+            .insert_block(block(1), StarknetStateDiff::default())
+            .expect("insert block 1");
+        storage
+            .insert_block(block(2), StarknetStateDiff::default())
+            .expect("insert block 2");
+
+        let lookup_hash = starknet_node_types::TxHash::parse("0x2").expect("valid tx hash");
+        let found = storage
+            .get_transaction_by_hash(&lookup_hash)
+            .expect("lookup should succeed")
+            .expect("transaction should exist");
+        assert_eq!(found.0, 2);
+        assert_eq!(found.1, 0);
+        assert_eq!(found.2.hash, lookup_hash);
+    }
+
+    #[test]
+    fn rejects_duplicate_transaction_hash_across_blocks() {
+        let mut storage = InMemoryStorage::new(InMemoryState::default());
+        storage
+            .insert_block(
+                block_with_tx_hash(1, "0xdeadbeef"),
+                StarknetStateDiff::default(),
+            )
+            .expect("insert block 1");
+
+        let err = storage
+            .insert_block(
+                block_with_tx_hash(2, "0xdeadbeef"),
+                StarknetStateDiff::default(),
+            )
+            .expect_err("duplicate tx hash must fail");
+        assert!(matches!(
+            err,
+            StorageError::DuplicateTransactionHash {
+                existing_block: 1,
+                new_block: 2,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1040,7 +1163,10 @@ mod tests {
         let storage = writer.clone();
         let handle = std::thread::spawn(move || {
             let reader = storage.get_state_reader(1).expect("state reader");
-            reader.get_storage(&ContractAddress::parse("0xabc").expect("valid contract address"), "0x2")
+            reader.get_storage(
+                &ContractAddress::parse("0xabc").expect("valid contract address"),
+                "0x2",
+            )
         });
 
         assert_eq!(
