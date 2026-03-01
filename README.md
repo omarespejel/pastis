@@ -38,7 +38,7 @@ This repository currently ships core, tested building blocks:
 - JSON-RPC server request handler with strict JSON-RPC 2.0 validation and Starknet core method coverage
 - Type-state node builder that enforces composition order
 - Daemon runtime defaults to production backends (strict consensus guardrails + dynamic peer-health checks)
-- Daemon strict canonical toggle (`--strict-canonical-execution` / `PASTIS_STRICT_CANONICAL_EXECUTION=true`) to fail closed when executable payload coverage is incomplete
+- Daemon strict canonical toggle (`--strict-canonical-execution` / `PASTIS_STRICT_CANONICAL_EXECUTION=true`) to fail closed when executable payload coverage is incomplete (enabled by default in `production-adapters` builds)
 
 Source entry points:
 

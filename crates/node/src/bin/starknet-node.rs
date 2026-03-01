@@ -1264,7 +1264,8 @@ fn parse_daemon_config() -> Result<DaemonConfig, String> {
     let strict_canonical_execution = if cli_strict_canonical_execution {
         true
     } else {
-        parse_env_bool("PASTIS_STRICT_CANONICAL_EXECUTION")?.unwrap_or(false)
+        parse_env_bool("PASTIS_STRICT_CANONICAL_EXECUTION")?
+            .unwrap_or(default_strict_canonical_execution())
     };
     let p2p_heartbeat_ms = match cli_p2p_heartbeat_ms {
         Some(value) => value,
@@ -1372,6 +1373,10 @@ fn parse_env_bool(name: &str) -> Result<Option<bool>, String> {
         }
         Err(_) => Ok(None),
     }
+}
+
+fn default_strict_canonical_execution() -> bool {
+    cfg!(feature = "production-adapters")
 }
 
 fn parse_positive_u64(raw: &str, field: &str) -> Result<u64, String> {
@@ -1737,7 +1742,7 @@ options:\n\
   --rpc-max-concurrency <n>          Max concurrent local RPC requests (default: {DEFAULT_RPC_MAX_CONCURRENCY})\n\
   --rpc-rate-limit-per-minute <n>    Per-IP RPC request rate limit (0 disables; default: {DEFAULT_RPC_RATE_LIMIT_PER_MINUTE})\n\
   --disable-upstream-batch           Disable outbound upstream JSON-RPC batch requests\n\
-  --strict-canonical-execution       Fail closed unless canonical execution is available for committed blocks\n\
+  --strict-canonical-execution       Fail closed unless canonical execution is available for committed blocks (default: enabled with production-adapters builds)\n\
   --bootnode <multiaddr>             Configure bootnode (repeatable)\n\
   --require-peers                    Fail closed when no peers are configured/available\n\
   --exit-on-unhealthy                Exit daemon when health checks fail\n\
@@ -1762,7 +1767,7 @@ environment:\n\
   PASTIS_RPC_MAX_CONCURRENCY         Max concurrent local RPC requests\n\
   PASTIS_RPC_RATE_LIMIT_PER_MINUTE   Per-IP RPC request rate limit (0 disables)\n\
   PASTIS_DISABLE_UPSTREAM_BATCH      Disable outbound upstream JSON-RPC batch requests (true/false)\n\
-  PASTIS_STRICT_CANONICAL_EXECUTION  Require canonical execution for committed blocks (true/false)\n\
+  PASTIS_STRICT_CANONICAL_EXECUTION  Require canonical execution for committed blocks (true/false; default=true with production-adapters)\n\
   PASTIS_BOOTNODES                   Comma-separated bootnodes\n\
   PASTIS_REQUIRE_PEERS               Require peers for sync loop health (true/false)\n\
   PASTIS_EXIT_ON_UNHEALTHY           Exit daemon when health checks fail (true/false)\n\
@@ -2017,6 +2022,18 @@ mod tests {
             .expect_err("malformed URL must fail");
         assert!(!error.contains("supersecret"));
         assert!(error.contains("invalid upstream RPC URL entry"));
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn strict_canonical_defaults_enabled_for_production_builds() {
+        assert!(default_strict_canonical_execution());
+    }
+
+    #[cfg(not(feature = "production-adapters"))]
+    #[test]
+    fn strict_canonical_defaults_disabled_without_production_adapters() {
+        assert!(!default_strict_canonical_execution());
     }
 
     #[tokio::test]
