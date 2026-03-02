@@ -21,6 +21,21 @@ use crate::replay::{
 };
 use crate::{ChainId, NodeConfig, StarknetNode, StarknetNodeBuilder};
 #[cfg(feature = "production-adapters")]
+use blockifier::execution::contract_class::RunnableCompiledClass;
+#[cfg(feature = "production-adapters")]
+use blockifier::state::errors::StateError;
+#[cfg(feature = "production-adapters")]
+use starknet_api::contract_class::compiled_class_hash::{HashVersion, HashableCompiledClass};
+#[cfg(feature = "production-adapters")]
+use starknet_api::contract_class::{ContractClass as ApiContractClass, VersionedCasm};
+#[cfg(feature = "production-adapters")]
+use starknet_api::core::{
+    ClassHash as ApiClassHash, CompiledClassHash as ApiCompiledClassHash,
+    ContractAddress as ApiContractAddress,
+};
+#[cfg(feature = "production-adapters")]
+use starknet_api::deprecated_contract_class::ContractClass as ApiDeprecatedContractClass;
+#[cfg(feature = "production-adapters")]
 use starknet_api::executable_transaction::{
     AccountTransaction as ApiExecutableAccountTransaction,
     DeployAccountTransaction as ApiExecutableDeployAccountTransaction,
@@ -36,7 +51,7 @@ use starknet_api::transaction::{
     InvokeTransaction as ApiInvokeTransaction, TransactionHash as ApiTransactionHash,
 };
 #[cfg(feature = "production-adapters")]
-use starknet_node_execution::BlockifierVmBackend;
+use starknet_node_execution::{BlockifierClassProvider, BlockifierVmBackend};
 use starknet_node_execution::{
     DualExecutionBackend, ExecutionBackend, ExecutionError, ExecutionMode, MismatchPolicy,
 };
@@ -52,6 +67,8 @@ use starknet_node_types::{
     StarknetBlock, StarknetFelt, StarknetReceipt, StarknetStateDiff, StarknetTransaction,
     StateReader, TxHash,
 };
+#[cfg(feature = "production-adapters")]
+use std::cell::RefCell;
 
 pub const DEFAULT_SYNC_POLL_MS: u64 = 1_500;
 pub const DEFAULT_REPLAY_WINDOW: u64 = 64;
@@ -74,6 +91,12 @@ const MAX_UPSTREAM_RPC_CONNECT_TIMEOUT_SECS: u64 = 5;
 const UPSTREAM_RPC_POOL_IDLE_TIMEOUT_SECS: u64 = 30;
 const UPSTREAM_RPC_POOL_MAX_IDLE_PER_HOST: usize = 16;
 const MAX_UPSTREAM_RPC_ENDPOINTS: usize = 16;
+#[cfg(feature = "production-adapters")]
+const MAX_RUNTIME_CLASS_PROVIDER_BINDINGS: usize = 32_768;
+#[cfg(feature = "production-adapters")]
+const MAX_RUNTIME_CLASS_HASH_CACHE_ENTRIES: usize = 32_768;
+#[cfg(feature = "production-adapters")]
+const MAX_RUNTIME_COMPILED_CLASS_CACHE_ENTRIES: usize = 8_192;
 const UPSTREAM_REQUEST_ID: u64 = 1;
 const UPSTREAM_BATCH_REQUEST_ID_BASE: u64 = 10_000;
 const RUNTIME_STORAGE_SNAPSHOT_VERSION: u32 = 1;
@@ -1055,6 +1078,8 @@ pub struct NodeRuntime {
     consensus: Arc<dyn ConsensusBackend>,
     network: Arc<dyn NetworkBackend>,
     node: RuntimeNode,
+    #[cfg(feature = "production-adapters")]
+    runtime_class_provider: Arc<RuntimeRpcClassProvider>,
     execution_state: InMemoryState,
     journal: Option<LocalChainJournal>,
     replay: ReplayPipeline,
@@ -1111,6 +1136,7 @@ impl NodeRuntime {
         network: Arc<dyn NetworkBackend>,
     ) -> Result<Self, String> {
         config.validate()?;
+        let class_provider_rpc_urls = parse_upstream_rpc_urls(&config.upstream_rpc_url)?;
         let mut replay = new_replay_pipeline(
             config.replay_window,
             config.max_replay_per_poll,
@@ -1139,12 +1165,17 @@ impl NodeRuntime {
         } else {
             ThreadSafeStorage::new(InMemoryStorage::new(InMemoryState::default()))
         };
-        let mut node = build_runtime_node(
+        let runtime_node_build = build_runtime_node(
             config.chain_id.clone(),
             storage,
             config.strict_canonical_execution,
             config.allow_synthetic_execution_fallback,
-        );
+            &class_provider_rpc_urls,
+            config.rpc_timeout,
+        )?;
+        let mut node = runtime_node_build.node;
+        #[cfg(feature = "production-adapters")]
+        let runtime_class_provider = runtime_node_build.class_provider;
         let journal = config
             .local_journal_path
             .as_deref()
@@ -1217,6 +1248,8 @@ impl NodeRuntime {
             consensus,
             network,
             node,
+            #[cfg(feature = "production-adapters")]
+            runtime_class_provider,
             execution_state,
             journal,
             replay,
@@ -1402,6 +1435,9 @@ impl NodeRuntime {
 
             let base_execution_state = self.execution_state.clone();
             let mut execution_validation_state = base_execution_state.clone();
+            #[cfg(feature = "production-adapters")]
+            self.runtime_class_provider
+                .bind_external_block_for_local(local_block_number, external_block);
             let execution_output = match self
                 .node
                 .execution
@@ -2440,35 +2476,618 @@ impl SyncSource for UpstreamRpcClient {
     }
 }
 
+#[cfg(feature = "production-adapters")]
+trait RuntimeClassRpcClient: Send + Sync {
+    fn call(&self, method: &str, params: Value) -> Result<Value, String>;
+}
+
+#[cfg(feature = "production-adapters")]
+struct RuntimeClassRpcTransport {
+    http: reqwest::Client,
+    rpc_urls: Vec<String>,
+}
+
+#[cfg(feature = "production-adapters")]
+impl RuntimeClassRpcTransport {
+    fn new(rpc_urls: &[String], timeout: Duration) -> Result<Self, String> {
+        if rpc_urls.is_empty() {
+            return Err("runtime class provider requires at least one RPC endpoint".to_string());
+        }
+        let connect_timeout = derive_upstream_connect_timeout(timeout);
+        let http = reqwest::Client::builder()
+            .timeout(timeout)
+            .connect_timeout(connect_timeout)
+            .read_timeout(timeout)
+            .pool_idle_timeout(Duration::from_secs(UPSTREAM_RPC_POOL_IDLE_TIMEOUT_SECS))
+            .pool_max_idle_per_host(UPSTREAM_RPC_POOL_MAX_IDLE_PER_HOST)
+            .tcp_nodelay(true)
+            .build()
+            .map_err(|error| {
+                format!("failed to build runtime class-provider HTTP client: {error}")
+            })?;
+        Ok(Self {
+            http,
+            rpc_urls: rpc_urls.to_vec(),
+        })
+    }
+
+    async fn call_async(&self, method: &str, params: Value) -> Result<Value, String> {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": UPSTREAM_REQUEST_ID,
+            "method": method,
+            "params": params,
+        });
+        let mut errors = Vec::new();
+        for rpc_url in &self.rpc_urls {
+            let mut response = match self.http.post(rpc_url).json(&request).send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    let redacted = redact_upstream_url(error.to_string(), rpc_url);
+                    errors.push(format!(
+                        "{}: request failed: {}",
+                        redact_upstream_endpoint(rpc_url),
+                        sanitize_error_message(&redacted, MAX_RPC_ERROR_CONTEXT_CHARS)
+                    ));
+                    continue;
+                }
+            };
+            let http_status = response.status();
+            let content_length = response.content_length();
+            let body = match read_json_body_with_limit(
+                &mut response,
+                content_length,
+                MAX_UPSTREAM_RPC_RESPONSE_BYTES,
+                method,
+            )
+            .await
+            {
+                Ok(body) => body,
+                Err(error) => {
+                    errors.push(format!(
+                        "{}: {}",
+                        redact_upstream_endpoint(rpc_url),
+                        sanitize_error_message(&error, MAX_RPC_ERROR_CONTEXT_CHARS)
+                    ));
+                    continue;
+                }
+            };
+            if !http_status.is_success() {
+                errors.push(format!(
+                    "{}: HTTP {} with body {}",
+                    redact_upstream_endpoint(rpc_url),
+                    http_status,
+                    summarize_json_for_error(&body)
+                ));
+                continue;
+            }
+            match parse_rpc_result(body, method, UPSTREAM_REQUEST_ID) {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    errors.push(format!(
+                        "{}: {}",
+                        redact_upstream_endpoint(rpc_url),
+                        sanitize_error_message(&error, MAX_RPC_ERROR_CONTEXT_CHARS)
+                    ));
+                }
+            }
+        }
+
+        Err(format!(
+            "all runtime class-provider RPC endpoints failed for {method}: {}",
+            errors.join(" | ")
+        ))
+    }
+}
+
+#[cfg(feature = "production-adapters")]
+impl RuntimeClassRpcClient for RuntimeClassRpcTransport {
+    fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+        let future = self.call_async(method, params);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            return tokio::task::block_in_place(|| handle.block_on(future));
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                format!("failed to build runtime for class-provider RPC call {method}: {error}")
+            })?;
+        runtime.block_on(future)
+    }
+}
+
+#[cfg(feature = "production-adapters")]
+fn rpc_error_indicates_method_not_found(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("method not found") || lower.contains("\"code\":-32601")
+}
+
+#[cfg(feature = "production-adapters")]
+fn rpc_error_indicates_absent_contract(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("contract not found")
+        || lower.contains("contract_not_found")
+        || lower.contains("uninitialized contract")
+}
+
+#[cfg(feature = "production-adapters")]
+#[derive(Debug, Clone, Copy)]
+struct RuntimeClassProviderContext {
+    lookup_external_block: u64,
+}
+
+#[cfg(feature = "production-adapters")]
+#[derive(Default)]
+struct RuntimeClassProviderCache {
+    class_hash_by_contract_at_block: BTreeMap<(u64, String), ApiClassHash>,
+    compiled_class_by_hash_at_block: BTreeMap<(u64, String), RunnableCompiledClass>,
+    compiled_class_hash_by_hash_at_block: BTreeMap<(u64, String), ApiCompiledClassHash>,
+}
+
+#[cfg(feature = "production-adapters")]
+struct RuntimeRpcClassProvider {
+    rpc: Arc<dyn RuntimeClassRpcClient>,
+    instance_id: u64,
+    local_to_external: Mutex<BTreeMap<u64, u64>>,
+    cache: Mutex<RuntimeClassProviderCache>,
+}
+
+#[cfg(feature = "production-adapters")]
+impl RuntimeRpcClassProvider {
+    fn next_instance_id() -> u64 {
+        static NEXT_RUNTIME_CLASS_PROVIDER_ID: AtomicU64 = AtomicU64::new(1);
+        NEXT_RUNTIME_CLASS_PROVIDER_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn with_thread_local_state<T>(
+        f: impl FnOnce(&mut BTreeMap<u64, RuntimeClassProviderContext>) -> T,
+    ) -> T {
+        thread_local! {
+            static STATE_BY_PROVIDER_ID: RefCell<BTreeMap<u64, RuntimeClassProviderContext>> =
+                const { RefCell::new(BTreeMap::new()) };
+        }
+        STATE_BY_PROVIDER_ID.with(|state| f(&mut state.borrow_mut()))
+    }
+
+    fn new(rpc_urls: &[String], timeout: Duration) -> Result<Self, String> {
+        let transport = Arc::new(RuntimeClassRpcTransport::new(rpc_urls, timeout)?);
+        Ok(Self::with_rpc_client(transport))
+    }
+
+    fn with_rpc_client(rpc: Arc<dyn RuntimeClassRpcClient>) -> Self {
+        Self {
+            rpc,
+            instance_id: Self::next_instance_id(),
+            local_to_external: Mutex::new(BTreeMap::new()),
+            cache: Mutex::new(RuntimeClassProviderCache::default()),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_test_rpc_client(rpc: Arc<dyn RuntimeClassRpcClient>) -> Self {
+        Self::with_rpc_client(rpc)
+    }
+
+    fn bind_external_block_for_local(&self, local_block_number: u64, external_block_number: u64) {
+        if let Ok(mut mapping) = self.local_to_external.lock() {
+            mapping.insert(local_block_number, external_block_number);
+            while mapping.len() > MAX_RUNTIME_CLASS_PROVIDER_BINDINGS {
+                if let Some(oldest) = mapping.first_key_value().map(|(key, _)| *key) {
+                    mapping.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn prestate_external_block(external_block_number: u64) -> u64 {
+        external_block_number.saturating_sub(1)
+    }
+
+    fn state_read_error(message: impl Into<String>) -> StateError {
+        StateError::StateReadError(message.into())
+    }
+
+    fn write_context(&self, context: RuntimeClassProviderContext) {
+        Self::with_thread_local_state(|state| {
+            state.insert(self.instance_id, context);
+        });
+    }
+
+    fn read_context(&self) -> Result<RuntimeClassProviderContext, StateError> {
+        Self::with_thread_local_state(|state| {
+            state.get(&self.instance_id).copied().ok_or_else(|| {
+                Self::state_read_error(format!(
+                    "runtime class provider state is uninitialized on this thread; \
+                     call prepare_for_block_execution/prepare_for_simulation before reads \
+                     (provider_id={})",
+                    self.instance_id
+                ))
+            })
+        })
+    }
+
+    fn resolve_external_for_local(&self, local_block_number: u64) -> Result<u64, StateError> {
+        let mapping = self.local_to_external.lock().map_err(|_| {
+            Self::state_read_error("runtime class provider local/external map lock poisoned")
+        })?;
+        mapping.get(&local_block_number).copied().ok_or_else(|| {
+            Self::state_read_error(format!(
+                "runtime class provider missing external block mapping for local block {local_block_number}; \
+                 sync loop must bind local->external before canonical execution"
+            ))
+        })
+    }
+
+    fn block_selector(external_block_number: u64) -> Value {
+        json!({ "block_number": external_block_number })
+    }
+
+    fn contract_key(contract_address: ApiContractAddress) -> String {
+        let felt: ApiStarkHash = contract_address.into();
+        format!("{:#x}", felt)
+    }
+
+    fn class_key(class_hash: ApiClassHash) -> String {
+        format!("{:#x}", class_hash.0)
+    }
+
+    fn parse_class_hash(value: Value) -> Result<ApiClassHash, StateError> {
+        let raw = value.as_str().ok_or_else(|| {
+            Self::state_read_error(format!(
+                "runtime class provider expected class hash string, got {}",
+                summarize_json_for_error(&value)
+            ))
+        })?;
+        let felt = ApiStarkHash::from_str(raw).map_err(|error| {
+            Self::state_read_error(format!(
+                "runtime class provider invalid class hash `{raw}`: {error}"
+            ))
+        })?;
+        Ok(ApiClassHash(felt))
+    }
+
+    fn parse_compiled_class_result(
+        value: Value,
+    ) -> Result<(RunnableCompiledClass, ApiCompiledClassHash), StateError> {
+        let (compiled_raw, sierra_version_raw) = match value {
+            Value::Array(values) if values.len() == 2 => {
+                (values[0].clone(), Some(values[1].clone()))
+            }
+            Value::Object(mut object) => {
+                let compiled = object
+                    .remove("compiled_contract_class")
+                    .or_else(|| object.remove("compiledClass"))
+                    .or_else(|| object.remove("contract_class"))
+                    .or_else(|| object.remove("class"));
+                let sierra = object
+                    .remove("sierra_version")
+                    .or_else(|| object.remove("sierraVersion"));
+                let Some(compiled) = compiled else {
+                    return Err(Self::state_read_error(format!(
+                        "runtime class provider missing compiled class payload: {}",
+                        summarize_json_for_error(&Value::Object(object))
+                    )));
+                };
+                (compiled, sierra)
+            }
+            other => {
+                return Err(Self::state_read_error(format!(
+                    "runtime class provider invalid getCompiledContractClass payload: {}",
+                    summarize_json_for_error(&other)
+                )));
+            }
+        };
+
+        if let Some(sierra_version_raw) = sierra_version_raw.clone() {
+            let casm_payload = Value::Array(vec![compiled_raw.clone(), sierra_version_raw]);
+            if let Ok(versioned_casm) = serde_json::from_value::<VersionedCasm>(casm_payload) {
+                let runnable =
+                    RunnableCompiledClass::try_from(ApiContractClass::V1(versioned_casm.clone()))
+                        .map_err(|error| {
+                        Self::state_read_error(format!(
+                            "runtime class provider failed to build runnable Cairo 1 class: {error}"
+                        ))
+                    })?;
+                let compiled_hash = versioned_casm.0.hash(&HashVersion::V2);
+                return Ok((runnable, compiled_hash));
+            }
+        }
+
+        if let Ok(deprecated) = serde_json::from_value::<ApiDeprecatedContractClass>(compiled_raw) {
+            let runnable = RunnableCompiledClass::try_from(ApiContractClass::V0(deprecated))
+                .map_err(|error| {
+                    Self::state_read_error(format!(
+                        "runtime class provider failed to build runnable Cairo 0 class: {error}"
+                    ))
+                })?;
+            return Ok((runnable, ApiCompiledClassHash::default()));
+        }
+
+        Err(Self::state_read_error(
+            "runtime class provider could not decode compiled class payload".to_string(),
+        ))
+    }
+
+    fn get_cached_class_hash(
+        &self,
+        lookup_external_block: u64,
+        contract_key: &str,
+    ) -> Option<ApiClassHash> {
+        let cache = self.cache.lock().ok()?;
+        cache
+            .class_hash_by_contract_at_block
+            .get(&(lookup_external_block, contract_key.to_string()))
+            .copied()
+    }
+
+    fn cache_class_hash(
+        &self,
+        lookup_external_block: u64,
+        contract_key: String,
+        class_hash: ApiClassHash,
+    ) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache
+                .class_hash_by_contract_at_block
+                .insert((lookup_external_block, contract_key), class_hash);
+            while cache.class_hash_by_contract_at_block.len() > MAX_RUNTIME_CLASS_HASH_CACHE_ENTRIES
+            {
+                if let Some(oldest) = cache
+                    .class_hash_by_contract_at_block
+                    .first_key_value()
+                    .map(|(key, _)| key.clone())
+                {
+                    cache.class_hash_by_contract_at_block.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn get_cached_compiled_class(
+        &self,
+        lookup_external_block: u64,
+        class_key: &str,
+    ) -> Option<(RunnableCompiledClass, ApiCompiledClassHash)> {
+        let cache = self.cache.lock().ok()?;
+        let compiled_class = cache
+            .compiled_class_by_hash_at_block
+            .get(&(lookup_external_block, class_key.to_string()))?
+            .clone();
+        let compiled_hash = cache
+            .compiled_class_hash_by_hash_at_block
+            .get(&(lookup_external_block, class_key.to_string()))
+            .copied()?;
+        Some((compiled_class, compiled_hash))
+    }
+
+    fn cache_compiled_class(
+        &self,
+        lookup_external_block: u64,
+        class_key: String,
+        compiled_class: RunnableCompiledClass,
+        compiled_class_hash: ApiCompiledClassHash,
+    ) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache
+                .compiled_class_by_hash_at_block
+                .insert((lookup_external_block, class_key.clone()), compiled_class);
+            cache
+                .compiled_class_hash_by_hash_at_block
+                .insert((lookup_external_block, class_key), compiled_class_hash);
+
+            while cache.compiled_class_by_hash_at_block.len()
+                > MAX_RUNTIME_COMPILED_CLASS_CACHE_ENTRIES
+            {
+                if let Some(oldest) = cache
+                    .compiled_class_by_hash_at_block
+                    .first_key_value()
+                    .map(|(key, _)| key.clone())
+                {
+                    cache.compiled_class_by_hash_at_block.remove(&oldest);
+                    cache.compiled_class_hash_by_hash_at_block.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn resolve_compiled_class_at_context(
+        &self,
+        lookup_external_block: u64,
+        class_hash: ApiClassHash,
+    ) -> Result<(RunnableCompiledClass, ApiCompiledClassHash), StateError> {
+        let class_key = Self::class_key(class_hash);
+        if let Some(cached) = self.get_cached_compiled_class(lookup_external_block, &class_key) {
+            return Ok(cached);
+        }
+        let params = json!([
+            Self::block_selector(lookup_external_block),
+            class_key.clone()
+        ]);
+        let result = self
+            .rpc
+            .call("starknet_getCompiledContractClass", params)
+            .map_err(|error| {
+                let guidance = if rpc_error_indicates_method_not_found(&error) {
+                    " upstream endpoint does not expose starknet_getCompiledContractClass; use an endpoint that supports canonical class retrieval."
+                } else {
+                    ""
+                };
+                Self::state_read_error(format!(
+                    "runtime class provider failed fetching compiled class for {class_key} at external block {lookup_external_block}: {error}{guidance}"
+                ))
+            })?;
+        let (compiled_class, compiled_class_hash) = Self::parse_compiled_class_result(result)?;
+        self.cache_compiled_class(
+            lookup_external_block,
+            class_key,
+            compiled_class.clone(),
+            compiled_class_hash,
+        );
+        Ok((compiled_class, compiled_class_hash))
+    }
+}
+
+#[cfg(feature = "production-adapters")]
+impl BlockifierClassProvider for RuntimeRpcClassProvider {
+    fn supports_account_execution(&self) -> bool {
+        true
+    }
+
+    fn prepare_for_block_execution(&self, block_number: u64) -> Result<(), StateError> {
+        let external_block = self.resolve_external_for_local(block_number)?;
+        self.write_context(RuntimeClassProviderContext {
+            lookup_external_block: Self::prestate_external_block(external_block),
+        });
+        Ok(())
+    }
+
+    fn prepare_for_simulation(&self, block_number: u64) -> Result<(), StateError> {
+        let external_block = self.resolve_external_for_local(block_number)?;
+        self.write_context(RuntimeClassProviderContext {
+            lookup_external_block: Self::prestate_external_block(external_block),
+        });
+        Ok(())
+    }
+
+    fn get_class_hash_at(
+        &self,
+        contract_address: ApiContractAddress,
+    ) -> Result<ApiClassHash, StateError> {
+        let context = self.read_context()?;
+        let contract_key = Self::contract_key(contract_address);
+        if let Some(class_hash) =
+            self.get_cached_class_hash(context.lookup_external_block, &contract_key)
+        {
+            return Ok(class_hash);
+        }
+        let params = json!([
+            Self::block_selector(context.lookup_external_block),
+            contract_key.clone()
+        ]);
+        let class_hash = match self.rpc.call("starknet_getClassHashAt", params) {
+            Ok(result) => Self::parse_class_hash(result)?,
+            Err(error) if rpc_error_indicates_absent_contract(&error) => ApiClassHash::default(),
+            Err(error) => {
+                let guidance = if rpc_error_indicates_method_not_found(&error) {
+                    " upstream endpoint does not expose starknet_getClassHashAt; use an endpoint that supports canonical class retrieval."
+                } else {
+                    ""
+                };
+                return Err(Self::state_read_error(format!(
+                    "runtime class provider failed fetching class hash for contract {contract_key} at external block {}: {error}{guidance}",
+                    context.lookup_external_block
+                )));
+            }
+        };
+        self.cache_class_hash(context.lookup_external_block, contract_key, class_hash);
+        Ok(class_hash)
+    }
+
+    fn get_compiled_class(
+        &self,
+        class_hash: ApiClassHash,
+    ) -> Result<RunnableCompiledClass, StateError> {
+        let context = self.read_context()?;
+        let (compiled_class, _) =
+            self.resolve_compiled_class_at_context(context.lookup_external_block, class_hash)?;
+        Ok(compiled_class)
+    }
+
+    fn get_compiled_class_hash(
+        &self,
+        class_hash: ApiClassHash,
+    ) -> Result<ApiCompiledClassHash, StateError> {
+        let context = self.read_context()?;
+        let (_, compiled_class_hash) =
+            self.resolve_compiled_class_at_context(context.lookup_external_block, class_hash)?;
+        Ok(compiled_class_hash)
+    }
+}
+
+struct RuntimeExecutionBackendBuild {
+    backend: DualExecutionBackend,
+    #[cfg(feature = "production-adapters")]
+    class_provider: Arc<RuntimeRpcClassProvider>,
+}
+
+struct RuntimeNodeBuild {
+    node: RuntimeNode,
+    #[cfg(feature = "production-adapters")]
+    class_provider: Arc<RuntimeRpcClassProvider>,
+}
+
 fn build_runtime_node(
     chain_id: ChainId,
     storage: ThreadSafeStorage<InMemoryStorage>,
     strict_canonical_execution: bool,
     allow_synthetic_execution_fallback: bool,
-) -> RuntimeNode {
-    StarknetNodeBuilder::new(NodeConfig { chain_id })
+    class_provider_rpc_urls: &[String],
+    rpc_timeout: Duration,
+) -> Result<RuntimeNodeBuild, String> {
+    let execution = build_runtime_execution_backend(
+        strict_canonical_execution,
+        allow_synthetic_execution_fallback,
+        class_provider_rpc_urls,
+        rpc_timeout,
+    )?;
+    let node = StarknetNodeBuilder::new(NodeConfig { chain_id })
         .with_storage(storage)
-        .with_execution(build_runtime_execution_backend(
-            strict_canonical_execution,
-            allow_synthetic_execution_fallback,
-        ))
+        .with_execution(execution.backend)
         .with_rpc(true)
-        .build()
+        .build();
+    Ok(RuntimeNodeBuild {
+        node,
+        #[cfg(feature = "production-adapters")]
+        class_provider: execution.class_provider,
+    })
 }
 
 fn build_runtime_execution_backend(
     strict_canonical_execution: bool,
     allow_synthetic_execution_fallback: bool,
-) -> DualExecutionBackend {
-    DualExecutionBackend::new(
+    class_provider_rpc_urls: &[String],
+    rpc_timeout: Duration,
+) -> Result<RuntimeExecutionBackendBuild, String> {
+    #[cfg(feature = "production-adapters")]
+    let class_provider = Arc::new(RuntimeRpcClassProvider::new(
+        class_provider_rpc_urls,
+        rpc_timeout,
+    )?);
+
+    #[cfg(not(feature = "production-adapters"))]
+    {
+        let _ = class_provider_rpc_urls;
+        let _ = rpc_timeout;
+    }
+
+    let backend = DualExecutionBackend::new(
         None,
+        #[cfg(feature = "production-adapters")]
+        Box::new(RuntimeExecutionBackend::new_with_class_provider(
+            strict_canonical_execution,
+            allow_synthetic_execution_fallback,
+            class_provider.clone() as Arc<dyn BlockifierClassProvider>,
+        )),
+        #[cfg(not(feature = "production-adapters"))]
         Box::new(RuntimeExecutionBackend::new(
             strict_canonical_execution,
             allow_synthetic_execution_fallback,
         )),
         ExecutionMode::CanonicalOnly,
         MismatchPolicy::WarnAndFallback,
-    )
+    );
+    Ok(RuntimeExecutionBackendBuild {
+        backend,
+        #[cfg(feature = "production-adapters")]
+        class_provider,
+    })
 }
 
 fn new_replay_pipeline(
@@ -2581,17 +3200,49 @@ struct RuntimeExecutionBackend {
 }
 
 impl RuntimeExecutionBackend {
-    fn new(strict_canonical_execution: bool, allow_synthetic_execution_fallback: bool) -> Self {
+    #[cfg(feature = "production-adapters")]
+    fn with_canonical_backend(
+        strict_canonical_execution: bool,
+        allow_synthetic_execution_fallback: bool,
+        canonical: BlockifierVmBackend,
+    ) -> Self {
         Self {
             strict_canonical_execution,
             allow_synthetic_execution_fallback,
-            #[cfg(feature = "production-adapters")]
-            canonical: BlockifierVmBackend::starknet_mainnet(),
-            #[cfg(feature = "production-adapters")]
+            canonical,
             warned_canonical_fallback: AtomicBool::new(false),
-            #[cfg(feature = "production-adapters")]
             canonical_enabled: AtomicBool::new(true),
         }
+    }
+
+    #[cfg_attr(feature = "production-adapters", allow(dead_code))]
+    fn new(strict_canonical_execution: bool, allow_synthetic_execution_fallback: bool) -> Self {
+        #[cfg(feature = "production-adapters")]
+        {
+            return Self::with_canonical_backend(
+                strict_canonical_execution,
+                allow_synthetic_execution_fallback,
+                BlockifierVmBackend::starknet_mainnet(),
+            );
+        }
+        #[cfg(not(feature = "production-adapters"))]
+        Self {
+            strict_canonical_execution,
+            allow_synthetic_execution_fallback,
+        }
+    }
+
+    #[cfg(feature = "production-adapters")]
+    fn new_with_class_provider(
+        strict_canonical_execution: bool,
+        allow_synthetic_execution_fallback: bool,
+        class_provider: Arc<dyn BlockifierClassProvider>,
+    ) -> Self {
+        Self::with_canonical_backend(
+            strict_canonical_execution,
+            allow_synthetic_execution_fallback,
+            BlockifierVmBackend::starknet_mainnet().with_class_provider(class_provider),
+        )
     }
 
     fn synthetic_execute_block(block: &StarknetBlock) -> ExecutionOutput {
@@ -3879,7 +4530,7 @@ fn redact_upstream_endpoint(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::{BTreeMap, HashSet, VecDeque};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
@@ -4413,7 +5064,14 @@ mod tests {
 
     #[test]
     fn runtime_execution_backend_runs_canonical_path_once_per_block() {
-        let backend = build_runtime_execution_backend(false, true);
+        let backend = build_runtime_execution_backend(
+            false,
+            true,
+            &["http://localhost:9545".to_string()],
+            Duration::from_secs(1),
+        )
+        .expect("runtime execution backend should initialize")
+        .backend;
         let fetch = sample_fetch(1, "0x0", "0x1");
         let block = ingest_block_from_fetch(1, &fetch).expect("sample block should ingest");
         let mut state = InMemoryState::default();
@@ -4431,7 +5089,14 @@ mod tests {
     #[cfg(not(feature = "production-adapters"))]
     #[test]
     fn runtime_execution_backend_strict_mode_requires_production_adapters() {
-        let backend = build_runtime_execution_backend(true, true);
+        let backend = build_runtime_execution_backend(
+            true,
+            true,
+            &["http://localhost:9545".to_string()],
+            Duration::from_secs(1),
+        )
+        .expect("runtime execution backend should initialize")
+        .backend;
         let fetch = sample_fetch(1, "0x0", "0x1");
         let block = ingest_block_from_fetch(1, &fetch).expect("sample block should ingest");
         let mut state = InMemoryState::default();
@@ -4450,7 +5115,14 @@ mod tests {
     #[cfg(feature = "production-adapters")]
     #[test]
     fn runtime_execution_backend_strict_mode_rejects_missing_executable_payloads() {
-        let backend = build_runtime_execution_backend(true, true);
+        let backend = build_runtime_execution_backend(
+            true,
+            true,
+            &["http://localhost:9545".to_string()],
+            Duration::from_secs(1),
+        )
+        .expect("runtime execution backend should initialize")
+        .backend;
         let fetch = sample_fetch(1, "0x0", "0x1");
         let block = ingest_block_from_fetch(1, &fetch).expect("sample block should ingest");
         let mut state = InMemoryState::default();
@@ -4468,7 +5140,14 @@ mod tests {
 
     #[test]
     fn runtime_execution_backend_rejects_synthetic_fallback_when_disabled() {
-        let backend = build_runtime_execution_backend(false, false);
+        let backend = build_runtime_execution_backend(
+            false,
+            false,
+            &["http://localhost:9545".to_string()],
+            Duration::from_secs(1),
+        )
+        .expect("runtime execution backend should initialize")
+        .backend;
         let fetch = sample_fetch(1, "0x0", "0x1");
         let block = ingest_block_from_fetch(1, &fetch).expect("sample block should ingest");
         let mut state = InMemoryState::default();
@@ -4735,6 +5414,148 @@ mod tests {
         let error = ingest_block_from_fetch(1, &fetch)
             .expect_err("payload/hash count mismatch must fail closed");
         assert!(error.contains("payload/hash count mismatch"));
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[derive(Default)]
+    struct ScriptedClassRpcClient {
+        calls: Mutex<Vec<(String, Value)>>,
+        responses: Mutex<BTreeMap<String, VecDeque<Result<Value, String>>>>,
+    }
+
+    #[cfg(feature = "production-adapters")]
+    impl ScriptedClassRpcClient {
+        fn push_response(&self, method: &str, response: Result<Value, String>) {
+            let mut responses = self
+                .responses
+                .lock()
+                .expect("scripted class RPC responses lock should not be poisoned");
+            responses
+                .entry(method.to_string())
+                .or_default()
+                .push_back(response);
+        }
+
+        fn recorded_calls(&self) -> Vec<(String, Value)> {
+            self.calls
+                .lock()
+                .expect("scripted class RPC calls lock should not be poisoned")
+                .clone()
+        }
+    }
+
+    #[cfg(feature = "production-adapters")]
+    impl RuntimeClassRpcClient for ScriptedClassRpcClient {
+        fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+            self.calls
+                .lock()
+                .expect("scripted class RPC calls lock should not be poisoned")
+                .push((method.to_string(), params.clone()));
+            let mut responses = self
+                .responses
+                .lock()
+                .expect("scripted class RPC responses lock should not be poisoned");
+            let queue = responses
+                .get_mut(method)
+                .unwrap_or_else(|| panic!("missing scripted response for RPC method `{method}`"));
+            queue
+                .pop_front()
+                .unwrap_or_else(|| panic!("missing queued scripted response for `{method}`"))
+        }
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn runtime_class_provider_requires_local_to_external_binding() {
+        let rpc = Arc::new(ScriptedClassRpcClient::default());
+        let provider = RuntimeRpcClassProvider::with_test_rpc_client(rpc);
+
+        let error = provider
+            .prepare_for_block_execution(7)
+            .expect_err("provider must fail closed without local->external binding");
+        assert!(
+            matches!(error, StateError::StateReadError(message) if message.contains("missing external block mapping"))
+        );
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn runtime_class_provider_uses_prestate_external_block_and_caches_class_hash() {
+        let rpc = Arc::new(ScriptedClassRpcClient::default());
+        rpc.push_response("starknet_getClassHashAt", Ok(json!("0x1234")));
+        let provider = RuntimeRpcClassProvider::with_test_rpc_client(
+            Arc::clone(&rpc) as Arc<dyn RuntimeClassRpcClient>
+        );
+        provider.bind_external_block_for_local(9, 50);
+        provider
+            .prepare_for_block_execution(9)
+            .expect("provider prepare should succeed");
+
+        let contract = ApiContractAddress::try_from(ApiStarkHash::from(0xabc_u64))
+            .expect("contract address should parse");
+        let class_hash = provider
+            .get_class_hash_at(contract)
+            .expect("class hash lookup should succeed");
+        assert_eq!(class_hash, ApiClassHash(ApiStarkHash::from(0x1234_u64)));
+
+        // Cached lookup must avoid a second RPC call.
+        let _ = provider
+            .get_class_hash_at(contract)
+            .expect("cached class hash lookup should succeed");
+
+        let calls = rpc.recorded_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "starknet_getClassHashAt");
+        assert_eq!(calls[0].1[0]["block_number"], json!(49_u64));
+    }
+
+    #[cfg(feature = "production-adapters")]
+    #[test]
+    fn runtime_class_provider_caches_compiled_class_and_hash_from_single_rpc_call() {
+        let casm_json: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/account_with_dummy_validate.casm.json"
+        ))
+        .expect("CASM fixture must deserialize");
+        let sierra_version = starknet_api::contract_class::SierraVersion::new(1, 7, 0);
+        let sierra_version_value =
+            serde_json::to_value(sierra_version.clone()).expect("serialize Sierra version");
+
+        let rpc = Arc::new(ScriptedClassRpcClient::default());
+        rpc.push_response(
+            "starknet_getCompiledContractClass",
+            Ok(Value::Array(vec![
+                casm_json.clone(),
+                sierra_version_value.clone(),
+            ])),
+        );
+        let provider = RuntimeRpcClassProvider::with_test_rpc_client(
+            Arc::clone(&rpc) as Arc<dyn RuntimeClassRpcClient>
+        );
+        provider.bind_external_block_for_local(2, 100);
+        provider
+            .prepare_for_block_execution(2)
+            .expect("provider prepare should succeed");
+
+        let class_hash = ApiClassHash(ApiStarkHash::from(0x55_u64));
+        let _compiled = provider
+            .get_compiled_class(class_hash)
+            .expect("compiled class lookup should succeed");
+        let compiled_class_hash = provider
+            .get_compiled_class_hash(class_hash)
+            .expect("compiled class hash lookup should use cache");
+
+        let expected_versioned_casm: VersionedCasm =
+            serde_json::from_value(Value::Array(vec![casm_json, sierra_version_value]))
+                .expect("CASM fixture + Sierra version should parse as VersionedCasm");
+        assert_eq!(
+            compiled_class_hash,
+            expected_versioned_casm.0.hash(&HashVersion::V2)
+        );
+
+        let calls = rpc.recorded_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "starknet_getCompiledContractClass");
+        assert_eq!(calls[0].1[0]["block_number"], json!(99_u64));
     }
 
     #[cfg(feature = "production-adapters")]
